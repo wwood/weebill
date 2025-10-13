@@ -1,4 +1,7 @@
+# sylph v0.9.0: 10-13-2025
 
+- Added an option `--estimate-read-count` to VERY ROUGHLY output estimated read counts in the "Sequence_abundance" column instead of an actual sequence abundance. This forces `-u`. Only works for short reads right now. 
+- Record ids could previously contain tabs, causing sylph's tsv output to not be a true tsv. This is fixed (thanks Donovan Parks). 
 
 ## sylph v0.8.1: release date TODO
 

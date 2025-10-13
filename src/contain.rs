@@ -146,6 +146,11 @@ pub fn contain(mut args: ContainArgs, pseudotax_in: bool) {
         None => Box::new(BufWriter::new(io::stdout())) as Box<dyn Write + Send>,
     };
 
+    if args.estimate_read_counts{
+        args.estimate_unknown = true;
+        log::info!("--estimate-read-count detected, also enabling -u. Sequence_abundance column will be set to estimated read counts, not abundance. This is still experimental.");
+    }
+
     log::info!("Obtaining sketches...");
     let mut genome_sketch_files = vec![];
     let mut genome_files = vec![];
@@ -314,6 +319,7 @@ pub fn contain(mut args: ContainArgs, pseudotax_in: bool) {
                     if args.estimate_unknown{
                         bases_explained = estimate_covered_bases(&stats_vec_seq, &sequence_sketch, sequence_sketch.mean_read_length, sequence_sketch.k);
                         log::info!("{} has {:.2}% of reads detected in database by profile", &first_read_file, bases_explained * 100.);
+                        
                     }
 
                     let total_cov = stats_vec_seq.iter().map(|x| x.final_est_cov).sum::<f64>();
@@ -322,7 +328,13 @@ pub fn contain(mut args: ContainArgs, pseudotax_in: bool) {
                         thing.rel_abund = Some(thing.final_est_cov/total_cov * 100.);
                     }
                     for thing in stats_vec_seq.iter_mut(){
-                        thing.seq_abund = Some(thing.final_est_cov * thing.genome_sketch.gn_size as f64 / total_seq_cov * 100. * bases_explained);
+                        if args.estimate_read_counts{
+                            thing.seq_abund = Some((thing.final_est_cov * thing.genome_sketch.gn_size as f64 / sequence_sketch.mean_read_length * bases_explained).round());
+                        }
+                        else{
+                            let seq_abund = thing.final_est_cov * thing.genome_sketch.gn_size as f64 / total_seq_cov * 100. * bases_explained;
+                            thing.seq_abund = Some(seq_abund);
+                        }
                     }
                 }
 

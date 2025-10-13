@@ -502,7 +502,8 @@ pub fn sketch_genome_individual(
                 let mut kmer_vec = vec![];
                 let record = record.expect(&format!("Invalid record for file {} ", ref_file));
                 let contig_name = String::from_utf8_lossy(record.id()).to_string();
-                return_genome_sketch.first_contig_name = contig_name;
+                let contig_name_notab = contig_name.replace('\t', " ");
+                return_genome_sketch.first_contig_name = contig_name_notab.to_owned();
                 let seq = record.seq();
 
                 extract_markers_positions(&seq, &mut kmer_vec, c, k, 0);
@@ -573,7 +574,8 @@ pub fn sketch_genome(
                 let record = record.expect(&format!("Invalid record for file {} ", ref_file));
                 if first {
                     let contig_name = String::from_utf8_lossy(record.id()).to_string();
-                    return_genome_sketch.first_contig_name = contig_name;
+                    let contig_name_notab = contig_name.replace('\t', " ");
+                    return_genome_sketch.first_contig_name = contig_name_notab.to_owned();
                     first = false;
                 }
                 let seq = record.seq();

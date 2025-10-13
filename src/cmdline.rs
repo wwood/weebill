@@ -106,9 +106,11 @@ pub struct ContainArgs {
     #[clap(long="debug", help = "Debug output")]
     pub debug: bool,
 
+    #[clap(long="estimate-read-counts", help_heading = "ALGORITHM", help = "Very roughly estimate read counts in the 'Sequence_abundance' column instead of relative abundance. This forces `-u`. May not be reliable for long reads.")]
+    pub estimate_read_counts: bool,
+
     #[clap(short='u', long="estimate-unknown", help_heading = "ALGORITHM", help = "Estimate true coverage and scale sequence abundance in `profile` by estimated unknown sequence percentage" )]
     pub estimate_unknown: bool,
-
     
     #[clap(short='I',long="read-seq-id", help_heading = "ALGORITHM", help = "Sequence identity (%) of reads. Only used in -u option and overrides automatic detection. ")]
     pub seq_id: Option<f64>,

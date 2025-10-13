@@ -460,6 +460,53 @@ fn test_raw_inputs_profile_simple(){
     fresh();
     
 }
+
+#[serial]
+#[test]
+fn test_estimate_read_counts(){
+    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    let output = cmd
+        .arg("profile")
+        .arg("--estimate-read-counts")
+        .arg("./test_files/e.coli-o157.fasta.gz")
+        .arg("-1")
+        .arg("test_files/k12_R1.fq")
+        .arg("-2")
+        .arg("test_files/k12_R2.fq")
+        .output()
+        .expect("output failed");
+    let stdout_1 = str::from_utf8(&output.stdout).expect("Output was not valid UTF-8");
+    let mut lines = stdout_1.lines();
+    dbg!(stdout_1);
+    lines.next();
+    let output = lines.next().unwrap();
+    let split : Vec<&str> = output.split('\t').collect();
+    assert!(split[3].parse::<f64>().unwrap() > 1000.0);
+
+    fresh();
+
+    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    let output = cmd
+        .arg("profile")
+        .arg("./test_files/e.coli-o157.fasta.gz")
+        .arg("-1")
+        .arg("test_files/k12_R1.fq")
+        .arg("-2")
+        .arg("test_files/k12_R2.fq")
+        .output()
+        .expect("output failed");
+    let stdout_1 = str::from_utf8(&output.stdout).expect("Output was not valid UTF-8");
+    let mut lines = stdout_1.lines();
+    dbg!(stdout_1);
+    lines.next();
+    let output = lines.next().unwrap();
+    let split : Vec<&str> = output.split('\t').collect();
+    assert!(split[3].parse::<f64>().unwrap() < 101.00);
+
+    fresh();
+
+}
+
 #[serial]
 #[test]
 fn test_raw_inputs_profile_with_sketch(){
