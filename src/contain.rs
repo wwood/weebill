@@ -148,7 +148,7 @@ pub fn contain(mut args: ContainArgs, pseudotax_in: bool) {
 
     if args.estimate_read_counts{
         args.estimate_unknown = true;
-        log::info!("--estimate-read-count detected, also enabling -u. Sequence_abundance column will be set to estimated read counts, not abundance. This is still experimental.");
+        log::info!("--estimate-read-counts detected, also enabling -u. Sequence_abundance column will be set to estimated read counts, not abundance. This is still experimental.");
     }
 
     log::info!("Obtaining sketches...");
