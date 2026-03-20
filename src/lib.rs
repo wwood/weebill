@@ -6,6 +6,7 @@ pub mod cmdline;
 pub mod contain;
 pub mod inference;
 pub mod inspect;
+pub mod merge;
 
 #[cfg(target_arch = "x86_64")]
 pub mod avx2_seeding;

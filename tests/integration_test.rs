@@ -595,3 +595,248 @@ fn test_inspect(){
     assert!(stdout.contains("e.coli-K12.fasta.gz"));
 
 }
+
+#[serial]
+#[test]
+fn test_merge_basic() {
+    fresh();
+
+    // Sketch paired-end reads
+    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    cmd.arg("sketch")
+        .arg("-1").arg("test_files/k12_R1.fq")
+        .arg("-2").arg("test_files/k12_R2.fq")
+        .arg("-d").arg("./tests/results/test_sketch_dir")
+        .assert()
+        .success();
+
+    // Sketch single-end reads
+    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    cmd.arg("sketch")
+        .arg("-r").arg("test_files/o157_reads.fastq.gz")
+        .arg("-d").arg("./tests/results/test_sketch_dir")
+        .assert()
+        .success();
+
+    let paired_sketch = "./tests/results/test_sketch_dir/k12_R1.fq.paired.sylsp";
+    let single_sketch = "./tests/results/test_sketch_dir/o157_reads.fastq.gz.sylsp";
+    let merged_output = "./tests/results/test_sketch_dir/merged.sylsp";
+
+    assert!(Path::new(paired_sketch).exists());
+    assert!(Path::new(single_sketch).exists());
+
+    // Merge the two sketches
+    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    cmd.arg("merge")
+        .arg(paired_sketch)
+        .arg(single_sketch)
+        .arg("-o").arg(merged_output)
+        .assert()
+        .success();
+
+    assert!(Path::new(merged_output).exists());
+
+    // Verify merged sketch works with profile
+    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    let output = cmd
+        .arg("profile")
+        .arg("./test_files/e.coli-EC590.fasta.gz")
+        .arg(merged_output)
+        .output()
+        .expect("Output failed");
+    let stdout = str::from_utf8(&output.stdout).expect("Output was not valid UTF-8");
+    // Should produce output (header + at least one result line)
+    assert!(stdout.matches('\n').count() >= 2);
+
+    fresh();
+}
+
+#[serial]
+#[test]
+fn test_merge_mismatched_params() {
+    fresh();
+
+    // Sketch with c=200 (default)
+    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    cmd.arg("sketch")
+        .arg("-r").arg("test_files/o157_reads.fastq.gz")
+        .arg("-d").arg("./tests/results/test_sketch_dir")
+        .assert()
+        .success();
+
+    // Sketch with c=100
+    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    cmd.arg("sketch")
+        .arg("-1").arg("test_files/t1.fq")
+        .arg("-2").arg("test_files/t2.fq")
+        .arg("-c").arg("100")
+        .arg("-d").arg("./tests/results/test_sketch_dir/c100")
+        .assert()
+        .success();
+
+    // Merge should fail due to different c values
+    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    cmd.arg("merge")
+        .arg("./tests/results/test_sketch_dir/o157_reads.fastq.gz.sylsp")
+        .arg("./tests/results/test_sketch_dir/c100/t1.fq.paired.sylsp")
+        .arg("-o").arg("./tests/results/test_sketch_dir/bad_merge.sylsp")
+        .assert()
+        .failure()
+        .code(1);
+
+    fresh();
+}
+
+#[serial]
+#[test]
+fn test_merge_sample_name() {
+    fresh();
+
+    // Sketch two single-end files
+    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    cmd.arg("sketch")
+        .arg("-r").arg("test_files/o157_reads.fastq.gz")
+        .arg("-d").arg("./tests/results/test_sketch_dir")
+        .assert()
+        .success();
+
+    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    cmd.arg("sketch")
+        .arg("-1").arg("test_files/t1.fq")
+        .arg("-2").arg("test_files/t2.fq")
+        .arg("-d").arg("./tests/results/test_sketch_dir")
+        .assert()
+        .success();
+
+    let merged_output = "./tests/results/test_sketch_dir/named_merge.sylsp";
+
+    // Merge with custom sample name
+    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    cmd.arg("merge")
+        .arg("./tests/results/test_sketch_dir/o157_reads.fastq.gz.sylsp")
+        .arg("./tests/results/test_sketch_dir/t1.fq.paired.sylsp")
+        .arg("-o").arg(merged_output)
+        .arg("-S").arg("MY_MERGED_SAMPLE")
+        .assert()
+        .success();
+
+    // Profile with merged sketch and check sample name appears
+    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    let output = cmd
+        .arg("profile")
+        .arg("./test_files/e.coli-EC590.fasta.gz")
+        .arg(merged_output)
+        .output()
+        .expect("Output failed");
+    let stdout = str::from_utf8(&output.stdout).expect("Output was not valid UTF-8");
+    assert!(stdout.contains("MY_MERGED_SAMPLE"));
+
+    fresh();
+}
+
+#[serial]
+#[test]
+fn test_merge_inspect_num_reads() {
+    fresh();
+
+    // Sketch paired-end reads
+    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    cmd.arg("sketch")
+        .arg("-1").arg("test_files/k12_R1.fq")
+        .arg("-2").arg("test_files/k12_R2.fq")
+        .arg("-d").arg("./tests/results/test_sketch_dir")
+        .assert()
+        .success();
+
+    // Inspect should show num_reads
+    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    let output = cmd
+        .arg("inspect")
+        .arg("./tests/results/test_sketch_dir/k12_R1.fq.paired.sylsp")
+        .output()
+        .expect("Output failed");
+    let stdout = str::from_utf8(&output.stdout).expect("Output was not valid UTF-8");
+    assert!(stdout.contains("num_reads"));
+
+    fresh();
+}
+
+#[serial]
+#[test]
+fn test_merge_produces_valid_sketch() {
+    fresh();
+
+    // Sketch single-end reads into two separate sketches
+    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    cmd.arg("sketch")
+        .arg("-1").arg("test_files/k12_R1.fq")
+        .arg("-2").arg("test_files/k12_R2.fq")
+        .arg("-d").arg("./tests/results/test_sketch_dir")
+        .assert()
+        .success();
+
+    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    cmd.arg("sketch")
+        .arg("-1").arg("test_files/t1.fq")
+        .arg("-2").arg("test_files/t2.fq")
+        .arg("-d").arg("./tests/results/test_sketch_dir")
+        .assert()
+        .success();
+
+    let merged_output = "./tests/results/test_sketch_dir/merged_valid.sylsp";
+
+    // Merge
+    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    cmd.arg("merge")
+        .arg("./tests/results/test_sketch_dir/k12_R1.fq.paired.sylsp")
+        .arg("./tests/results/test_sketch_dir/t1.fq.paired.sylsp")
+        .arg("-o").arg(merged_output)
+        .assert()
+        .success();
+
+    // Inspect merged sketch to verify it's valid
+    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    let output = cmd
+        .arg("inspect")
+        .arg(merged_output)
+        .output()
+        .expect("Output failed");
+    let stdout = str::from_utf8(&output.stdout).expect("Output was not valid UTF-8");
+    assert!(stdout.contains("num_reads"));
+    assert!(stdout.contains("paired: true"));
+
+    // Query with merged sketch should work
+    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    cmd.arg("query")
+        .arg("./test_files/e.coli-o157.fasta.gz")
+        .arg(merged_output)
+        .assert()
+        .success();
+
+    fresh();
+}
+
+#[serial]
+#[test]
+fn test_merge_too_few_files() {
+    fresh();
+
+    // Sketch one file
+    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    cmd.arg("sketch")
+        .arg("-r").arg("test_files/o157_reads.fastq.gz")
+        .arg("-d").arg("./tests/results/test_sketch_dir")
+        .assert()
+        .success();
+
+    // Merge with only one file should fail
+    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    cmd.arg("merge")
+        .arg("./tests/results/test_sketch_dir/o157_reads.fastq.gz.sylsp")
+        .arg("-o").arg("./tests/results/test_sketch_dir/single_merge.sylsp")
+        .assert()
+        .failure()
+        .code(1);
+
+    fresh();
+}

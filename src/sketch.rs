@@ -893,6 +893,7 @@ pub fn sketch_pair_sequences(
         percent,
     );
     read_sketch.mean_read_length = mean_read_length;
+    read_sketch.num_reads = counter as u64;
     return Some(read_sketch);
 }
 
@@ -957,5 +958,6 @@ pub fn sketch_sequences_needle(
         paired: false,
         sample_name: sample_name,
         mean_read_length,
+        num_reads: counter as u64,
     });
 }

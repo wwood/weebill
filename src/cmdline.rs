@@ -22,6 +22,9 @@ pub enum Mode {
     ///Inspect sketched .syldb and .sylsp files.
     #[clap(arg_required_else_help = true, display_order = 4)]
     Inspect(InspectArgs),
+    /// Merge multiple sample sketches (.sylsp) into one.
+    #[clap(arg_required_else_help = true, display_order = 5)]
+    Merge(MergeArgs),
 }
 
 
@@ -172,5 +175,15 @@ pub struct InspectArgs {
     #[clap(short='o',long="output-file", help = "Output to this file (YAML format). [default: stdout]")]
     pub out_file_name: Option<String>,
 
+}
+
+#[derive(Args)]
+pub struct MergeArgs {
+    #[clap(multiple=true, required=true, help = "Sample sketch files (.sylsp) to merge")]
+    pub files: Vec<String>,
+    #[clap(short='o', long="output", required=true, help = "Output file path for merged sketch (.sylsp)")]
+    pub output: String,
+    #[clap(short='S', long="sample-name", help = "Sample name for the merged sketch")]
+    pub sample_name: Option<String>,
 }
     

@@ -26,6 +26,7 @@ struct SequencesSketchInspect{
     pub mean_read_length: f64,
     pub sample_name: Option<String>,
     pub paired: bool,
+    pub num_reads: u64,
 }
 
 impl From<SequencesSketch> for SequencesSketchInspect{
@@ -41,6 +42,7 @@ impl From<SequencesSketch> for SequencesSketchInspect{
             sample_name: sk.sample_name,
             paired: sk.paired,
             mean_read_length: sk.mean_read_length,
+            num_reads: sk.num_reads,
         }
     }
 }

@@ -3,6 +3,7 @@ use sylph::cmdline::*;
 use sylph::sketch;
 use sylph::contain;
 use sylph::inspect;
+use sylph::merge;
 //use std::panic::set_hook;
 
 //Use this allocator when statically compiling
@@ -27,5 +28,6 @@ fn main() {
         Mode::Query(contain_args) => contain::contain(contain_args, false),
         Mode::Profile(contain_args) => contain::contain(contain_args, true),
         Mode::Inspect(inspect_args) => inspect::inspect(inspect_args),
+        Mode::Merge(merge_args) => merge::merge(merge_args),
     }
 }
