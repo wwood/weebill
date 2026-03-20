@@ -1023,7 +1023,11 @@ pub fn sketch_sequences_needle(
 /// needletail's id() already strips everything after the first space, so we just need to strip /1 /2.
 fn base_read_name(id: &[u8]) -> String {
     let name = std::str::from_utf8(id).unwrap_or("");
-    let name = name.strip_suffix("/1").or_else(|| name.strip_suffix("/2")).unwrap_or(name);
+    let name = name.strip_suffix("/1")
+        .or_else(|| name.strip_suffix("/2"))
+        .or_else(|| name.strip_suffix(".1"))
+        .or_else(|| name.strip_suffix(".2"))
+        .unwrap_or(name);
     name.to_string()
 }
 

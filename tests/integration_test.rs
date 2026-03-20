@@ -974,3 +974,32 @@ fn test_interleaved_query_direct() {
 
     fresh();
 }
+
+#[serial]
+#[test]
+fn test_interleaved_dot_suffix() {
+    fresh();
+
+    // Sketch interleaved reads with .1/.2 naming convention
+    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    cmd.arg("sketch")
+        .arg("--interleaved").arg("test_files/k12_interleaved_dot.fq")
+        .arg("-d").arg("./tests/results/test_sketch_dir")
+        .assert()
+        .success();
+
+    assert!(Path::new("./tests/results/test_sketch_dir/k12_interleaved_dot.fq.paired.sylsp").exists());
+
+    // Profile and verify output
+    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    let output = cmd
+        .arg("profile")
+        .arg("./test_files/e.coli-EC590.fasta.gz")
+        .arg("./tests/results/test_sketch_dir/k12_interleaved_dot.fq.paired.sylsp")
+        .output()
+        .expect("Output failed");
+    let stdout = str::from_utf8(&output.stdout).expect("Output was not valid UTF-8");
+    assert!(stdout.matches('\n').count() >= 2);
+
+    fresh();
+}
