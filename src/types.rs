@@ -142,7 +142,7 @@ mod kmer_counts {
     }
 }
 
-#[derive(Default, Deserialize, Serialize, Debug, PartialEq)]
+#[derive(Default, Deserialize, Serialize, Debug, PartialEq, Clone)]
 pub struct SequencesSketch{
     #[serde(with = "kmer_counts")]
     pub kmer_counts: FxHashMap<Kmer, u32>,

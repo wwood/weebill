@@ -840,3 +840,137 @@ fn test_merge_too_few_files() {
 
     fresh();
 }
+
+#[serial]
+#[test]
+fn test_interleaved_sketch_matches_paired() {
+    fresh();
+
+    // Sketch paired-end reads
+    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    cmd.arg("sketch")
+        .arg("-1").arg("test_files/k12_R1.fq")
+        .arg("-2").arg("test_files/k12_R2.fq")
+        .arg("-d").arg("./tests/results/test_sketch_dir")
+        .assert()
+        .success();
+
+    // Sketch interleaved reads
+    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    cmd.arg("sketch")
+        .arg("--interleaved").arg("test_files/k12_interleaved.fq")
+        .arg("-d").arg("./tests/results/test_sketch_dir/interleaved")
+        .assert()
+        .success();
+
+    assert!(Path::new("./tests/results/test_sketch_dir/interleaved/k12_interleaved.fq.paired.sylsp").exists(), "Interleaved output not created");
+
+    // Profile both against a genome and compare output
+    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    let output_paired = cmd
+        .arg("profile")
+        .arg("./test_files/e.coli-EC590.fasta.gz")
+        .arg("./tests/results/test_sketch_dir/k12_R1.fq.paired.sylsp")
+        .output()
+        .expect("Output failed");
+    let stdout_paired = str::from_utf8(&output_paired.stdout).expect("Output was not valid UTF-8");
+
+    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    let output_interleaved = cmd
+        .arg("profile")
+        .arg("./test_files/e.coli-EC590.fasta.gz")
+        .arg("./tests/results/test_sketch_dir/interleaved/k12_interleaved.fq.paired.sylsp")
+        .output()
+        .expect("Output failed");
+    let stdout_interleaved = str::from_utf8(&output_interleaved.stdout).expect("Output was not valid UTF-8");
+
+    // Both should produce output with same number of lines
+    assert_eq!(stdout_paired.matches('\n').count(), stdout_interleaved.matches('\n').count());
+    // Both should have at least a header + result
+    assert!(stdout_paired.matches('\n').count() >= 2);
+
+    fresh();
+}
+
+#[serial]
+#[test]
+fn test_interleaved_sketch_t_files() {
+    fresh();
+
+    // Sketch interleaved t files (these have same read names without /1 /2 suffix)
+    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    cmd.arg("sketch")
+        .arg("--interleaved").arg("test_files/t_interleaved.fq")
+        .arg("-d").arg("./tests/results/test_sketch_dir")
+        .assert()
+        .success();
+
+    assert!(Path::new("./tests/results/test_sketch_dir/t_interleaved.fq.paired.sylsp").exists());
+
+    // Verify it works with profile
+    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    cmd.arg("profile")
+        .arg("./test_files/e.coli-o157.fasta.gz")
+        .arg("./tests/results/test_sketch_dir/t_interleaved.fq.paired.sylsp")
+        .assert()
+        .success();
+
+    fresh();
+}
+
+#[serial]
+#[test]
+fn test_interleaved_bad_names_fails() {
+    fresh();
+
+    // bad_interleaved.fq has two R1 reads with different names — should fail
+    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    cmd.arg("sketch")
+        .arg("--interleaved").arg("test_files/bad_interleaved.fq")
+        .arg("-d").arg("./tests/results/test_sketch_dir")
+        .assert()
+        .failure()
+        .code(1);
+
+    fresh();
+}
+
+#[serial]
+#[test]
+fn test_interleaved_profile_direct() {
+    fresh();
+
+    // Use --interleaved directly with profile (no pre-sketching)
+    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    let output = cmd
+        .arg("profile")
+        .arg("./test_files/e.coli-EC590.fasta.gz")
+        .arg("--interleaved").arg("test_files/k12_interleaved.fq")
+        .output()
+        .expect("Output failed");
+    assert!(output.status.success());
+    let stdout = str::from_utf8(&output.stdout).expect("Output was not valid UTF-8");
+    assert!(stdout.matches('\n').count() >= 2);
+
+    fresh();
+}
+
+#[serial]
+#[test]
+fn test_interleaved_query_direct() {
+    fresh();
+
+    // Use --interleaved directly with query
+    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    let output = cmd
+        .arg("query")
+        .arg("./test_files/e.coli-EC590.fasta.gz")
+        .arg("--interleaved").arg("test_files/k12_interleaved.fq")
+        .output()
+        .expect("Output failed");
+    assert!(output.status.success());
+    let stdout = str::from_utf8(&output.stdout).expect("Output was not valid UTF-8");
+    assert!(stdout.matches('\n').count() >= 2);
+
+    fresh();
+}

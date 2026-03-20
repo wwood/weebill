@@ -144,6 +144,7 @@ fn check_args_valid(args: &SketchArgs) {
         && args.list_sequence.is_none()
         && args.first_pair.is_empty()
         && args.second_pair.is_empty()
+        && args.interleaved.is_empty()
         && args.genomes.is_none()
         && args.reads.is_none()
         && args.list_genomes.is_none()
@@ -284,9 +285,11 @@ pub fn sketch(args: SketchArgs) {
     parse_reads_and_genomes(&args, &mut read_inputs, &mut genome_inputs);
     parse_paired_end_reads(&args, &mut first_pairs, &mut second_pairs);
 
+    let interleaved_inputs = args.interleaved.clone();
+
     let sample_names = parse_sample_names(&args);
     if let Some(names) = &sample_names {
-        if names.len() != first_pairs.len() + read_inputs.len() {
+        if names.len() != first_pairs.len() + read_inputs.len() + interleaved_inputs.len() {
             log::error!("Sample name length is not equal to the number of reads. Exiting");
             std::process::exit(1);
         }
@@ -363,6 +366,60 @@ pub fn sketch(args: SketchArgs) {
         });
     }
 
+    if !interleaved_inputs.is_empty() {
+        info!("Sketching interleaved sequences...");
+        let iter_vec: Vec<usize> = (0..interleaved_inputs.len()).into_iter().collect();
+        iter_vec.into_par_iter().for_each(|i| {
+            let read_file = &interleaved_inputs[i];
+
+            let mut sample_name = None;
+            if let Some(name) = &sample_names {
+                sample_name = Some(name[i + first_pairs.len()].clone());
+            }
+            let read_sketch_opt = sketch_interleaved_sequences(
+                read_file,
+                args.c,
+                args.k,
+                sample_name.clone(),
+                args.no_dedup,
+                args.fpr,
+            );
+            if read_sketch_opt.is_some() {
+                let res = fs::create_dir_all(&args.sample_output_dir);
+                if res.is_err() {
+                    error!("Could not create directory at {}", args.sample_output_dir);
+                    std::process::exit(1);
+                }
+                let pref = Path::new(&args.sample_output_dir);
+                let read_sketch = read_sketch_opt.unwrap();
+
+                let sketch_name;
+                if sample_name.is_some() {
+                    sketch_name = read_sketch.sample_name.as_ref().unwrap();
+                } else {
+                    sketch_name = &read_sketch.file_name;
+                }
+
+                let read_file_path = Path::new(&sketch_name).file_name().unwrap();
+                let file_path = pref.join(&read_file_path);
+
+                let file_path_str = format!(
+                    "{}.paired{}",
+                    file_path.to_str().unwrap(),
+                    SAMPLE_FILE_SUFFIX
+                );
+
+                let mut read_sk_file = BufWriter::new(
+                    File::create(&file_path_str)
+                        .expect(&format!("{} path not valid; exiting ", file_path_str)),
+                );
+
+                bincode::serialize_into(&mut read_sk_file, &read_sketch).unwrap();
+                info!("Sketching {} complete.", file_path_str);
+            }
+        });
+    }
+
     if !read_inputs.is_empty() {
         info!("Sketching non-paired sequences...");
     }
@@ -378,7 +435,7 @@ pub fn sketch(args: SketchArgs) {
         check_vram_and_block(max_ram, read_file);
         let mut sample_name = None;
         if let Some(name) = &sample_names {
-            sample_name = Some(name[i + first_pairs.len()].clone());
+            sample_name = Some(name[i + first_pairs.len() + interleaved_inputs.len()].clone());
         }
 
         let read_sketch_opt;
@@ -960,4 +1017,139 @@ pub fn sketch_sequences_needle(
         mean_read_length,
         num_reads: counter as u64,
     });
+}
+
+/// Extract the base read name by stripping /1, /2 suffixes and taking content before the first space.
+/// needletail's id() already strips everything after the first space, so we just need to strip /1 /2.
+fn base_read_name(id: &[u8]) -> String {
+    let name = std::str::from_utf8(id).unwrap_or("");
+    let name = name.strip_suffix("/1").or_else(|| name.strip_suffix("/2")).unwrap_or(name);
+    name.to_string()
+}
+
+pub fn sketch_interleaved_sequences(
+    read_file: &str,
+    c: usize,
+    k: usize,
+    sample_name: Option<String>,
+    no_dedup: bool,
+    dedup_fpr: f64,
+) -> Option<SequencesSketch> {
+    let reader = parse_fastx_file(&read_file);
+    if reader.is_err() {
+        log::error!("Interleaved reading failed for '{}'. Make sure the file is present and valid.", read_file);
+        std::process::exit(1);
+    }
+    let mut reader = reader.unwrap();
+
+    let mut read_sketch = SequencesSketch::new(read_file.to_string(), c, k, true, sample_name, 0.);
+    let mut num_dup_removed = 0;
+    let mut kmer_pair_set = FxHashSet::default();
+    let mut fpr = 0.001;
+    if dedup_fpr != 0. {
+        fpr = dedup_fpr;
+    }
+    let mut kmer_pair_set_approx = ScalableCuckooFilterBuilder::new()
+        .initial_capacity(1_000_000_0)
+        .false_positive_probability(fpr)
+        .hasher(FxHasher::default())
+        .finish();
+
+    let mut mean_read_length: f64 = 0.;
+    let mut counter: f64 = 0.;
+
+    // Buffer for the pending read (name, sequence)
+    let mut pending: Option<(String, Vec<u8>)> = None;
+
+    while let Some(rec_result) = reader.next() {
+        let rec = match rec_result {
+            Ok(r) => r,
+            Err(_) => {
+                log::warn!("Invalid record in interleaved file '{}'; skipping.", read_file);
+                continue;
+            }
+        };
+
+        let current_name = base_read_name(rec.id());
+        let current_seq = rec.seq().to_vec();
+
+        if let Some((prev_name, prev_seq)) = pending.take() {
+            if prev_name == current_name {
+                // Paired reads — process like sketch_pair_sequences
+                let mut temp_vec1 = vec![];
+                let mut temp_vec2 = vec![];
+                extract_markers(&prev_seq, &mut temp_vec1, c, k);
+                extract_markers(&current_seq, &mut temp_vec2, c, k);
+                let kmer_pair = pair_kmer(&prev_seq, &current_seq);
+
+                counter += 1.;
+                mean_read_length = mean_read_length
+                    + ((prev_seq.len() as f64) - mean_read_length) / counter;
+
+                for km in temp_vec1.iter() {
+                    if dedup_fpr == 0. {
+                        dup_removal_lsh_full_exact(
+                            &mut read_sketch.kmer_counts,
+                            &mut kmer_pair_set,
+                            km, kmer_pair, &mut num_dup_removed, no_dedup, None,
+                        );
+                    } else {
+                        dup_removal_lsh_full(
+                            &mut read_sketch.kmer_counts,
+                            &mut kmer_pair_set_approx,
+                            km, kmer_pair, &mut num_dup_removed, no_dedup,
+                        );
+                    }
+                }
+                for km in temp_vec2.iter() {
+                    if temp_vec1.contains(km) {
+                        continue;
+                    }
+                    if dedup_fpr == 0. {
+                        dup_removal_lsh_full_exact(
+                            &mut read_sketch.kmer_counts,
+                            &mut kmer_pair_set,
+                            km, kmer_pair, &mut num_dup_removed, no_dedup, None,
+                        );
+                    } else {
+                        dup_removal_lsh_full(
+                            &mut read_sketch.kmer_counts,
+                            &mut kmer_pair_set_approx,
+                            km, kmer_pair, &mut num_dup_removed, no_dedup,
+                        );
+                    }
+                }
+            } else {
+                // Previous read has no mate — error out
+                log::error!(
+                    "Read '{}' in interleaved file '{}' has no mate. Expected consecutive reads to share the same name (before the first space), but found '{}' followed by '{}'. Exiting.",
+                    prev_name, read_file, prev_name, current_name
+                );
+                std::process::exit(1);
+            }
+        } else {
+            // No pending read — buffer this one
+            pending = Some((current_name, current_seq));
+        }
+    }
+
+    // If there's a trailing unpaired read, error out
+    if let Some((prev_name, _)) = pending {
+        log::error!(
+            "Trailing unpaired read '{}' at end of interleaved file '{}'. Interleaved files must contain an even number of reads with consecutive pairs sharing the same name. Exiting.",
+            prev_name, read_file
+        );
+        std::process::exit(1);
+    }
+
+    let percent = (num_dup_removed as f64) / ((read_sketch.kmer_counts.values().sum::<u32>() as f64) + num_dup_removed as f64) * 100.;
+    log::debug!(
+        "Number of sketched k-mers removed due to read duplication for {}: {}. Percentage: {:.2}%",
+        read_sketch.file_name,
+        num_dup_removed,
+        percent,
+    );
+    read_sketch.mean_read_length = mean_read_length;
+    read_sketch.num_reads = counter as u64;
+    return Some(read_sketch);
 }

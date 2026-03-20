@@ -156,6 +156,7 @@ pub fn contain(mut args: ContainArgs, pseudotax_in: bool) {
     let mut genome_files = vec![];
     let mut read_sketch_files = vec![];
     let mut read_files = vec![];
+    let mut interleaved_files = vec![];
 
     let mut all_files = args.files.clone();
 
@@ -213,6 +214,11 @@ pub fn contain(mut args: ContainArgs, pseudotax_in: bool) {
         read_files.push(vec![first,second]);
     }
 
+    // interleaved files are treated as a single-element vec with a special marker
+    for interleaved in args.interleaved.iter() {
+        interleaved_files.push(interleaved);
+    }
+
     for read in args.reads.iter() {
         read_files.push(vec![read]);
     }
@@ -222,7 +228,7 @@ pub fn contain(mut args: ContainArgs, pseudotax_in: bool) {
         std::process::exit(1);
     }
 
-    if read_sketch_files.is_empty() && read_files.is_empty(){
+    if read_sketch_files.is_empty() && read_files.is_empty() && interleaved_files.is_empty(){
         log::error!("No read files found; see sylph query/profile -h for help. Exiting");
         std::process::exit(1);
     }
@@ -240,6 +246,11 @@ pub fn contain(mut args: ContainArgs, pseudotax_in: bool) {
         log::error!("Attempting profiling, but *.syldb was sketched with the --disable-profiling option. Exiting");
         std::process::exit(1);
     }
+
+    // Sketch interleaved files upfront
+    let interleaved_sketches: Vec<SequencesSketch> = interleaved_files.iter().filter_map(|f| {
+        sketch_interleaved_sequences(f, args.c, args.k, None, false, DEFAULT_FPR)
+    }).collect();
 
     let num_raw_read_files = read_files.len();
     let step;
@@ -262,7 +273,8 @@ pub fn contain(mut args: ContainArgs, pseudotax_in: bool) {
 
     let read_sketch_files_as_vec = read_sketch_files.clone().into_iter().map(|x| vec![x]).collect::<Vec<Vec<&String>>>();
     read_files.extend(read_sketch_files_as_vec);
-    let sequence_index_vec = (0..read_files.len()).collect::<Vec<usize>>();
+    let total_entries = read_files.len() + interleaved_sketches.len();
+    let sequence_index_vec = (0..total_entries).collect::<Vec<usize>>();
     let out_writer:Mutex<Box<dyn Write + Send>> = Mutex::new(out_writer);
 
     let chunks = get_chunks(&sequence_index_vec, step);
@@ -270,10 +282,20 @@ pub fn contain(mut args: ContainArgs, pseudotax_in: bool) {
     print_header(args.pseudotax,&mut *out_writer.lock().unwrap(), args.estimate_unknown);
     chunks.into_iter().for_each(|chunk| {
         chunk.into_par_iter().for_each(|j|{
-            let is_sketch = j >= read_files.len() - read_sketch_files.len();
-            let sequence_sketch = get_seq_sketch(&args, &read_files[j], is_sketch, genome_sketches[0].c, genome_sketches[0].k);
+            let sequence_sketch;
+            let display_name: String;
+            if j >= read_files.len() {
+                // This is an interleaved sketch
+                let idx = j - read_files.len();
+                sequence_sketch = Some(interleaved_sketches[idx].clone());
+                display_name = interleaved_sketches[idx].file_name.clone();
+            } else {
+                let is_sketch = j >= read_files.len() - read_sketch_files.len();
+                sequence_sketch = get_seq_sketch(&args, &read_files[j], is_sketch, genome_sketches[0].c, genome_sketches[0].k);
+                display_name = read_files[j][0].clone();
+            }
             if sequence_sketch.is_some(){
-                let first_read_file = read_files[j][0];
+                let first_read_file = &display_name;
                 let sequence_sketch = sequence_sketch.unwrap();
                 
                 let kmer_id_opt;
@@ -350,11 +372,13 @@ pub fn contain(mut args: ContainArgs, pseudotax_in: bool) {
                     print_ani_result(&res, args.pseudotax, &mut *out_writer);
                 }
             }
-            if read_files[j].len() > 1{
-                log::info!("Finished paired sample {}.", &read_files[j][0]);
+            if j >= read_files.len() {
+                log::info!("Finished interleaved sample {}.", &display_name);
+            } else if read_files[j].len() > 1{
+                log::info!("Finished paired sample {}.", &display_name);
             }
             else{
-                log::info!("Finished sample {}.", &read_files[j][0]);
+                log::info!("Finished sample {}.", &display_name);
             }
         });
     });

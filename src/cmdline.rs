@@ -83,6 +83,8 @@ pub struct SketchArgs {
     pub first_pair: Vec<String>,
     #[clap(short='2',long="second-pairs", multiple=true, help_heading = "PAIRED-END INPUT", help = "Second pairs for paired end reads")]
     pub second_pair: Vec<String>,
+    #[clap(long="interleaved", multiple=true, help_heading = "PAIRED-END INPUT", help = "Interleaved paired-end fasta/fastq reads. Consecutive reads with the same name (before the first space) are treated as pairs")]
+    pub interleaved: Vec<String>,
 }
 
 #[derive(Args)]
@@ -132,6 +134,9 @@ pub struct ContainArgs {
 
     #[clap(short='2', long="second-pairs", multiple=true, help = "Second pairs for raw paired-end reads (fastx/gzip)", help_heading = "SKETCHING")]
     pub second_pair: Vec<String>,
+
+    #[clap(long="interleaved", multiple=true, help = "Interleaved paired-end raw reads (fastx/gzip). Consecutive reads with the same name (before the first space) are treated as pairs", help_heading = "SKETCHING")]
+    pub interleaved: Vec<String>,
 
     #[clap(short, default_value_t = 200, help_heading = "SKETCHING", help = "Subsampling rate. Does nothing for pre-sketched files")]
     pub c: usize,
