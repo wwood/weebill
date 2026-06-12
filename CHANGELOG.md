@@ -1,7 +1,7 @@
 # sylph (unreleased)
 
 ### Minor
-- Added `--compressed-output` (analogous to `-o`) and `--compressed-database` (analogous to `-d`) to `sylph sketch`. These write compressed sketches (`.syldbc` databases / `.sylspc` samples) that are substantially smaller on disk (~30% smaller databases, ~45% smaller samples on test data). The FracMinHash values are sorted, delta-encoded and Golomb–Rice coded — near-optimal for the geometric gap distribution of uniform hashes — with hashes stored separately from their multiplicities. This reaches the entropy of the set without a generic-compression pass, so writing is nearly as fast as the uncompressed format. `query`, `profile`, and `inspect` transparently read both the legacy and compressed formats (detected by content, not extension), so the two can be mixed freely.
+- Added `--compressed-output` (analogous to `-o`) and `--compressed-database` (analogous to `-d`) to `sylph sketch`. These write compressed sketches (`.syldbc` databases / `.sylspc` samples) that are substantially smaller on disk (~30%+ smaller databases, ~55% smaller samples on test data). The FracMinHash values are sorted, delta-encoded and Golomb–Rice coded — near-optimal for the geometric gap distribution of uniform hashes — with hashes stored separately from their multiplicities, and the whole payload is then wrapped in a fast zstd frame that mops up the repetitive metadata (genome/contig names) and count stream. Rice reaches the entropy of the hash set so writing stays nearly as fast as the uncompressed format, and zstd adds negligible time. `query`, `profile`, and `inspect` transparently read both the legacy and compressed formats (detected by content, not extension), so the two can be mixed freely.
 
 # sylph v0.9.0: 10-13-2025
 

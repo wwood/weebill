@@ -17,6 +17,7 @@ bincode = "1"
 fxhash = "0"
 clap = { version = "3", features = ["derive"] }
 flate2 = { version = "1.0.17", features = ["zlib-ng"], default-features = false }
+zstd = "0.13"
 statrs="0.16"
 nalgebra="0"
 rand = "0"

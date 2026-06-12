@@ -21,22 +21,34 @@
 //!      buys nothing on an already near-random bitstream.
 //!   3. Small per-hash multiplicities (read sketches only) are stored as
 //!      varints in their own stream.
+//!   4. The whole payload is wrapped in a zstd frame. The Rice bitstream is at
+//!      entropy and passes through incompressibly, but the repetitive metadata
+//!      (genome file names, contig names) and the count stream compress well,
+//!      and zstd does this at very high throughput — unlike DEFLATE, it adds
+//!      negligible time to writing.
 //!
 //! The on-disk container is a four-byte `SYLZ` magic, a version byte and a
-//! sketch-type byte, followed by the encoded payload. The magic makes the
-//! format self-describing and detectable at read time independently of the file
-//! extension: a legacy `bincode` file begins with a little-endian length, which
-//! could only equal the `SYLZ` magic at ~1.5 billion entries — impossible for a
-//! FracMinHash sketch — so the two formats never collide.
+//! sketch-type byte (all in plaintext, ahead of the zstd frame), followed by
+//! the zstd-compressed payload. The magic makes the format self-describing and
+//! detectable at read time independently of the file extension: a legacy
+//! `bincode` file begins with a little-endian length, which could only equal
+//! the `SYLZ` magic at ~1.5 billion entries — impossible for a FracMinHash
+//! sketch — so the two formats never collide.
 
 use crate::types::*;
 use fxhash::FxHashMap;
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 
 const MAGIC: &[u8; 4] = b"SYLZ";
-const VERSION: u8 = 2;
+const VERSION: u8 = 3;
 const TYPE_GENOME_DB: u8 = 1;
 const TYPE_SEQ_SAMPLE: u8 = 2;
+
+/// zstd level for the outer frame. The Rice-coded hashes are already at entropy
+/// and pass through incompressibly; the win is the repetitive metadata (genome
+/// file names, contig names) and the read-sketch count stream. Level 3 (zstd's
+/// default) captures essentially all of that at very high throughput.
+const ZSTD_LEVEL: i32 = 3;
 
 /// Returns `true` if the buffered reader is positioned at the start of a
 /// compressed sylph sketch, without consuming any bytes.
@@ -401,22 +413,25 @@ fn read_genome_sketch<R: Read>(r: &mut R) -> io::Result<GenomeSketch> {
 
 /// Write a database (a list of genome sketches) in the compressed format.
 pub fn write_genome_sketches_compressed<W: Write>(
-    inner: W,
+    mut inner: W,
     sketches: &[GenomeSketch],
 ) -> io::Result<()> {
-    let mut w = BufWriter::new(inner);
-    write_header(&mut w, TYPE_GENOME_DB)?;
+    write_header(&mut inner, TYPE_GENOME_DB)?;
+    let mut w = BufWriter::new(zstd::stream::write::Encoder::new(inner, ZSTD_LEVEL)?);
     write_uvarint(&mut w, sketches.len() as u64)?;
     for s in sketches {
         write_genome_sketch(&mut w, s)?;
     }
-    w.flush()
+    w.into_inner()
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?
+        .finish()?;
+    Ok(())
 }
 
 /// Read a database (a list of genome sketches) from the compressed format.
-pub fn read_genome_sketches_compressed<R: Read>(inner: R) -> io::Result<Vec<GenomeSketch>> {
-    let mut r = BufReader::with_capacity(1 << 22, inner);
-    read_and_check_header(&mut r, TYPE_GENOME_DB)?;
+pub fn read_genome_sketches_compressed<R: Read>(mut inner: R) -> io::Result<Vec<GenomeSketch>> {
+    read_and_check_header(&mut inner, TYPE_GENOME_DB)?;
+    let mut r = BufReader::with_capacity(1 << 22, zstd::stream::read::Decoder::new(inner)?);
     let n = read_uvarint(&mut r)? as usize;
     let mut out = Vec::with_capacity(n);
     for _ in 0..n {
@@ -426,9 +441,9 @@ pub fn read_genome_sketches_compressed<R: Read>(inner: R) -> io::Result<Vec<Geno
 }
 
 /// Write a sample (read) sketch in the compressed format.
-pub fn write_seq_sketch_compressed<W: Write>(inner: W, s: &SequencesSketch) -> io::Result<()> {
-    let mut w = BufWriter::new(inner);
-    write_header(&mut w, TYPE_SEQ_SAMPLE)?;
+pub fn write_seq_sketch_compressed<W: Write>(mut inner: W, s: &SequencesSketch) -> io::Result<()> {
+    write_header(&mut inner, TYPE_SEQ_SAMPLE)?;
+    let mut w = BufWriter::new(zstd::stream::write::Encoder::new(inner, ZSTD_LEVEL)?);
     write_uvarint(&mut w, s.c as u64)?;
     write_uvarint(&mut w, s.k as u64)?;
     write_string(&mut w, &s.file_name)?;
@@ -451,13 +466,16 @@ pub fn write_seq_sketch_compressed<W: Write>(inner: W, s: &SequencesSketch) -> i
         write_uvarint(&mut w, *count as u64)?;
     }
 
-    w.flush()
+    w.into_inner()
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?
+        .finish()?;
+    Ok(())
 }
 
 /// Read a sample (read) sketch from the compressed format.
-pub fn read_seq_sketch_compressed<R: Read>(inner: R) -> io::Result<SequencesSketch> {
-    let mut r = BufReader::with_capacity(1 << 22, inner);
-    read_and_check_header(&mut r, TYPE_SEQ_SAMPLE)?;
+pub fn read_seq_sketch_compressed<R: Read>(mut inner: R) -> io::Result<SequencesSketch> {
+    read_and_check_header(&mut inner, TYPE_SEQ_SAMPLE)?;
+    let mut r = BufReader::with_capacity(1 << 22, zstd::stream::read::Decoder::new(inner)?);
     let c = read_uvarint(&mut r)? as usize;
     let k = read_uvarint(&mut r)? as usize;
     let file_name = read_string(&mut r)?;
