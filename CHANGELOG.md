@@ -1,3 +1,8 @@
+# sylph (unreleased)
+
+### Minor
+- Added `--compressed-output` (analogous to `-o`) and `--compressed-database` (analogous to `-d`) to `sylph sketch`. These write compressed sketches (`.syldbc` databases / `.sylspc` samples) that are substantially smaller on disk (~25% smaller databases, ~50% smaller samples on test data). Compression sorts and delta-encodes the FracMinHash values, splits hashes from their multiplicities, and gzips the result. `query`, `profile`, and `inspect` transparently read both the legacy and compressed formats (detected by content, not extension), so the two can be mixed freely.
+
 # sylph v0.9.0: 10-13-2025
 
 - Added an option `--estimate-read-count` to VERY ROUGHLY output estimated read counts in the "Sequence_abundance" column instead of an actual sequence abundance. This forces `-u`. Only works for short reads right now. 

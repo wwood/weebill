@@ -503,12 +503,20 @@ fn get_genome_sketches(
 
     for genome_sketch_file in genome_sketch_files {
         let file = File::open(genome_sketch_file).expect(&format!("The sketch `{}` could not be opened. Exiting", genome_sketch_file));
-        let genome_reader = BufReader::with_capacity(10_000_000, file);
-        let genome_sketches_vec: Vec<GenomeSketch> = bincode::deserialize_from(genome_reader)
-            .expect(&format!(
-                "The sketch `{}` is not a valid sketch. Perhaps it is an older, incompatible version ",
-                &genome_sketch_file
-            ));
+        let mut genome_reader = BufReader::with_capacity(10_000_000, file);
+        let genome_sketches_vec: Vec<GenomeSketch> = if crate::compress::peek_is_compressed(&mut genome_reader).unwrap_or(false) {
+            crate::compress::read_genome_sketches_compressed(&mut genome_reader)
+                .expect(&format!(
+                    "The sketch `{}` is not a valid sketch. Perhaps it is an older, incompatible version ",
+                    &genome_sketch_file
+                ))
+        } else {
+            bincode::deserialize_from(&mut genome_reader)
+                .expect(&format!(
+                    "The sketch `{}` is not a valid sketch. Perhaps it is an older, incompatible version ",
+                    &genome_sketch_file
+                ))
+        };
         if genome_sketches_vec.is_empty() {
             continue;
         }
@@ -567,10 +575,16 @@ fn get_seq_sketch(
             "The sketch `{}` could not be opened",
             &read_sketch_file
         ));
-        let read_reader = BufReader::with_capacity(10_000_000, file);
-        let read_sketch: SequencesSketch = bincode::deserialize_from(read_reader).expect(
-            &format!("The sketch `{}` is not a valid sketch. Perhaps it is an older incompatible version ", read_sketch_file),
-        );
+        let mut read_reader = BufReader::with_capacity(10_000_000, file);
+        let read_sketch: SequencesSketch = if crate::compress::peek_is_compressed(&mut read_reader).unwrap_or(false) {
+            crate::compress::read_seq_sketch_compressed(&mut read_reader).expect(
+                &format!("The sketch `{}` is not a valid sketch. Perhaps it is an older incompatible version ", read_sketch_file),
+            )
+        } else {
+            bincode::deserialize_from(&mut read_reader).expect(
+                &format!("The sketch `{}` is not a valid sketch. Perhaps it is an older incompatible version ", read_sketch_file),
+            )
+        };
         if read_sketch.c > genome_c {
             error!("{} value of -c is {}; this is greater than the smallest value of -c = {} for a genome sketch. Exiting.", read_file, read_sketch.c, genome_c);
             return None;

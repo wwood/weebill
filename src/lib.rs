@@ -1,4 +1,5 @@
 pub mod sketch;
+pub mod compress;
 pub mod constants;
 pub mod types;
 pub mod seeding;

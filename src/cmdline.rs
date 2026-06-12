@@ -33,6 +33,10 @@ pub struct SketchArgs {
     pub db_out_name: String,
     #[clap(short='d',long="sample-output-directory", default_value = "./", help_heading = "OUTPUT", help = "Output directory for sample sketches")]
     pub sample_output_dir: String,
+    #[clap(long="compressed-output", help_heading = "OUTPUT", help = "Like -o, but writes a compressed database sketch (with .syldbc appended). Compressed sketches are smaller on disk and readable by query/profile/inspect")]
+    pub compressed_db_out_name: Option<String>,
+    #[clap(long="compressed-database", help_heading = "OUTPUT", help = "Like -d, but writes compressed sample sketches (with .sylspc appended). Compressed sketches are smaller on disk and readable by query/profile/inspect")]
+    pub compressed_sample_output_dir: Option<String>,
     #[clap(short,long="individual-records", help_heading = "GENOME INPUT", help = "Use individual records (contigs) for database construction")]
     pub individual: bool,
     #[clap(multiple=true,short,long="reads", help_heading = "SINGLE-END INPUT", help = "Single-end fasta/fastq reads")]

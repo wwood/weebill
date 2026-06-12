@@ -24,6 +24,46 @@ use std::path::Path;
 use std::sync::Mutex;
 type Marker = u32;
 
+/// Write a single read (sample) sketch to disk, in either the legacy `bincode`
+/// format or, when a `--compressed-database` directory is given, the compressed
+/// format.
+fn write_read_sketch_file(
+    read_sketch: &SequencesSketch,
+    sketch_name: &str,
+    paired: bool,
+    sample_output_dir: &str,
+    compressed_sample_output_dir: &Option<String>,
+) {
+    let (dir, compressed) = match compressed_sample_output_dir {
+        Some(d) => (d.as_str(), true),
+        None => (sample_output_dir, false),
+    };
+    std::fs::create_dir_all(dir)
+        .expect("Could not create directory for output sample files. Exiting...");
+    let read_file_path = Path::new(sketch_name).file_name().unwrap();
+    let file_path = Path::new(dir).join(read_file_path);
+    let suffix = if compressed {
+        SAMPLE_COMP_FILE_SUFFIX
+    } else {
+        SAMPLE_FILE_SUFFIX
+    };
+    let file_path_str = if paired {
+        format!("{}.paired{}", file_path.to_str().unwrap(), suffix)
+    } else {
+        format!("{}{}", file_path.to_str().unwrap(), suffix)
+    };
+    let mut read_sk_file = BufWriter::new(
+        File::create(&file_path_str).expect(&format!("{} path not valid; exiting ", file_path_str)),
+    );
+    if compressed {
+        crate::compress::write_seq_sketch_compressed(&mut read_sk_file, read_sketch)
+            .expect(&format!("Failed to write compressed sketch {}", file_path_str));
+    } else {
+        bincode::serialize_into(&mut read_sk_file, read_sketch).unwrap();
+    }
+    info!("Sketching {} complete.", file_path_str);
+}
+
 pub fn check_vram_and_block(max_ram: usize, file: &str) {
     if let Some(usage) = memory_stats() {
         let mut gb_usage_curr = usage.virtual_mem as f64 / 1_000_000_000 as f64;
@@ -333,32 +373,21 @@ pub fn sketch(args: SketchArgs) {
                     error!("Could not create directory at {}", args.sample_output_dir);
                     std::process::exit(1);
                 }
-                let pref = Path::new(&args.sample_output_dir);
                 let read_sketch = read_sketch_opt.unwrap();
 
-                let sketch_name;
-                if sample_name.is_some() {
-                    sketch_name = read_sketch.sample_name.as_ref().unwrap();
+                let sketch_name = if sample_name.is_some() {
+                    read_sketch.sample_name.as_ref().unwrap().clone()
                 } else {
-                    sketch_name = &read_sketch.file_name;
-                }
+                    read_sketch.file_name.clone()
+                };
 
-                let read_file_path = Path::new(&sketch_name).file_name().unwrap();
-                let file_path = pref.join(&read_file_path);
-
-                let file_path_str = format!(
-                    "{}.paired{}",
-                    file_path.to_str().unwrap(),
-                    SAMPLE_FILE_SUFFIX
+                write_read_sketch_file(
+                    &read_sketch,
+                    &sketch_name,
+                    true,
+                    &args.sample_output_dir,
+                    &args.compressed_sample_output_dir,
                 );
-
-                let mut read_sk_file = BufWriter::new(
-                    File::create(&file_path_str)
-                        .expect(&format!("{} path not valid; exiting ", file_path_str)),
-                );
-
-                bincode::serialize_into(&mut read_sk_file, &read_sketch).unwrap();
-                info!("Sketching {} complete.", file_path_str);
             }
         });
     }
@@ -392,24 +421,18 @@ pub fn sketch(args: SketchArgs) {
 
         if read_sketch_opt.is_some() {
             let read_sketch = read_sketch_opt.unwrap();
-            let sketch_name;
-            if sample_name.is_some() {
-                sketch_name = read_sketch.sample_name.as_ref().unwrap();
+            let sketch_name = if sample_name.is_some() {
+                read_sketch.sample_name.as_ref().unwrap().clone()
             } else {
-                sketch_name = &read_sketch.file_name;
-            }
-            let read_file_path = Path::new(&sketch_name).file_name().unwrap();
-            let file_path = pref.join(&read_file_path);
-
-            let file_path_str = format!("{}{}", file_path.to_str().unwrap(), SAMPLE_FILE_SUFFIX);
-
-            let mut read_sk_file = BufWriter::new(
-                File::create(&file_path_str)
-                    .expect(&format!("{} path not valid; exiting.", file_path_str)),
+                read_sketch.file_name.clone()
+            };
+            write_read_sketch_file(
+                &read_sketch,
+                &sketch_name,
+                false,
+                &args.sample_output_dir,
+                &args.compressed_sample_output_dir,
             );
-
-            bincode::serialize_into(&mut read_sk_file, &read_sketch).unwrap();
-            info!("Sketching {} complete.", file_path_str);
         }
     });
 
@@ -417,8 +440,17 @@ pub fn sketch(args: SketchArgs) {
         info!("Sketching genomes...");
         let iter_vec: Vec<usize> = (0..genome_inputs.len()).into_iter().collect();
         let counter: Mutex<usize> = Mutex::new(0);
-        let pref = Path::new(&args.db_out_name);
-        let file_path_str = format!("{}{}", pref.to_str().unwrap(), QUERY_FILE_SUFFIX);
+        let (db_out_name, db_compressed) = match &args.compressed_db_out_name {
+            Some(name) => (name.as_str(), true),
+            None => (args.db_out_name.as_str(), false),
+        };
+        let db_suffix = if db_compressed {
+            QUERY_COMP_FILE_SUFFIX
+        } else {
+            QUERY_FILE_SUFFIX
+        };
+        let pref = Path::new(db_out_name);
+        let file_path_str = format!("{}{}", pref.to_str().unwrap(), db_suffix);
         let path = std::path::Path::new(&file_path_str);
         let prefix = path.parent().unwrap();
         std::fs::create_dir_all(prefix)
@@ -471,7 +503,19 @@ pub fn sketch(args: SketchArgs) {
                 File::create(&file_path_str).expect(&format!("{} not valid ", file_path_str)),
             );
             info!("Wrote all genome sketches to {}", file_path_str);
-            bincode::serialize_into(&mut genome_sk_file, &all_genome_sketches).unwrap();
+            let all_genome_sketches = all_genome_sketches.into_inner().unwrap();
+            if db_compressed {
+                crate::compress::write_genome_sketches_compressed(
+                    &mut genome_sk_file,
+                    &all_genome_sketches,
+                )
+                .expect(&format!(
+                    "Failed to write compressed database {}",
+                    file_path_str
+                ));
+            } else {
+                bincode::serialize_into(&mut genome_sk_file, &all_genome_sketches).unwrap();
+            }
         }
     }
 
