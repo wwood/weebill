@@ -31,8 +31,7 @@ fn compress_genome_roundtrip() {
 
     let mut buf = Vec::new();
     compress::write_genome_sketches_compressed(&mut buf, &sketches).unwrap();
-    assert_eq!(buf[0], 0x1f, "compressed output must start with gzip magic");
-    assert_eq!(buf[1], 0x8b);
+    assert_eq!(&buf[..4], b"SYLZ", "compressed output must start with SYLZ magic");
     let decoded = compress::read_genome_sketches_compressed(&buf[..]).unwrap();
 
     assert_eq!(decoded.len(), sketches.len());
@@ -96,6 +95,30 @@ fn compress_seq_roundtrip() {
     let mut buf2 = Vec::new();
     compress::write_seq_sketch_compressed(&mut buf2, &sketch2).unwrap();
     assert_eq!(sketch2, compress::read_seq_sketch_compressed(&buf2[..]).unwrap());
+}
+
+#[test]
+fn compress_detection_does_not_collide_with_legacy() {
+    // A real compressed sketch is detected as compressed.
+    let sketch = SequencesSketch {
+        kmer_counts: FxHashMap::default(),
+        c: 200,
+        k: 31,
+        file_name: "s.fq".to_string(),
+        sample_name: None,
+        paired: false,
+        mean_read_length: 0.0,
+    };
+    let mut buf = Vec::new();
+    compress::write_seq_sketch_compressed(&mut buf, &sketch).unwrap();
+    let mut slice: &[u8] = &buf;
+    assert!(compress::peek_is_compressed(&mut slice).unwrap());
+
+    // A legacy bincode sketch whose leading length bytes are 1f 8b 08 (the old
+    // gzip-style signature) must NOT be misdetected as compressed.
+    let legacy_collision: &[u8] = &[0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00];
+    let mut slice2 = legacy_collision;
+    assert!(!compress::peek_is_compressed(&mut slice2).unwrap());
 }
 
 fn test_hash(){

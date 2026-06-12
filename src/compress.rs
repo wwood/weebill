@@ -15,10 +15,12 @@
 //!      ~`u64::MAX / (c * n)` on average, requiring far fewer than 64 bits each.
 //!   3. A generic `gzip`/DEFLATE pass on top of the varint stream.
 //!
-//! The on-disk container is a gzip stream whose payload begins with a small
-//! magic + version header, so the format is self-describing and is detected at
-//! read time independently of the file extension (a gzip stream always starts
-//! with the bytes `0x1f 0x8b`, which the legacy `bincode` format never does).
+//! The on-disk container is a four-byte `SYLZ` magic, a version byte and a
+//! sketch-type byte, followed by a gzip stream holding the payload. The magic
+//! makes the format self-describing and detectable at read time independently
+//! of the file extension: a legacy `bincode` file begins with a little-endian
+//! length, which could only equal the `SYLZ` magic at ~1.5 billion entries —
+//! impossible for a FracMinHash sketch — so the two formats never collide.
 
 use crate::types::*;
 use fxhash::FxHashMap;
@@ -33,14 +35,16 @@ const TYPE_GENOME_DB: u8 = 1;
 const TYPE_SEQ_SAMPLE: u8 = 2;
 
 /// Returns `true` if the buffered reader is positioned at the start of a gzip
-/// stream (i.e. a compressed sylph sketch), without consuming any bytes.
+/// compressed sylph sketch, without consuming any bytes.
 ///
-/// We check the two gzip magic bytes plus the DEFLATE compression-method byte
-/// (`0x08`). The legacy `bincode` format begins with a little-endian length,
-/// so this three-byte signature avoids misclassifying it.
+/// Detection is by the four-byte `SYLZ` magic that prefixes the file (ahead of
+/// the gzip stream). The legacy `bincode` format begins with a little-endian
+/// length, which could only match this signature at ~1.5 billion entries — far
+/// beyond any possible FracMinHash sketch — so legacy sketches are never
+/// misclassified and always fall back to the `bincode` reader.
 pub fn peek_is_compressed<R: BufRead>(reader: &mut R) -> io::Result<bool> {
     let buf = reader.fill_buf()?;
-    Ok(buf.len() >= 3 && buf[0] == 0x1f && buf[1] == 0x8b && buf[2] == 0x08)
+    Ok(buf.len() >= MAGIC.len() && &buf[..MAGIC.len()] == MAGIC)
 }
 
 // --- primitive encoders -----------------------------------------------------
@@ -215,12 +219,12 @@ fn read_genome_sketch<R: Read>(r: &mut R) -> io::Result<GenomeSketch> {
 
 /// Write a database (a list of genome sketches) in the compressed format.
 pub fn write_genome_sketches_compressed<W: Write>(
-    inner: W,
+    mut inner: W,
     sketches: &[GenomeSketch],
 ) -> io::Result<()> {
+    write_header(&mut inner, TYPE_GENOME_DB)?;
     let enc = GzEncoder::new(inner, Compression::default());
     let mut w = BufWriter::new(enc);
-    write_header(&mut w, TYPE_GENOME_DB)?;
     write_uvarint(&mut w, sketches.len() as u64)?;
     for s in sketches {
         write_genome_sketch(&mut w, s)?;
@@ -232,9 +236,9 @@ pub fn write_genome_sketches_compressed<W: Write>(
 }
 
 /// Read a database (a list of genome sketches) from the compressed format.
-pub fn read_genome_sketches_compressed<R: Read>(inner: R) -> io::Result<Vec<GenomeSketch>> {
+pub fn read_genome_sketches_compressed<R: Read>(mut inner: R) -> io::Result<Vec<GenomeSketch>> {
+    read_and_check_header(&mut inner, TYPE_GENOME_DB)?;
     let mut r = BufReader::new(GzDecoder::new(inner));
-    read_and_check_header(&mut r, TYPE_GENOME_DB)?;
     let n = read_uvarint(&mut r)? as usize;
     let mut out = Vec::with_capacity(n);
     for _ in 0..n {
@@ -244,10 +248,10 @@ pub fn read_genome_sketches_compressed<R: Read>(inner: R) -> io::Result<Vec<Geno
 }
 
 /// Write a sample (read) sketch in the compressed format.
-pub fn write_seq_sketch_compressed<W: Write>(inner: W, s: &SequencesSketch) -> io::Result<()> {
+pub fn write_seq_sketch_compressed<W: Write>(mut inner: W, s: &SequencesSketch) -> io::Result<()> {
+    write_header(&mut inner, TYPE_SEQ_SAMPLE)?;
     let enc = GzEncoder::new(inner, Compression::default());
     let mut w = BufWriter::new(enc);
-    write_header(&mut w, TYPE_SEQ_SAMPLE)?;
     write_uvarint(&mut w, s.c as u64)?;
     write_uvarint(&mut w, s.k as u64)?;
     write_string(&mut w, &s.file_name)?;
@@ -281,9 +285,9 @@ pub fn write_seq_sketch_compressed<W: Write>(inner: W, s: &SequencesSketch) -> i
 }
 
 /// Read a sample (read) sketch from the compressed format.
-pub fn read_seq_sketch_compressed<R: Read>(inner: R) -> io::Result<SequencesSketch> {
+pub fn read_seq_sketch_compressed<R: Read>(mut inner: R) -> io::Result<SequencesSketch> {
+    read_and_check_header(&mut inner, TYPE_SEQ_SAMPLE)?;
     let mut r = BufReader::new(GzDecoder::new(inner));
-    read_and_check_header(&mut r, TYPE_SEQ_SAMPLE)?;
     let c = read_uvarint(&mut r)? as usize;
     let k = read_uvarint(&mut r)? as usize;
     let file_name = read_string(&mut r)?;
