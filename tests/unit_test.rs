@@ -1,8 +1,124 @@
 use assert_cmd::prelude::*; // Add methods on commands
 use sylph::seeding;
 use sylph::compress;
+use sylph::refdelta;
 use sylph::types::{GenomeSketch, SequencesSketch};
 use fxhash::FxHashMap;
+
+fn gsketch(file_name: &str, kmers: Vec<u64>) -> GenomeSketch {
+    GenomeSketch {
+        genome_kmers: kmers,
+        pseudotax_tracked_nonused_kmers: None,
+        file_name: file_name.to_string(),
+        first_contig_name: "c".to_string(),
+        c: 200,
+        k: 31,
+        gn_size: 1000,
+        min_spacing: 30,
+    }
+}
+
+#[test]
+fn refdelta_build_two_level_assignment() {
+    // species A: rep A_rep + strain A_str; species B: rep B_rep
+    let sketches = vec![
+        gsketch("A_rep.fa", vec![1, 2, 3, 100, 101, 500]),
+        gsketch("A_str.fa", vec![100, 101, 200, 201]),
+        gsketch("B_rep.fa", vec![300, 301, 500]),
+    ];
+    let mut tax: FxHashMap<String, (String, bool)> = FxHashMap::default();
+    tax.insert("A_rep.fa".into(), ("A".into(), true));
+    tax.insert("A_str.fa".into(), ("A".into(), false));
+    tax.insert("B_rep.fa".into(), ("B".into(), true));
+
+    let db = refdelta::build_refdb(&sketches, &tax);
+    // ordering: species A (rep first), then strain, then species B
+    assert_eq!(db.genomes[0].file_name, "A_rep.fa");
+    assert_eq!(db.genomes[1].file_name, "A_str.fa");
+    assert_eq!(db.genomes[2].file_name, "B_rep.fa");
+    // strains of A are contiguous (ids 0,1)
+    assert!(db.genomes[0].is_rep && !db.genomes[1].is_rep);
+
+    // 100,101 are in rep A_rep AND strain A_str -> rep wins (distinctive to A_rep)
+    assert_eq!(db.distinctive[0], vec![1, 2, 3, 100, 101]);
+    assert_eq!(db.distinctive[1], vec![200, 201]); // strain-only
+    assert_eq!(db.distinctive[2], vec![300, 301]);
+    // 500 is in two reps -> shared pool
+    assert_eq!(db.pool, vec![500]);
+}
+
+fn refdelta_roundtrip(sketch: &SequencesSketch, db: &refdelta::RefDb) {
+    let lookup = db.build_lookup();
+    let mut buf = Vec::new();
+    refdelta::compress_seq(&mut buf, sketch, db, &lookup).unwrap();
+    let decoded = refdelta::decompress_seq(&buf[..], db).unwrap();
+    assert_eq!(*sketch, decoded);
+}
+
+#[test]
+fn refdelta_compress_decompress_roundtrip() {
+    let sketches = vec![
+        gsketch("A_rep.fa", vec![1, 2, 3, 100, 101, 500]),
+        gsketch("A_str.fa", vec![100, 101, 200, 201]),
+        gsketch("B_rep.fa", vec![300, 301, 500]),
+    ];
+    let mut tax: FxHashMap<String, (String, bool)> = FxHashMap::default();
+    tax.insert("A_rep.fa".into(), ("A".into(), true));
+    tax.insert("A_str.fa".into(), ("A".into(), false));
+    tax.insert("B_rep.fa".into(), ("B".into(), true));
+    let db = refdelta::build_refdb(&sketches, &tax);
+
+    // reference DB serialization roundtrip
+    let mut dbuf = Vec::new();
+    refdelta::write_refdb(&mut dbuf, &db).unwrap();
+    let db2 = refdelta::read_refdb(&dbuf[..]).unwrap();
+    assert_eq!(db, db2);
+
+    // distinctive hits + pool hit + novel hashes + counts
+    let mut counts: FxHashMap<u64, u32> = FxHashMap::default();
+    for (h, c) in [(1u64, 5u32), (2, 3), (100, 7), (200, 2), (500, 4), (999, 1), (98765, 9)] {
+        counts.insert(h, c);
+    }
+    let sketch = SequencesSketch {
+        kmer_counts: counts,
+        c: 200,
+        k: 31,
+        file_name: "sample.fq".into(),
+        sample_name: Some("s".into()),
+        paired: true,
+        mean_read_length: 149.0,
+    };
+    refdelta_roundtrip(&sketch, &db);
+
+    // empty sketch and a sketch that is entirely novel also roundtrip
+    refdelta_roundtrip(
+        &SequencesSketch {
+            kmer_counts: FxHashMap::default(),
+            c: 200,
+            k: 31,
+            file_name: "empty.fq".into(),
+            sample_name: None,
+            paired: false,
+            mean_read_length: 0.0,
+        },
+        &db,
+    );
+    let mut nov: FxHashMap<u64, u32> = FxHashMap::default();
+    nov.insert(7_000_000, 1);
+    nov.insert(8_000_000, 2);
+    refdelta_roundtrip(
+        &SequencesSketch {
+            kmer_counts: nov,
+            c: 200,
+            k: 31,
+            file_name: "novel.fq".into(),
+            sample_name: None,
+            paired: false,
+            mean_read_length: 1.0,
+        },
+        &db,
+    );
+}
 
 #[test]
 fn compress_genome_roundtrip() {

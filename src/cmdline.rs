@@ -22,6 +22,42 @@ pub enum Mode {
     ///Inspect sketched .syldb and .sylsp files.
     #[clap(arg_required_else_help = true, display_order = 4)]
     Inspect(InspectArgs),
+    ///Build a k-mer dereplicated reference database (.sylref) for reference-delta sample compression.
+    #[clap(arg_required_else_help = true, display_order = 5)]
+    RefBuild(RefBuildArgs),
+    ///Compress sample sketches against a reference DB (.sylsp -> .sylspr), or --decompress to reverse.
+    #[clap(arg_required_else_help = true, display_order = 6)]
+    RefCompress(RefCompressArgs),
+}
+
+#[derive(Args)]
+pub struct RefBuildArgs {
+    #[clap(multiple=true, help = "Genome database sketches (*.syldb) to build the reference from")]
+    pub files: Vec<String>,
+    #[clap(short='T', long="taxonomy", help_heading = "INPUT", help = "TSV with one line per genome: <genome_file_name><TAB><species><TAB><rep|strain>. The genome name matches the sketched path or its basename. Genomes absent from the file are treated as their own single-genome species representative. Strains of a species are placed contiguously, representatives first.")]
+    pub taxonomy: Option<String>,
+    #[clap(short='o', long="output", help = "Output reference database name (.sylref appended)")]
+    pub output: String,
+    #[clap(short, default_value_t = 3, help = "Number of threads")]
+    pub threads: usize,
+    #[clap(long="trace", help = "Trace output")]
+    pub trace: bool,
+}
+
+#[derive(Args)]
+pub struct RefCompressArgs {
+    #[clap(multiple=true, help = "Sample sketches (*.sylsp) to compress, or (*.sylspr) with --decompress")]
+    pub files: Vec<String>,
+    #[clap(short='r', long="reference", help = "Reference database (*.sylref) produced by `sylph ref-build`")]
+    pub ref_db: String,
+    #[clap(long="decompress", help = "Reverse the operation: reconstruct *.sylsp from *.sylspr")]
+    pub decompress: bool,
+    #[clap(short='d', long="output-directory", default_value = "./", help = "Output directory")]
+    pub output_dir: String,
+    #[clap(short, default_value_t = 3, help = "Number of threads")]
+    pub threads: usize,
+    #[clap(long="trace", help = "Trace output")]
+    pub trace: bool,
 }
 
 

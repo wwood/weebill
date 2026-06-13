@@ -1,5 +1,6 @@
 pub mod sketch;
 pub mod compress;
+pub mod refdelta;
 pub mod constants;
 pub mod types;
 pub mod seeding;
