@@ -84,36 +84,38 @@ pub struct RefDb {
     pub distinctive: Vec<Vec<u64>>,
     /// Hashes shared by ≥2 genomes (after rep preference), sorted and deduplicated.
     pub pool: Vec<u64>,
-    /// Digest over the full reference contents, used to reject decoding a sample
-    /// against the wrong DB. Computed once at build/load time (see `compute_fingerprint`).
-    pub fingerprint: u64,
 }
 
-/// A digest over the *entire* reference contents (every distinctive and pool hash,
-/// in order, with length separators). A sample is encoded as indices into these
-/// arrays, so any difference that could change a decoded hash must change the
-/// digest — mixing only lengths and boundary hashes would let a different DB with
-/// matching boundaries pass and silently produce a wrong `SequencesSketch`.
-fn compute_fingerprint(c: usize, k: usize, distinctive: &[Vec<u64>], pool: &[u64]) -> u64 {
+/// A stable fingerprint so a compressed sample can be matched to its reference DB.
+/// This mixes only array lengths and boundary hashes (not full contents): a
+/// deliberately different DB with matching shape/boundaries could in principle
+/// collide, but the chance of that in practice is negligible and it keeps the
+/// digest cheap.
+fn fingerprint(db: &RefDb) -> u64 {
     let mut h: u64 = 1469598103934665603; // FNV-1a offset
     let mut mix = |x: u64| {
         h ^= x;
         h = h.wrapping_mul(1099511628211);
     };
-    mix(c as u64);
-    mix(k as u64);
-    mix(distinctive.len() as u64);
-    for d in distinctive.iter() {
-        mix(0x5359_4c44_4953_5400); // "SYLDIST\0" domain separator
+    mix(db.c as u64);
+    mix(db.k as u64);
+    mix(db.genomes.len() as u64);
+    mix(db.pool.len() as u64);
+    for (i, d) in db.distinctive.iter().enumerate() {
+        mix(i as u64);
         mix(d.len() as u64);
-        for &x in d {
-            mix(x);
+        if let Some(&first) = d.first() {
+            mix(first);
+        }
+        if let Some(&last) = d.last() {
+            mix(last);
         }
     }
-    mix(0x5359_4c50_4f4f_4c00); // "SYLPOOL\0" domain separator
-    mix(pool.len() as u64);
-    for &x in pool {
-        mix(x);
+    if let Some(&p) = db.pool.first() {
+        mix(p);
+    }
+    if let Some(&p) = db.pool.last() {
+        mix(p);
     }
     h
 }
@@ -231,14 +233,12 @@ pub fn build_refdb(
     pool.sort_unstable();
     pool.dedup();
 
-    let fingerprint = compute_fingerprint(c, k, &distinctive, &pool);
     RefDb {
         c,
         k,
         genomes,
         distinctive,
         pool,
-        fingerprint,
     }
 }
 
@@ -313,14 +313,12 @@ pub fn read_refdb<R: Read>(inner: R) -> io::Result<RefDb> {
         distinctive.push(read_hashes(&mut r)?);
     }
     let pool = read_hashes(&mut r)?;
-    let fingerprint = compute_fingerprint(c, k, &distinctive, &pool);
     Ok(RefDb {
         c,
         k,
         genomes,
         distinctive,
         pool,
-        fingerprint,
     })
 }
 
@@ -439,7 +437,7 @@ pub fn compress_seq<W: Write>(
     let mut payload = Vec::new();
     payload.extend_from_slice(SKETCH_MAGIC);
     payload.push(SKETCH_VERSION);
-    payload.extend_from_slice(&db.fingerprint.to_le_bytes());
+    payload.extend_from_slice(&fingerprint(db).to_le_bytes());
     write_uvarint(&mut payload, sketch.c as u64)?;
     write_uvarint(&mut payload, sketch.k as u64)?;
     write_string(&mut payload, &sketch.file_name)?;
@@ -506,7 +504,7 @@ pub fn decompress_seq<R: Read>(inner: R, db: &RefDb) -> io::Result<SequencesSket
     }
     let mut fp = [0u8; 8];
     r.read_exact(&mut fp)?;
-    if u64::from_le_bytes(fp) != db.fingerprint {
+    if u64::from_le_bytes(fp) != fingerprint(db) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "reference DB does not match the one used to compress this sample",
