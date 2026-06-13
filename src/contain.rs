@@ -186,6 +186,10 @@ pub fn contain(mut args: ContainArgs, pseudotax_in: bool) {
                 break
             }
         }
+        // reference-delta compressed samples are decoded via --reference in get_seq_sketch
+        if file.ends_with(REF_SAMPLE_SUFFIX){
+            sample_sketch_good_suffix = true;
+        }
 
         if genome_sketch_good_suffix{
             genome_sketch_files.push(file);
@@ -226,6 +230,23 @@ pub fn contain(mut args: ContainArgs, pseudotax_in: bool) {
         log::error!("No read files found; see sylph query/profile -h for help. Exiting");
         std::process::exit(1);
     }
+
+    // Load the reference DB (if given) once, for decoding *.sylspr samples.
+    let have_refdelta = read_sketch_files.iter().any(|f| f.ends_with(REF_SAMPLE_SUFFIX));
+    let ref_db: Option<crate::refdelta::RefDb> = match &args.reference {
+        Some(path) => {
+            log::info!("Loading reference database {} for .sylspr decoding...", path);
+            let r = BufReader::with_capacity(10_000_000, File::open(path).unwrap_or_else(|_| panic!("Could not open reference database {}", path)));
+            Some(crate::refdelta::read_refdb(r).unwrap_or_else(|e| panic!("{} is not a valid reference database: {}", path, e)))
+        }
+        None => {
+            if have_refdelta {
+                log::error!("Reference-delta compressed samples (*.sylspr) were given but --reference was not specified. Exiting.");
+                std::process::exit(1);
+            }
+            None
+        }
+    };
 
     let genome_sketches = get_genome_sketches(&args, &genome_sketch_files, &genome_files);
     let genome_index_vec = (0..genome_sketches.len()).collect::<Vec<usize>>();
@@ -271,7 +292,7 @@ pub fn contain(mut args: ContainArgs, pseudotax_in: bool) {
     chunks.into_iter().for_each(|chunk| {
         chunk.into_par_iter().for_each(|j|{
             let is_sketch = j >= read_files.len() - read_sketch_files.len();
-            let sequence_sketch = get_seq_sketch(&args, &read_files[j], is_sketch, genome_sketches[0].c, genome_sketches[0].k);
+            let sequence_sketch = get_seq_sketch(&args, &read_files[j], is_sketch, ref_db.as_ref(), genome_sketches[0].c, genome_sketches[0].k);
             if sequence_sketch.is_some(){
                 let first_read_file = read_files[j][0];
                 let sequence_sketch = sequence_sketch.unwrap();
@@ -565,25 +586,42 @@ fn get_seq_sketch(
     args: &ContainArgs,
     read_file: &Vec<&String>,
     is_sketch_file: bool,
+    ref_db: Option<&crate::refdelta::RefDb>,
     genome_c: usize,
     genome_k: usize,
 ) -> Option<SequencesSketch> {
     if is_sketch_file {
         let read_file = read_file[0];
         let read_sketch_file = read_file;
-        let file = File::open(read_sketch_file).expect(&format!(
-            "The sketch `{}` could not be opened",
-            &read_sketch_file
-        ));
-        let mut read_reader = BufReader::with_capacity(10_000_000, file);
-        let read_sketch: SequencesSketch = if crate::compress::peek_is_compressed(&mut read_reader).unwrap_or(false) {
-            crate::compress::read_seq_sketch_compressed(&mut read_reader).expect(
-                &format!("The sketch `{}` is not a valid sketch. Perhaps it is an older incompatible version ", read_sketch_file),
-            )
+        let read_sketch: SequencesSketch = if read_sketch_file.ends_with(REF_SAMPLE_SUFFIX) {
+            let db = ref_db.unwrap_or_else(|| panic!(
+                "`{}` is a reference-delta compressed sample (*.sylspr) but no --reference was provided",
+                read_sketch_file
+            ));
+            let file = File::open(read_sketch_file).expect(&format!(
+                "The sketch `{}` could not be opened",
+                &read_sketch_file
+            ));
+            let read_reader = BufReader::with_capacity(10_000_000, file);
+            crate::refdelta::decompress_seq(read_reader, db).unwrap_or_else(|e| panic!(
+                "Could not decode `{}` with the given --reference: {}",
+                read_sketch_file, e
+            ))
         } else {
-            bincode::deserialize_from(&mut read_reader).expect(
-                &format!("The sketch `{}` is not a valid sketch. Perhaps it is an older incompatible version ", read_sketch_file),
-            )
+            let file = File::open(read_sketch_file).expect(&format!(
+                "The sketch `{}` could not be opened",
+                &read_sketch_file
+            ));
+            let mut read_reader = BufReader::with_capacity(10_000_000, file);
+            if crate::compress::peek_is_compressed(&mut read_reader).unwrap_or(false) {
+                crate::compress::read_seq_sketch_compressed(&mut read_reader).expect(
+                    &format!("The sketch `{}` is not a valid sketch. Perhaps it is an older incompatible version ", read_sketch_file),
+                )
+            } else {
+                bincode::deserialize_from(&mut read_reader).expect(
+                    &format!("The sketch `{}` is not a valid sketch. Perhaps it is an older incompatible version ", read_sketch_file),
+                )
+            }
         };
         if read_sketch.c > genome_c {
             error!("{} value of -c is {}; this is greater than the smallest value of -c = {} for a genome sketch. Exiting.", read_file, read_sketch.c, genome_c);

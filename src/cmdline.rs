@@ -181,6 +181,8 @@ pub struct ContainArgs {
 
     #[clap(short='o',long="output-file", help = "Output to this file (TSV format). [default: stdout]", help_heading="INPUT/OUTPUT")]
     pub out_file_name: Option<String>,
+    #[clap(long="reference", help_heading="INPUT/OUTPUT", help = "Reference database (*.sylref from `sylph ref-build`) used to decode reference-delta compressed samples (*.sylspr). Required when any input is a *.sylspr file.")]
+    pub reference: Option<String>,
     #[clap(long="log-reassignments", help = "Output information for how k-mers for genomes are reassigned during `profile`. Caution: can be verbose and slows down computation.")]
     pub log_reassignments: bool,
 

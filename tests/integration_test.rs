@@ -595,3 +595,66 @@ fn test_inspect(){
     assert!(stdout.contains("e.coli-K12.fasta.gz"));
 
 }
+
+#[serial]
+#[test]
+fn test_refdelta_query_with_reference(){
+    fresh();
+    let dir = "./tests/results/test_sketch_dir";
+
+    // sketch a database and a sample
+    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    cmd.arg("sketch")
+        .arg("test_files/e.coli-K12.fasta.gz")
+        .arg("test_files/e.coli-o157.fasta.gz")
+        .arg("test_files/e.coli-EC590.fasta.gz")
+        .arg("-o").arg(format!("{}/db", dir))
+        .arg("-d").arg(dir)
+        .assert().success().code(0);
+    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    cmd.arg("sketch")
+        .arg("test_files/o157_reads.fastq.gz")
+        .arg("-d").arg(dir)
+        .assert().success().code(0);
+
+    // build a reference and compress the sample sketch against it
+    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    cmd.arg("ref-build")
+        .arg(format!("{}/db.syldb", dir))
+        .arg("-o").arg(format!("{}/ref", dir))
+        .assert().success().code(0);
+    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    cmd.arg("ref-compress")
+        .arg(format!("{}/o157_reads.fastq.gz.sylsp", dir))
+        .arg("-r").arg(format!("{}/ref.sylref", dir))
+        .arg("-d").arg(dir)
+        .assert().success().code(0);
+    assert!(Path::new(&format!("{}/o157_reads.fastq.gz.sylspr", dir)).exists(),
+        "ref-compress did not produce a .sylspr");
+
+    // querying the .sylspr via --reference must match querying the original .sylsp
+    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    let orig = cmd.arg("query")
+        .arg(format!("{}/db.syldb", dir))
+        .arg(format!("{}/o157_reads.fastq.gz.sylsp", dir))
+        .output().expect("Output failed");
+    let orig = str::from_utf8(&orig.stdout).expect("Output was not valid UTF-8");
+
+    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    let from_ref = cmd.arg("query")
+        .arg(format!("{}/db.syldb", dir))
+        .arg(format!("{}/o157_reads.fastq.gz.sylspr", dir))
+        .arg("--reference").arg(format!("{}/ref.sylref", dir))
+        .output().expect("Output failed");
+    let from_ref = str::from_utf8(&from_ref.stdout).expect("Output was not valid UTF-8");
+
+    assert!(orig.contains("e.coli-o157.fasta.gz"));
+    assert_eq!(orig, from_ref, "query of .sylspr via --reference differs from query of original .sylsp");
+
+    // a .sylspr without --reference must fail
+    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    cmd.arg("query")
+        .arg(format!("{}/db.syldb", dir))
+        .arg(format!("{}/o157_reads.fastq.gz.sylspr", dir))
+        .assert().failure();
+}
