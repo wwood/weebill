@@ -121,6 +121,42 @@ fn refdelta_compress_decompress_roundtrip() {
 }
 
 #[test]
+fn refdelta_rejects_wrong_reference() {
+    // Two DBs with the same shape (genome count, per-array lengths) and identical
+    // boundary (first/last) hashes, differing only in an interior hash. A weak
+    // fingerprint would collide; the full-content digest must reject decoding a
+    // sample compressed against `db_a` using `db_b`.
+    let mk = |middle: u64| {
+        let sketches = vec![gsketch("g.fa", vec![10, middle, 30])];
+        refdelta::build_refdb(&sketches, &FxHashMap::default())
+    };
+    let db_a = mk(20);
+    let db_b = mk(21);
+    assert_eq!(db_a.distinctive[0].len(), db_b.distinctive[0].len());
+    assert_eq!(db_a.distinctive[0].first(), db_b.distinctive[0].first());
+    assert_eq!(db_a.distinctive[0].last(), db_b.distinctive[0].last());
+    assert_ne!(db_a.fingerprint, db_b.fingerprint);
+
+    let mut counts: FxHashMap<u64, u32> = FxHashMap::default();
+    counts.insert(10, 1);
+    counts.insert(20, 2);
+    let sketch = SequencesSketch {
+        kmer_counts: counts,
+        c: 200,
+        k: 31,
+        file_name: "s.fq".into(),
+        sample_name: None,
+        paired: false,
+        mean_read_length: 1.0,
+    };
+    let lookup = db_a.build_lookup();
+    let mut buf = Vec::new();
+    refdelta::compress_seq(&mut buf, &sketch, &db_a, &lookup).unwrap();
+    assert!(refdelta::decompress_seq(&buf[..], &db_a).is_ok());
+    assert!(refdelta::decompress_seq(&buf[..], &db_b).is_err());
+}
+
+#[test]
 fn compress_genome_roundtrip() {
     let mut sketches = Vec::new();
     for g in 0..3 {

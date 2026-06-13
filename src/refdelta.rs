@@ -84,34 +84,36 @@ pub struct RefDb {
     pub distinctive: Vec<Vec<u64>>,
     /// Hashes shared by ≥2 genomes (after rep preference), sorted and deduplicated.
     pub pool: Vec<u64>,
+    /// Digest over the full reference contents, used to reject decoding a sample
+    /// against the wrong DB. Computed once at build/load time (see `compute_fingerprint`).
+    pub fingerprint: u64,
 }
 
-/// A stable fingerprint so a compressed sample can be matched to its reference DB.
-fn fingerprint(db: &RefDb) -> u64 {
+/// A digest over the *entire* reference contents (every distinctive and pool hash,
+/// in order, with length separators). A sample is encoded as indices into these
+/// arrays, so any difference that could change a decoded hash must change the
+/// digest — mixing only lengths and boundary hashes would let a different DB with
+/// matching boundaries pass and silently produce a wrong `SequencesSketch`.
+fn compute_fingerprint(c: usize, k: usize, distinctive: &[Vec<u64>], pool: &[u64]) -> u64 {
     let mut h: u64 = 1469598103934665603; // FNV-1a offset
     let mut mix = |x: u64| {
         h ^= x;
         h = h.wrapping_mul(1099511628211);
     };
-    mix(db.c as u64);
-    mix(db.k as u64);
-    mix(db.genomes.len() as u64);
-    mix(db.pool.len() as u64);
-    for (i, d) in db.distinctive.iter().enumerate() {
-        mix(i as u64);
+    mix(c as u64);
+    mix(k as u64);
+    mix(distinctive.len() as u64);
+    for d in distinctive.iter() {
+        mix(0x5359_4c44_4953_5400); // "SYLDIST\0" domain separator
         mix(d.len() as u64);
-        if let Some(&first) = d.first() {
-            mix(first);
-        }
-        if let Some(&last) = d.last() {
-            mix(last);
+        for &x in d {
+            mix(x);
         }
     }
-    if let Some(&p) = db.pool.first() {
-        mix(p);
-    }
-    if let Some(&p) = db.pool.last() {
-        mix(p);
+    mix(0x5359_4c50_4f4f_4c00); // "SYLPOOL\0" domain separator
+    mix(pool.len() as u64);
+    for &x in pool {
+        mix(x);
     }
     h
 }
@@ -229,12 +231,14 @@ pub fn build_refdb(
     pool.sort_unstable();
     pool.dedup();
 
+    let fingerprint = compute_fingerprint(c, k, &distinctive, &pool);
     RefDb {
         c,
         k,
         genomes,
         distinctive,
         pool,
+        fingerprint,
     }
 }
 
@@ -309,12 +313,14 @@ pub fn read_refdb<R: Read>(inner: R) -> io::Result<RefDb> {
         distinctive.push(read_hashes(&mut r)?);
     }
     let pool = read_hashes(&mut r)?;
+    let fingerprint = compute_fingerprint(c, k, &distinctive, &pool);
     Ok(RefDb {
         c,
         k,
         genomes,
         distinctive,
         pool,
+        fingerprint,
     })
 }
 
@@ -324,36 +330,40 @@ pub fn read_refdb<R: Read>(inner: R) -> io::Result<RefDb> {
 /// bitmask, present-Rice, or absent(complement)-Rice. Self-delimiting given the
 /// `domain`, which the decoder knows from the reference DB.
 fn encode_subset(out: &mut Vec<u8>, present: &[u64], domain: u64) -> io::Result<()> {
-    // present-Rice
+    // present-Rice (cheap: O(present))
     let mut p_rice = Vec::new();
     write_hashes(&mut p_rice, present)?;
-    // absent-Rice (complement)
-    let mut absent = Vec::with_capacity((domain as usize).saturating_sub(present.len()));
-    let mut it = present.iter().copied().peekable();
-    for i in 0..domain {
-        match it.peek() {
-            Some(&p) if p == i => {
-                it.next();
-            }
-            _ => absent.push(i),
-        }
-    }
-    let mut a_rice = Vec::new();
-    write_hashes(&mut a_rice, &absent)?;
-    // bitmask
     let bm_len = ((domain + 7) / 8) as usize;
 
-    let (scheme, len) = {
-        let mut best = (SCHEME_BITMASK, bm_len);
-        if p_rice.len() < best.1 {
-            best = (SCHEME_PRESENT_RICE, p_rice.len());
+    let mut best = (SCHEME_BITMASK, bm_len);
+    if p_rice.len() < best.1 {
+        best = (SCHEME_PRESENT_RICE, p_rice.len());
+    }
+
+    // absent-Rice can only beat present-Rice when there are fewer absent than
+    // present indices, i.e. the subset is more than half full. For sparse subsets
+    // present-Rice already dominates, so skip materializing the (up to `domain`-
+    // sized) complement — otherwise a sparse sample against a huge pool/genome
+    // would allocate the whole complement just to discard it.
+    let mut a_rice = Vec::new();
+    if present.len().saturating_mul(2) >= domain as usize {
+        let mut absent = Vec::with_capacity((domain as usize).saturating_sub(present.len()));
+        let mut it = present.iter().copied().peekable();
+        for i in 0..domain {
+            match it.peek() {
+                Some(&p) if p == i => {
+                    it.next();
+                }
+                _ => absent.push(i),
+            }
         }
+        write_hashes(&mut a_rice, &absent)?;
         if a_rice.len() < best.1 {
             best = (SCHEME_ABSENT_RICE, a_rice.len());
         }
-        best
-    };
-    let _ = len;
+    }
+
+    let (scheme, _len) = best;
     out.push(scheme);
     match scheme {
         SCHEME_PRESENT_RICE => out.extend_from_slice(&p_rice),
@@ -429,7 +439,7 @@ pub fn compress_seq<W: Write>(
     let mut payload = Vec::new();
     payload.extend_from_slice(SKETCH_MAGIC);
     payload.push(SKETCH_VERSION);
-    payload.extend_from_slice(&fingerprint(db).to_le_bytes());
+    payload.extend_from_slice(&db.fingerprint.to_le_bytes());
     write_uvarint(&mut payload, sketch.c as u64)?;
     write_uvarint(&mut payload, sketch.k as u64)?;
     write_string(&mut payload, &sketch.file_name)?;
@@ -496,7 +506,7 @@ pub fn decompress_seq<R: Read>(inner: R, db: &RefDb) -> io::Result<SequencesSket
     }
     let mut fp = [0u8; 8];
     r.read_exact(&mut fp)?;
-    if u64::from_le_bytes(fp) != fingerprint(db) {
+    if u64::from_le_bytes(fp) != db.fingerprint {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "reference DB does not match the one used to compress this sample",
