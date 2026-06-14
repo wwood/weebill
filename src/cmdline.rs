@@ -22,6 +22,25 @@ pub enum Mode {
     ///Inspect sketched .syldb and .sylsp files.
     #[clap(arg_required_else_help = true, display_order = 4)]
     Inspect(InspectArgs),
+    ///Convert a standard database (.syldb) into a two-stage seekable database (.syl2db) for `profile --two-stage`.
+    #[clap(arg_required_else_help = true, display_order = 5)]
+    DbConvert(DbConvertArgs),
+}
+
+#[derive(Args)]
+pub struct DbConvertArgs {
+    #[clap(multiple=true, help = "Standard genome database sketches (*.syldb) to convert")]
+    pub files: Vec<String>,
+    #[clap(short='o', long="output", help = "Output two-stage database name (.syl2db appended)")]
+    pub output: String,
+    #[clap(long="screen-c", default_value_t = SCREEN_C_DEFAULT, help = "Subsampling rate -c of the small in-memory stage-1 SCREEN index (the bincoded sparse hashes). Must be >= the database -c. A coarser (larger) value gives a smaller/faster screen index. The dense per-genome blocks always keep every k-mer at the database -c.")]
+    pub screen_c: usize,
+    #[clap(short, default_value_t = 3, help = "Number of threads")]
+    pub threads: usize,
+    #[clap(long="trace", help = "Trace output")]
+    pub trace: bool,
+    #[clap(long="debug", help = "Debug output")]
+    pub debug: bool,
 }
 
 
@@ -82,7 +101,7 @@ pub struct SketchArgs {
     pub second_pair: Vec<String>,
 }
 
-#[derive(Args)]
+#[derive(Args, Clone)]
 pub struct ContainArgs {
     #[clap(multiple=true, help = "Pre-sketched *.syldb/*.sylsp files. Raw single-end fastq/fasta are allowed and will be automatically sketched to .sylsp/.syldb")]
     pub files: Vec<String>,
@@ -143,6 +162,17 @@ pub struct ContainArgs {
     pub out_file_name: Option<String>,
     #[clap(long="log-reassignments", help = "Output information for how k-mers for genomes are reassigned during `profile`. Caution: can be verbose and slows down computation.")]
     pub log_reassignments: bool,
+
+    #[clap(long="two-stage", help_heading = "TWO-STAGE PROFILING", help = "Two-stage profiling (profile only): cheaply SCREEN the sample against the (sparse) database, then densely profile ONLY the genomes that pass the screen. Lets a sparse pre-built database (e.g. -c 200 GTDB) deliver dense -c profiling without ever building/loading a dense full database.")]
+    pub two_stage: bool,
+    #[clap(long="dense-c", default_value_t = DENSE_C_DEFAULT, help_heading = "TWO-STAGE PROFILING", help = "Subsampling rate -c for the dense second stage. Genomes passing the screen are (re)sketched at this rate from their source fasta if the database is sparser than this. The sample sketch must have -c <= this value.")]
+    pub dense_c: usize,
+    #[clap(long="screen-c", help_heading = "TWO-STAGE PROFILING", help = "Subsampling rate -c for the cheap first-stage screen. Default: the database's own -c. Must be >= the database -c (a sketch can only be made sparser, never denser).")]
+    pub screen_c: Option<usize>,
+    #[clap(long="screen-ani", default_value_t = SCREEN_MIN_ANI_DEFAULT, help_heading = "TWO-STAGE PROFILING", help = "Minimum adjusted ANI (0-100) for a genome to pass the first-stage screen. Deliberately permissive; the dense stage recovers specificity.")]
+    pub screen_ani: f64,
+    #[clap(long="dense-cache", help_heading = "TWO-STAGE PROFILING", help = "Directory of cached per-genome dense sketches (*.sylgn). Genomes (re)sketched for the dense stage are stored here and reused across samples/runs, so a dense database is grown lazily only for genomes that actually appear.")]
+    pub dense_cache: Option<String>,
 
 
     //Hidden options that are embedded in the args but no longer used... 
