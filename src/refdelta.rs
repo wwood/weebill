@@ -31,11 +31,13 @@
 //!     *distinctive* k-mers, stored uncompressed, mapping each sparse hash to its
 //!     owning genome. Cheap to load; querying a sample against it yields the small
 //!     set of genomes the sample actually contains ("hit genomes").
-//!   * **Stage 2 (dense, loaded on demand):** each genome's full distinctive set
-//!     is an independently Golomb–Rice-coded block at a known offset. Only the hit
-//!     genomes' blocks are decoded (and cached across samples). The shared **pool**
-//!     is the one exception — it is conserved across samples and is loaded once
-//!     when the index is opened.
+//!   * **Stage 2 (dense, loaded on demand):** each genome's distinctive set,
+//!     minus the hashes already held in stage 1, is an independently Golomb–Rice-
+//!     coded block at a known offset (so each k-mer is stored only once). Only the
+//!     hit genomes' blocks are decoded and merged back with their stage-1 hashes
+//!     to reconstruct the full distinctive array (cached across samples). The
+//!     shared **pool** is the one exception — it is conserved across samples and
+//!     is loaded once when the index is opened.
 //!
 //! Missing a genome in stage 1 only costs compression ratio (its hashes fall back
 //! to "novel" full-price coding), never correctness: decompression reads the exact
@@ -309,10 +311,17 @@ pub fn write_refdb<W: Write>(mut w: W, db: &RefDb, sparse_div: u64) -> io::Resul
     let pool_off = body.len() as u64;
     write_hashes(&mut body, &db.pool)?;
 
+    // Dense blocks store only the *complement* of the stage-1 sparse subset, so a
+    // k-mer kept in stage 1 is not also stored here; load merges the two back.
     let mut dense_off = vec![0u64; ng];
     for g in 0..ng {
         dense_off[g] = body.len() as u64;
-        write_hashes(&mut body, &db.distinctive[g])?;
+        let complement: Vec<u64> = db.distinctive[g]
+            .iter()
+            .copied()
+            .filter(|&h| !(sparse_div <= 1 || h % sparse_div == 0))
+            .collect();
+        write_hashes(&mut body, &complement)?;
     }
 
     // Footer (zstd-compressed): metadata + absolute offsets into the file.
@@ -374,6 +383,9 @@ pub struct RefIndex {
     pub genomes: Vec<RefGenomeMeta>,
     /// stage-1: sparse distinctive hash -> owning genome id.
     sparse_map: FxHashMap<u64, u32>,
+    /// stage-1 hashes grouped per genome (sorted), merged into the dense block on
+    /// load to reconstruct the full distinctive array.
+    sparse_by_genome: Vec<Vec<u64>>,
     /// shared pool, loaded once.
     pool: Vec<u64>,
     pool_map: FxHashMap<u64, u32>,
@@ -439,13 +451,17 @@ pub fn open_ref_index<R: Read + Seek + Send + 'static>(mut r: R) -> io::Result<R
     r.read_exact(&mut sbuf)?;
     let mut sparse_map: FxHashMap<u64, u32> =
         FxHashMap::with_capacity_and_hasher(total_sparse, Default::default());
+    let mut sparse_by_genome: Vec<Vec<u64>> = Vec::with_capacity(ng);
     let mut pos = 0usize;
     for (g, &cnt) in sparse_count.iter().enumerate() {
+        let mut v = Vec::with_capacity(cnt);
         for _ in 0..cnt {
             let h = u64::from_le_bytes(sbuf[pos..pos + 8].try_into().unwrap());
             pos += 8;
             sparse_map.insert(h, g as u32);
+            v.push(h); // stored sorted (distinctive is sorted, filter preserves order)
         }
+        sparse_by_genome.push(v);
     }
 
     // shared pool (loaded once)
@@ -464,6 +480,7 @@ pub fn open_ref_index<R: Read + Seek + Send + 'static>(mut r: R) -> io::Result<R
         fingerprint,
         genomes,
         sparse_map,
+        sparse_by_genome,
         pool,
         pool_map,
         reader: Mutex::new(Box::new(r)),
@@ -490,18 +507,35 @@ impl RefIndex {
             .collect()
     }
 
-    /// Stage-2: the genome's dense distinctive block, decoded on demand and cached.
+    /// Stage-2: the genome's full distinctive array, decoded on demand and cached.
+    /// The dense block holds only the non-sparse complement; it is merged with the
+    /// genome's resident stage-1 hashes to reconstruct the complete sorted array.
     fn load_genome(&self, g: u32) -> io::Result<Arc<Vec<u64>>> {
         if let Some(a) = self.cache.lock().unwrap().get(&g) {
             return Ok(a.clone());
         }
         let off = self.genomes[g as usize].dense_offset;
-        let arr = {
+        let complement = {
             let mut rd = self.reader.lock().unwrap();
             rd.seek(SeekFrom::Start(off))?;
             let mut r: &mut dyn ReadSeek = &mut **rd;
             read_hashes(&mut r)?
         };
+        let sparse = &self.sparse_by_genome[g as usize];
+        // merge two sorted, disjoint ascending runs into the full distinctive array
+        let mut arr = Vec::with_capacity(complement.len() + sparse.len());
+        let (mut i, mut j) = (0usize, 0usize);
+        while i < complement.len() && j < sparse.len() {
+            if complement[i] < sparse[j] {
+                arr.push(complement[i]);
+                i += 1;
+            } else {
+                arr.push(sparse[j]);
+                j += 1;
+            }
+        }
+        arr.extend_from_slice(&complement[i..]);
+        arr.extend_from_slice(&sparse[j..]);
         let arc = Arc::new(arr);
         self.cache.lock().unwrap().insert(g, arc.clone());
         Ok(arc)
