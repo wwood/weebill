@@ -56,8 +56,8 @@
 
 use crate::cmdline::{RefBuildArgs, RefCompressArgs};
 use crate::compress::{
-    self, read_genome_sketches_compressed, read_hashes, read_seq_sketch_compressed, read_string,
-    read_uvarint, write_hashes, write_string, write_uvarint,
+    self, read_hashes, read_seq_sketch_compressed, read_string, read_uvarint, write_hashes,
+    write_string, write_uvarint,
 };
 use crate::constants::*;
 use crate::types::*;
@@ -66,7 +66,7 @@ use log::*;
 use rayon::prelude::*;
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 const REFDB_MAGIC: &[u8; 4] = b"SYLR";
@@ -809,20 +809,6 @@ fn init_logger(trace: bool) {
     let _ = simple_logger::SimpleLogger::new().with_level(level).init();
 }
 
-/// Load genome sketches from a `.syldb`, transparently handling the legacy
-/// bincode and the compressed formats.
-fn load_genome_sketches(path: &str) -> Vec<GenomeSketch> {
-    let file = File::open(path).unwrap_or_else(|_| panic!("Could not open {}", path));
-    let mut reader = BufReader::with_capacity(10_000_000, file);
-    if compress::peek_is_compressed(&mut reader).unwrap_or(false) {
-        read_genome_sketches_compressed(&mut reader)
-            .unwrap_or_else(|_| panic!("{} is not a valid database sketch", path))
-    } else {
-        bincode::deserialize_from(&mut reader)
-            .unwrap_or_else(|_| panic!("{} is not a valid database sketch", path))
-    }
-}
-
 fn load_seq_sketch(path: &str) -> SequencesSketch {
     let file = File::open(path).unwrap_or_else(|_| panic!("Could not open {}", path));
     let mut reader = BufReader::with_capacity(10_000_000, file);
@@ -869,10 +855,137 @@ fn parse_taxonomy(path: &str) -> FxHashMap<String, (String, bool)> {
     map
 }
 
+// --- streaming, hash-partitioned, parallel build ---------------------------
+
+/// Map a hash to one of `p` partitions by its low bits. FracMinHash hashes all
+/// sit below the MinHash threshold (~2^64/c), so high-bit partitioning would pile
+/// everything into the lowest partitions; the low bits are uniform. This is not
+/// order-preserving, so each genome's hashes are sorted once after merging.
+#[inline]
+fn partition_of(h: u64, p: u64) -> usize {
+    (h % p) as usize
+}
+
+/// Read a LEB128 uvarint, returning `None` at a clean end of stream (used to
+/// iterate the variable number of genome blocks in a shard file).
+fn read_uvarint_opt<R: Read>(r: &mut R) -> io::Result<Option<u64>> {
+    let mut first = [0u8; 1];
+    match r.read(&mut first)? {
+        0 => return Ok(None),
+        _ => {}
+    }
+    let mut x = (first[0] & 0x7f) as u64;
+    if first[0] & 0x80 == 0 {
+        return Ok(Some(x));
+    }
+    let mut shift = 7u32;
+    loop {
+        let mut b = [0u8; 1];
+        r.read_exact(&mut b)?;
+        x |= ((b[0] & 0x7f) as u64) << shift;
+        if b[0] & 0x80 == 0 {
+            break;
+        }
+        shift += 7;
+    }
+    Ok(Some(x))
+}
+
+/// Stream every genome sketch from the input databases, one at a time. Compressed
+/// databases are streamed without materializing all sketches; legacy bincode
+/// databases are loaded per-file (they cannot be streamed).
+fn for_each_genome<F: FnMut(GenomeSketch) -> io::Result<()>>(files: &[String], mut f: F) {
+    for path in files {
+        info!("Streaming genome sketches from {}", path);
+        let file = File::open(path).unwrap_or_else(|_| panic!("Could not open {}", path));
+        let mut reader = BufReader::with_capacity(10_000_000, file);
+        if compress::peek_is_compressed(&mut reader).unwrap_or(false) {
+            compress::stream_genome_sketches_compressed(reader, &mut f)
+                .unwrap_or_else(|e| panic!("{} is not a valid database sketch: {}", path, e));
+        } else {
+            warn!(
+                "{} is a legacy (uncompressed) database; it must be loaded in full. Re-sketch with --compressed-output for low-RAM builds.",
+                path
+            );
+            let sketches: Vec<GenomeSketch> = bincode::deserialize_from(&mut reader)
+                .unwrap_or_else(|_| panic!("{} is not a valid database sketch", path));
+            for s in sketches {
+                f(s).unwrap();
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+struct ShardOut {
+    /// distinctive hashes by genome id (unsorted; the merge step sorts them).
+    dist: Vec<(u32, Vec<u64>)>,
+    /// pool hashes owned by this shard (unsorted; the merge step sorts them).
+    pool: Vec<u64>,
+}
+
+/// Build ownership for one shard (one hash class): read its genome blocks, tally
+/// rep/strain occurrences per hash, and assign each hash to a single owner genome
+/// or the shared pool, exactly as `build_refdb` does globally.
+fn process_shard(path: &Path, remap: &[u32]) -> io::Result<ShardOut> {
+    let mut r = BufReader::with_capacity(1 << 20, File::open(path)?);
+    let mut acc: FxHashMap<u64, OwnAccum> = FxHashMap::default();
+    while let Some(fid) = read_uvarint_opt(&mut r)? {
+        let mut rep = [0u8; 1];
+        r.read_exact(&mut rep)?;
+        let is_rep = rep[0] != 0;
+        let gid = remap[fid as usize];
+        let hashes = read_hashes(&mut r)?;
+        for h in hashes {
+            let e = acc.entry(h).or_insert(OwnAccum {
+                rep_count: 0,
+                rep_id: 0,
+                strain_count: 0,
+                strain_id: 0,
+            });
+            if is_rep {
+                if e.rep_count == 0 {
+                    e.rep_id = gid;
+                }
+                e.rep_count += 1;
+            } else {
+                if e.strain_count == 0 {
+                    e.strain_id = gid;
+                }
+                e.strain_count += 1;
+            }
+        }
+    }
+
+    let mut by_gid: FxHashMap<u32, Vec<u64>> = FxHashMap::default();
+    let mut pool: Vec<u64> = Vec::new();
+    for (h, a) in acc {
+        let owner = if a.rep_count == 1 {
+            a.rep_id
+        } else if a.rep_count >= 2 {
+            POOL
+        } else if a.strain_count == 1 {
+            a.strain_id
+        } else {
+            POOL
+        };
+        if owner == POOL {
+            pool.push(h);
+        } else {
+            by_gid.entry(owner).or_default().push(h);
+        }
+    }
+    // Not sorted here: modular partitioning isn't order-preserving, so the merge
+    // step sorts each genome's hashes and the pool once after concatenation.
+    let dist: Vec<(u32, Vec<u64>)> = by_gid.into_iter().collect();
+    Ok(ShardOut { dist, pool })
+}
+
 pub fn run_ref_build(args: RefBuildArgs) {
     init_logger(args.trace);
+    let threads = args.threads.max(1);
     rayon::ThreadPoolBuilder::new()
-        .num_threads(args.threads)
+        .num_threads(threads)
         .build_global()
         .ok();
     if args.files.is_empty() {
@@ -883,20 +996,183 @@ pub fn run_ref_build(args: RefBuildArgs) {
         Some(p) => parse_taxonomy(p),
         None => FxHashMap::default(),
     };
+    let sparse_div = args.sparse_div.max(1);
 
-    let mut sketches: Vec<GenomeSketch> = Vec::new();
-    for f in &args.files {
-        info!("Loading genome sketches from {}", f);
-        sketches.extend(load_genome_sketches(f));
+    let resolve = |file_name: &str| -> (String, bool) {
+        if let Some(v) = taxonomy.get(file_name) {
+            return v.clone();
+        }
+        let base = Path::new(file_name)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(file_name);
+        if let Some(v) = taxonomy.get(base) {
+            return v.clone();
+        }
+        (file_name.to_string(), true)
+    };
+
+    // Choose the partition count from the RAM target (soft) and the input size.
+    // Distinct k-mers are bounded by k-mer instances, which we estimate from the
+    // compressed input size; per-shard `acc` peak is ~ (distinct / p) * entry size.
+    let total_input_bytes: u64 = args
+        .files
+        .iter()
+        .filter_map(|f| std::fs::metadata(f).ok())
+        .map(|m| m.len())
+        .sum();
+    const EST_BYTES_PER_KMER: f64 = 2.0;
+    const ACC_BYTES_PER_ENTRY: f64 = 48.0;
+    let est_kmers = (total_input_bytes as f64 / EST_BYTES_PER_KMER).max(1.0);
+    let p = match args.max_ram {
+        Some(gb) if gb > 0 => {
+            // reserve ~half the budget for `acc`, the rest for output + buffers
+            let budget = (gb as f64) * 1e9 * 0.5;
+            let needed = est_kmers * ACC_BYTES_PER_ENTRY * threads as f64 / budget;
+            (needed.ceil() as usize).max(threads).min(512).max(1)
+        }
+        _ => 256usize.min(512).max(threads).max(1),
+    };
+    info!(
+        "Building reference with {} hash partitions ({} threads){}",
+        p,
+        threads,
+        match args.max_ram {
+            Some(gb) => format!(", ~{} GB RAM target", gb),
+            None => String::new(),
+        }
+    );
+
+    let out = format!("{}{}", args.output, REF_DB_SUFFIX);
+    if let Some(parent) = Path::new(&out).parent() {
+        std::fs::create_dir_all(parent).ok();
     }
-    if sketches.is_empty() {
+    let tmp_dir = match &args.tmp_dir {
+        Some(d) => PathBuf::from(d),
+        None => Path::new(&out)
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf(),
+    }
+    .join(format!(".sylref_build_{}", std::process::id()));
+    std::fs::create_dir_all(&tmp_dir)
+        .unwrap_or_else(|e| panic!("Could not create scratch dir {:?}: {}", tmp_dir, e));
+    let shard_path = |i: usize| tmp_dir.join(format!("shard_{}.bin", i));
+
+    // --- pass 1: stream genomes, route k-mers into hash-partitioned shards ---
+    let mut writers: Vec<BufWriter<File>> = (0..p)
+        .map(|i| {
+            BufWriter::with_capacity(
+                1 << 16,
+                File::create(shard_path(i)).unwrap_or_else(|e| panic!("Could not create scratch shard: {}", e)),
+            )
+        })
+        .collect();
+    let mut meta: Vec<(String, String, bool)> = Vec::new();
+    let mut c = 0usize;
+    let mut k = 0usize;
+    let mut total_instances: u64 = 0;
+    let pu = p as u64;
+    {
+        let mut fid = 0u32;
+        // reused per genome: one bucket of k-mers per partition
+        let mut buckets: Vec<Vec<u64>> = vec![Vec::new(); p];
+        for_each_genome(&args.files, |s| {
+            if meta.is_empty() {
+                c = s.c;
+                k = s.k;
+            }
+            let (species, is_rep) = resolve(&s.file_name);
+            meta.push((s.file_name.clone(), species, is_rep));
+            let rep_byte = is_rep as u8;
+            let mut kmers = s.genome_kmers;
+            kmers.sort_unstable();
+            kmers.dedup();
+            total_instances += kmers.len() as u64;
+            // distribute this genome's (sorted) k-mers into partition buckets; each
+            // bucket stays sorted because we scan in order.
+            for b in buckets.iter_mut() {
+                b.clear();
+            }
+            for &h in &kmers {
+                buckets[partition_of(h, pu)].push(h);
+            }
+            for (part, b) in buckets.iter().enumerate() {
+                if b.is_empty() {
+                    continue;
+                }
+                let w = &mut writers[part];
+                write_uvarint(w, fid as u64)?;
+                w.write_all(&[rep_byte])?;
+                write_hashes(w, b)?;
+            }
+            fid += 1;
+            Ok(())
+        });
+    }
+    for mut w in writers {
+        w.flush().unwrap_or_else(|e| panic!("Failed to flush scratch shard: {}", e));
+    }
+
+    let ng = meta.len();
+    if ng == 0 {
+        std::fs::remove_dir_all(&tmp_dir).ok();
         error!("No genome sketches found; exiting");
         std::process::exit(1);
     }
-    info!("Building k-mer dereplicated reference from {} genomes...", sketches.len());
-    let db = build_refdb(&sketches, &taxonomy);
+    info!("Routed {} genomes ({} k-mers) into {} partitions; assigning owners...", ng, total_instances, p);
+
+    // build order (species, reps first, then file name) and file-id -> genome-id remap
+    let mut order: Vec<usize> = (0..ng).collect();
+    order.sort_by(|&a, &b| {
+        meta[a]
+            .1
+            .cmp(&meta[b].1)
+            .then(meta[b].2.cmp(&meta[a].2))
+            .then(meta[a].0.cmp(&meta[b].0))
+    });
+    let mut remap = vec![0u32; ng];
+    let mut genomes: Vec<RefGenome> = Vec::with_capacity(ng);
+    for (gid, &fid) in order.iter().enumerate() {
+        remap[fid] = gid as u32;
+        genomes.push(RefGenome {
+            file_name: meta[fid].0.clone(),
+            species: meta[fid].1.clone(),
+            is_rep: meta[fid].2,
+        });
+    }
+
+    // --- pass 2: build ownership per shard in parallel ----------------------
+    let shard_outs: Vec<ShardOut> = (0..p)
+        .into_par_iter()
+        .map(|pi| {
+            process_shard(&shard_path(pi), &remap)
+                .unwrap_or_else(|e| panic!("Failed to process scratch shard {}: {}", pi, e))
+        })
+        .collect();
+    std::fs::remove_dir_all(&tmp_dir).ok();
+
+    // merge shards (any order), then sort each genome's hashes and the pool, since
+    // modular partitioning does not preserve hash order.
+    let mut distinctive: Vec<Vec<u64>> = vec![Vec::new(); ng];
+    let mut pool: Vec<u64> = Vec::new();
+    for mut shard in shard_outs {
+        for (gid, mut hashes) in shard.dist.drain(..) {
+            distinctive[gid as usize].append(&mut hashes);
+        }
+        pool.append(&mut shard.pool);
+    }
+    distinctive.par_iter_mut().for_each(|d| d.sort_unstable());
+    pool.par_sort_unstable();
+
+    let db = RefDb {
+        c,
+        k,
+        genomes,
+        distinctive,
+        pool,
+    };
     let n_dist: usize = db.distinctive.iter().map(|d| d.len()).sum();
-    let sparse_div = args.sparse_div.max(1);
     let n_sparse: usize = if sparse_div <= 1 {
         n_dist
     } else {
@@ -914,10 +1190,6 @@ pub fn run_ref_build(args: RefBuildArgs) {
         sparse_div
     );
 
-    let out = format!("{}{}", args.output, REF_DB_SUFFIX);
-    if let Some(parent) = Path::new(&out).parent() {
-        std::fs::create_dir_all(parent).ok();
-    }
     let w = BufWriter::new(File::create(&out).unwrap_or_else(|_| panic!("Could not create {}", out)));
     write_refdb(w, &db, sparse_div).unwrap_or_else(|e| panic!("Failed to write {}: {}", out, e));
     info!("Wrote reference database to {}", out);

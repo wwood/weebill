@@ -440,6 +440,22 @@ pub fn read_genome_sketches_compressed<R: Read>(mut inner: R) -> io::Result<Vec<
     Ok(out)
 }
 
+/// Stream a compressed genome database one sketch at a time, invoking `f` for
+/// each. Lets callers process huge databases without holding every sketch in RAM.
+pub fn stream_genome_sketches_compressed<R: Read, F: FnMut(GenomeSketch) -> io::Result<()>>(
+    mut inner: R,
+    mut f: F,
+) -> io::Result<usize> {
+    read_and_check_header(&mut inner, TYPE_GENOME_DB)?;
+    let mut r = BufReader::with_capacity(1 << 22, zstd::stream::read::Decoder::new(inner)?);
+    let n = read_uvarint(&mut r)? as usize;
+    for _ in 0..n {
+        let s = read_genome_sketch(&mut r)?;
+        f(s)?;
+    }
+    Ok(n)
+}
+
 /// Write a sample (read) sketch in the compressed format.
 pub fn write_seq_sketch_compressed<W: Write>(mut inner: W, s: &SequencesSketch) -> io::Result<()> {
     write_header(&mut inner, TYPE_SEQ_SAMPLE)?;
