@@ -47,16 +47,20 @@ fn refdelta_build_two_level_assignment() {
     assert_eq!(db.pool, vec![500]);
 }
 
-fn refdelta_roundtrip(sketch: &SequencesSketch, db: &refdelta::RefDb) {
-    let lookup = db.build_lookup();
+fn open_index(db: &refdelta::RefDb, sparse_div: u64) -> refdelta::RefIndex {
+    let mut dbuf = Vec::new();
+    refdelta::write_refdb(&mut dbuf, db, sparse_div).unwrap();
+    refdelta::open_ref_index(std::io::Cursor::new(dbuf)).unwrap()
+}
+
+fn refdelta_roundtrip(sketch: &SequencesSketch, idx: &refdelta::RefIndex) {
     let mut buf = Vec::new();
-    refdelta::compress_seq(&mut buf, sketch, db, &lookup).unwrap();
-    let decoded = refdelta::decompress_seq(&buf[..], db).unwrap();
+    refdelta::compress_seq(&mut buf, sketch, idx).unwrap();
+    let decoded = refdelta::decompress_seq(&buf[..], idx).unwrap();
     assert_eq!(*sketch, decoded);
 }
 
-#[test]
-fn refdelta_compress_decompress_roundtrip() {
+fn three_genome_db() -> refdelta::RefDb {
     let sketches = vec![
         gsketch("A_rep.fa", vec![1, 2, 3, 100, 101, 500]),
         gsketch("A_str.fa", vec![100, 101, 200, 201]),
@@ -66,13 +70,15 @@ fn refdelta_compress_decompress_roundtrip() {
     tax.insert("A_rep.fa".into(), ("A".into(), true));
     tax.insert("A_str.fa".into(), ("A".into(), false));
     tax.insert("B_rep.fa".into(), ("B".into(), true));
-    let db = refdelta::build_refdb(&sketches, &tax);
+    refdelta::build_refdb(&sketches, &tax)
+}
 
-    // reference DB serialization roundtrip
-    let mut dbuf = Vec::new();
-    refdelta::write_refdb(&mut dbuf, &db).unwrap();
-    let db2 = refdelta::read_refdb(&dbuf[..]).unwrap();
-    assert_eq!(db, db2);
+#[test]
+fn refdelta_compress_decompress_roundtrip() {
+    let db = three_genome_db();
+    // sparse_div = 1 keeps every distinctive k-mer in the stage-1 index so every
+    // genome is detectable; the round trip is lossless regardless either way.
+    let idx = open_index(&db, 1);
 
     // distinctive hits + pool hit + novel hashes + counts
     let mut counts: FxHashMap<u64, u32> = FxHashMap::default();
@@ -88,7 +94,7 @@ fn refdelta_compress_decompress_roundtrip() {
         paired: true,
         mean_read_length: 149.0,
     };
-    refdelta_roundtrip(&sketch, &db);
+    refdelta_roundtrip(&sketch, &idx);
 
     // empty sketch and a sketch that is entirely novel also roundtrip
     refdelta_roundtrip(
@@ -101,7 +107,7 @@ fn refdelta_compress_decompress_roundtrip() {
             paired: false,
             mean_read_length: 0.0,
         },
-        &db,
+        &idx,
     );
     let mut nov: FxHashMap<u64, u32> = FxHashMap::default();
     nov.insert(7_000_000, 1);
@@ -116,8 +122,48 @@ fn refdelta_compress_decompress_roundtrip() {
             paired: false,
             mean_read_length: 1.0,
         },
-        &db,
+        &idx,
     );
+
+    // round trip is also lossless when stage 1 subsamples (some genomes may be
+    // missed and fall back to novel coding, but the result must be identical)
+    let idx_sparse = open_index(&db, 4);
+    let mut counts2: FxHashMap<u64, u32> = FxHashMap::default();
+    for (h, c) in [(1u64, 5u32), (100, 7), (300, 2), (500, 4), (424242, 9)] {
+        counts2.insert(h, c);
+    }
+    refdelta_roundtrip(
+        &SequencesSketch {
+            kmer_counts: counts2,
+            c: 200,
+            k: 31,
+            file_name: "s2.fq".into(),
+            sample_name: None,
+            paired: false,
+            mean_read_length: 100.0,
+        },
+        &idx_sparse,
+    );
+}
+
+#[test]
+fn refdelta_sparse_hit_detection() {
+    let db = three_genome_db();
+    let idx = open_index(&db, 1);
+    // a sample containing only B_rep's distinctive k-mer (300) should detect
+    // exactly genome 2 (build order: A_rep, A_str, B_rep).
+    let mut counts: FxHashMap<u64, u32> = FxHashMap::default();
+    counts.insert(300, 5);
+    let sketch = SequencesSketch {
+        kmer_counts: counts,
+        c: 200,
+        k: 31,
+        file_name: "x.fq".into(),
+        sample_name: None,
+        paired: false,
+        mean_read_length: 1.0,
+    };
+    assert_eq!(idx.hit_genomes(&sketch), vec![2]);
 }
 
 #[test]

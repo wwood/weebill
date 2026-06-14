@@ -233,11 +233,11 @@ pub fn contain(mut args: ContainArgs, pseudotax_in: bool) {
 
     // Load the reference DB (if given) once, for decoding *.sylspr samples.
     let have_refdelta = read_sketch_files.iter().any(|f| f.ends_with(REF_SAMPLE_SUFFIX));
-    let ref_db: Option<crate::refdelta::RefDb> = match &args.reference {
+    let ref_db: Option<crate::refdelta::RefIndex> = match &args.reference {
         Some(path) => {
             log::info!("Loading reference database {} for .sylspr decoding...", path);
             let r = BufReader::with_capacity(10_000_000, File::open(path).unwrap_or_else(|_| panic!("Could not open reference database {}", path)));
-            Some(crate::refdelta::read_refdb(r).unwrap_or_else(|e| panic!("{} is not a valid reference database: {}", path, e)))
+            Some(crate::refdelta::open_ref_index(r).unwrap_or_else(|e| panic!("{} is not a valid reference database: {}", path, e)))
         }
         None => {
             if have_refdelta {
@@ -586,7 +586,7 @@ fn get_seq_sketch(
     args: &ContainArgs,
     read_file: &Vec<&String>,
     is_sketch_file: bool,
-    ref_db: Option<&crate::refdelta::RefDb>,
+    ref_db: Option<&crate::refdelta::RefIndex>,
     genome_c: usize,
     genome_k: usize,
 ) -> Option<SequencesSketch> {

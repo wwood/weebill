@@ -22,10 +22,24 @@
 //!   * A k-mer in no rep but exactly one strain is owned by that strain.
 //!   * A k-mer in no rep and several strains → the shared pool.
 //!
-//! This is the same idea as sylph's profiling k-mer reassignment, but materialised
-//! as a compression reference: each genome keeps only its *distinctive* hashes,
-//! and conserved/shared hashes live in one pool so they remain referenceable
-//! (dropping them would push a large fraction of reads back to full-price coding).
+//! ## Two-stage reference database layout (`.sylref`)
+//!
+//! Loading a whole reference into a single hash→location table is expensive for
+//! large databases. The `.sylref` file is therefore seekable and read in two
+//! stages:
+//!   * **Stage 1 (sparse, loaded fully):** a 1/N subsample of every genome's
+//!     *distinctive* k-mers, stored uncompressed, mapping each sparse hash to its
+//!     owning genome. Cheap to load; querying a sample against it yields the small
+//!     set of genomes the sample actually contains ("hit genomes").
+//!   * **Stage 2 (dense, loaded on demand):** each genome's full distinctive set
+//!     is an independently Golomb–Rice-coded block at a known offset. Only the hit
+//!     genomes' blocks are decoded (and cached across samples). The shared **pool**
+//!     is the one exception — it is conserved across samples and is loaded once
+//!     when the index is opened.
+//!
+//! Missing a genome in stage 1 only costs compression ratio (its hashes fall back
+//! to "novel" full-price coding), never correctness: decompression reads the exact
+//! genome ids recorded in the sample and loads precisely those dense blocks.
 //!
 //! ## Encoding a read sketch
 //!
@@ -49,12 +63,12 @@ use fxhash::FxHashMap;
 use log::*;
 use rayon::prelude::*;
 use std::fs::File;
-use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 const REFDB_MAGIC: &[u8; 4] = b"SYLR";
-const REFDB_VERSION: u8 = 1;
+const REFDB_VERSION: u8 = 2;
 const SKETCH_MAGIC: &[u8; 4] = b"SYLD"; // reference-Delta sample
 const SKETCH_VERSION: u8 = 1;
 
@@ -64,6 +78,15 @@ const SCHEME_ABSENT_RICE: u8 = 2;
 
 /// zstd level for the read-sketch payload (matches the normal sketch format).
 const ZSTD_LEVEL: i32 = 3;
+
+/// Fixed size of the `.sylref` header: magic (4) + version (1) + footer offset (8).
+const HEADER_LEN: u64 = 13;
+
+/// A genome is treated as a "hit" (its dense block is loaded) once the sample
+/// shares at least this many of the genome's stage-1 sparse k-mers. Distinctive
+/// k-mers are genome-specific, so even 1 is a meaningful signal; over-loading a
+/// genome only costs time, under-loading only costs compression ratio.
+const SPARSE_MIN_HITS: u32 = 1;
 
 /// Metadata for one reference genome, in the dereplicated build order.
 #[derive(Clone, Debug, PartialEq)]
@@ -75,6 +98,8 @@ pub struct RefGenome {
 
 /// A k-mer dereplicated reference database: per-genome distinctive hash sets plus
 /// one shared pool, with genomes ordered so a species' strains are contiguous.
+/// This is the in-memory form produced by `build_refdb` and serialized by
+/// `write_refdb`; querying/compressing uses the seekable `RefIndex` instead.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RefDb {
     pub c: usize,
@@ -242,84 +267,245 @@ pub fn build_refdb(
     }
 }
 
-/// Lookup table: hash -> (owner genome id or `POOL`, index within that array).
-pub struct RefLookup {
-    map: FxHashMap<u64, (u32, u32)>,
+// --- reference DB serialization (seekable two-stage container) --------------
+
+/// Per-genome species id: genomes are already grouped contiguously by species, so
+/// a running counter assigns each species a dense integer id.
+fn species_ids(genomes: &[RefGenome]) -> Vec<u32> {
+    let mut ids = vec![0u32; genomes.len()];
+    let mut cur = 0u32;
+    for g in 0..genomes.len() {
+        if g > 0 && genomes[g].species != genomes[g - 1].species {
+            cur += 1;
+        }
+        ids[g] = cur;
+    }
+    ids
 }
 
-impl RefDb {
-    pub fn build_lookup(&self) -> RefLookup {
-        let mut map: FxHashMap<u64, (u32, u32)> =
-            FxHashMap::with_capacity_and_hasher(self.pool.len(), Default::default());
-        for (g, d) in self.distinctive.iter().enumerate() {
-            for (i, &h) in d.iter().enumerate() {
-                map.insert(h, (g as u32, i as u32));
+/// Write a `.sylref` in the seekable two-stage layout. `sparse_div` controls the
+/// stage-1 subsampling rate (keep 1/`sparse_div` of each genome's distinctive
+/// k-mers); `sparse_div <= 1` keeps all of them.
+pub fn write_refdb<W: Write>(mut w: W, db: &RefDb, sparse_div: u64) -> io::Result<()> {
+    let ng = db.genomes.len();
+    let sp_ids = species_ids(&db.genomes);
+
+    // Body: [sparse section][pool block][dense block 0][dense block 1]...
+    let mut body: Vec<u8> = Vec::new();
+
+    let sparse_off = body.len() as u64; // 0
+    let mut sparse_count = vec![0usize; ng];
+    for g in 0..ng {
+        let mut cnt = 0usize;
+        for &h in &db.distinctive[g] {
+            if sparse_div <= 1 || h % sparse_div == 0 {
+                body.extend_from_slice(&h.to_le_bytes());
+                cnt += 1;
             }
         }
-        for (i, &h) in self.pool.iter().enumerate() {
-            map.insert(h, (POOL, i as u32));
-        }
-        RefLookup { map }
+        sparse_count[g] = cnt;
     }
-}
 
-// --- reference DB serialization (zstd-framed) -------------------------------
+    let pool_off = body.len() as u64;
+    write_hashes(&mut body, &db.pool)?;
 
-pub fn write_refdb<W: Write>(inner: W, db: &RefDb) -> io::Result<()> {
-    let mut w = zstd::stream::write::Encoder::new(inner, 9)?;
+    let mut dense_off = vec![0u64; ng];
+    for g in 0..ng {
+        dense_off[g] = body.len() as u64;
+        write_hashes(&mut body, &db.distinctive[g])?;
+    }
+
+    // Footer (zstd-compressed): metadata + absolute offsets into the file.
+    let mut footer: Vec<u8> = Vec::new();
+    write_uvarint(&mut footer, db.c as u64)?;
+    write_uvarint(&mut footer, db.k as u64)?;
+    write_uvarint(&mut footer, sparse_div)?;
+    footer.extend_from_slice(&fingerprint(db).to_le_bytes());
+    write_uvarint(&mut footer, ng as u64)?;
+    write_uvarint(&mut footer, HEADER_LEN + sparse_off)?;
+    for g in 0..ng {
+        write_uvarint(&mut footer, sparse_count[g] as u64)?;
+    }
+    write_uvarint(&mut footer, HEADER_LEN + pool_off)?;
+    write_uvarint(&mut footer, db.pool.len() as u64)?;
+    for g in 0..ng {
+        write_string(&mut footer, &db.genomes[g].file_name)?;
+        write_string(&mut footer, &db.genomes[g].species)?;
+        footer.push(db.genomes[g].is_rep as u8);
+        write_uvarint(&mut footer, sp_ids[g] as u64)?;
+        write_uvarint(&mut footer, HEADER_LEN + dense_off[g])?;
+        write_uvarint(&mut footer, db.distinctive[g].len() as u64)?;
+    }
+    let footer_comp = zstd::stream::encode_all(&footer[..], 9)?;
+    let footer_offset = HEADER_LEN + body.len() as u64;
+
     w.write_all(REFDB_MAGIC)?;
     w.write_all(&[REFDB_VERSION])?;
-    write_uvarint(&mut w, db.c as u64)?;
-    write_uvarint(&mut w, db.k as u64)?;
-    write_uvarint(&mut w, db.genomes.len() as u64)?;
-    for (g, genome) in db.genomes.iter().enumerate() {
-        write_string(&mut w, &genome.file_name)?;
-        write_string(&mut w, &genome.species)?;
-        w.write_all(&[genome.is_rep as u8])?;
-        write_hashes(&mut w, &db.distinctive[g])?;
-    }
-    write_hashes(&mut w, &db.pool)?;
-    w.finish()?;
+    w.write_all(&footer_offset.to_le_bytes())?;
+    w.write_all(&body)?;
+    w.write_all(&footer_comp)?;
     Ok(())
 }
 
-pub fn read_refdb<R: Read>(inner: R) -> io::Result<RefDb> {
-    let mut r = zstd::stream::read::Decoder::new(inner)?;
-    let mut magic = [0u8; 4];
-    r.read_exact(&mut magic)?;
-    if &magic != REFDB_MAGIC {
+/// Per-genome metadata held by an opened `RefIndex` (everything but the dense
+/// distinctive block, which is loaded on demand).
+#[derive(Clone, Debug)]
+pub struct RefGenomeMeta {
+    pub file_name: String,
+    pub species: String,
+    pub is_rep: bool,
+    pub species_id: u32,
+    dense_offset: u64,
+    dense_domain: u32,
+}
+
+/// Any source we can both stream and seek (a file or an in-memory cursor).
+pub trait ReadSeek: Read + Seek + Send {}
+impl<T: Read + Seek + Send> ReadSeek for T {}
+
+/// An opened two-stage reference. Constructing it loads only the stage-1 sparse
+/// index and the shared pool; per-genome dense blocks are decoded lazily (and
+/// cached) as samples need them.
+pub struct RefIndex {
+    pub c: usize,
+    pub k: usize,
+    sparse_div: u64,
+    fingerprint: u64,
+    pub genomes: Vec<RefGenomeMeta>,
+    /// stage-1: sparse distinctive hash -> owning genome id.
+    sparse_map: FxHashMap<u64, u32>,
+    /// shared pool, loaded once.
+    pool: Vec<u64>,
+    pool_map: FxHashMap<u64, u32>,
+    reader: Mutex<Box<dyn ReadSeek>>,
+    cache: Mutex<FxHashMap<u32, Arc<Vec<u64>>>>,
+}
+
+/// Open a `.sylref`, loading stage 1 (sparse index) and the shared pool.
+pub fn open_ref_index<R: Read + Seek + Send + 'static>(mut r: R) -> io::Result<RefIndex> {
+    let mut hdr = [0u8; HEADER_LEN as usize];
+    r.read_exact(&mut hdr)?;
+    if &hdr[0..4] != REFDB_MAGIC {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "not a sylph reference DB"));
     }
-    let mut ver = [0u8; 1];
-    r.read_exact(&mut ver)?;
-    if ver[0] != REFDB_VERSION {
+    if hdr[4] != REFDB_VERSION {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "unsupported reference DB version"));
     }
-    let c = read_uvarint(&mut r)? as usize;
-    let k = read_uvarint(&mut r)? as usize;
-    let ng = read_uvarint(&mut r)? as usize;
-    let mut genomes = Vec::with_capacity(ng);
-    let mut distinctive = Vec::with_capacity(ng);
+    let footer_offset = u64::from_le_bytes(hdr[5..13].try_into().unwrap());
+
+    // footer
+    r.seek(SeekFrom::Start(footer_offset))?;
+    let mut comp = Vec::new();
+    r.read_to_end(&mut comp)?;
+    let fbytes = zstd::stream::decode_all(&comp[..])?;
+    let mut f = &fbytes[..];
+    let c = read_uvarint(&mut f)? as usize;
+    let k = read_uvarint(&mut f)? as usize;
+    let sparse_div = read_uvarint(&mut f)?;
+    let mut fpb = [0u8; 8];
+    f.read_exact(&mut fpb)?;
+    let fingerprint = u64::from_le_bytes(fpb);
+    let ng = read_uvarint(&mut f)? as usize;
+    let sparse_offset = read_uvarint(&mut f)?;
+    let mut sparse_count = Vec::with_capacity(ng);
     for _ in 0..ng {
-        let file_name = read_string(&mut r)?;
-        let species = read_string(&mut r)?;
+        sparse_count.push(read_uvarint(&mut f)? as usize);
+    }
+    let pool_offset = read_uvarint(&mut f)?;
+    let _pool_domain = read_uvarint(&mut f)? as usize;
+    let mut genomes = Vec::with_capacity(ng);
+    for _ in 0..ng {
+        let file_name = read_string(&mut f)?;
+        let species = read_string(&mut f)?;
         let mut rep = [0u8; 1];
-        r.read_exact(&mut rep)?;
-        genomes.push(RefGenome {
+        f.read_exact(&mut rep)?;
+        let species_id = read_uvarint(&mut f)? as u32;
+        let dense_offset = read_uvarint(&mut f)?;
+        let dense_domain = read_uvarint(&mut f)? as u32;
+        genomes.push(RefGenomeMeta {
             file_name,
             species,
             is_rep: rep[0] != 0,
+            species_id,
+            dense_offset,
+            dense_domain,
         });
-        distinctive.push(read_hashes(&mut r)?);
     }
+
+    // stage 1: sparse section (raw little-endian u64, grouped by genome)
+    let total_sparse: usize = sparse_count.iter().sum();
+    r.seek(SeekFrom::Start(sparse_offset))?;
+    let mut sbuf = vec![0u8; total_sparse * 8];
+    r.read_exact(&mut sbuf)?;
+    let mut sparse_map: FxHashMap<u64, u32> =
+        FxHashMap::with_capacity_and_hasher(total_sparse, Default::default());
+    let mut pos = 0usize;
+    for (g, &cnt) in sparse_count.iter().enumerate() {
+        for _ in 0..cnt {
+            let h = u64::from_le_bytes(sbuf[pos..pos + 8].try_into().unwrap());
+            pos += 8;
+            sparse_map.insert(h, g as u32);
+        }
+    }
+
+    // shared pool (loaded once)
+    r.seek(SeekFrom::Start(pool_offset))?;
     let pool = read_hashes(&mut r)?;
-    Ok(RefDb {
+    let mut pool_map: FxHashMap<u64, u32> =
+        FxHashMap::with_capacity_and_hasher(pool.len(), Default::default());
+    for (i, &h) in pool.iter().enumerate() {
+        pool_map.insert(h, i as u32);
+    }
+
+    Ok(RefIndex {
         c,
         k,
+        sparse_div,
+        fingerprint,
         genomes,
-        distinctive,
+        sparse_map,
         pool,
+        pool_map,
+        reader: Mutex::new(Box::new(r)),
+        cache: Mutex::new(FxHashMap::default()),
     })
+}
+
+impl RefIndex {
+    /// Stage-1 query: the genomes a sample contains, by sparse-hit count.
+    pub fn hit_genomes(&self, sketch: &SequencesSketch) -> Vec<u32> {
+        let mut counts: FxHashMap<u32, u32> = FxHashMap::default();
+        for &h in sketch.kmer_counts.keys() {
+            if self.sparse_div > 1 && h % self.sparse_div != 0 {
+                continue;
+            }
+            if let Some(&g) = self.sparse_map.get(&h) {
+                *counts.entry(g).or_insert(0) += 1;
+            }
+        }
+        counts
+            .into_iter()
+            .filter(|&(_, c)| c >= SPARSE_MIN_HITS)
+            .map(|(g, _)| g)
+            .collect()
+    }
+
+    /// Stage-2: the genome's dense distinctive block, decoded on demand and cached.
+    fn load_genome(&self, g: u32) -> io::Result<Arc<Vec<u64>>> {
+        if let Some(a) = self.cache.lock().unwrap().get(&g) {
+            return Ok(a.clone());
+        }
+        let off = self.genomes[g as usize].dense_offset;
+        let arr = {
+            let mut rd = self.reader.lock().unwrap();
+            rd.seek(SeekFrom::Start(off))?;
+            let mut r: &mut dyn ReadSeek = &mut **rd;
+            read_hashes(&mut r)?
+        };
+        let arc = Arc::new(arr);
+        self.cache.lock().unwrap().insert(g, arc.clone());
+        Ok(arc)
+    }
 }
 
 // --- adaptive present/absent subset coding ----------------------------------
@@ -414,30 +600,41 @@ fn decode_subset<R: Read>(r: &mut R, domain: u64) -> io::Result<Vec<u64>> {
 
 // --- compressing / decompressing a read sketch ------------------------------
 
-/// Compress a read sketch against the reference DB. The DB (or one with the same
-/// fingerprint) is required to decompress.
+/// Compress a read sketch against the reference index. Only the sample's hit
+/// genomes' dense blocks are loaded; the pool is already resident in `idx`.
 pub fn compress_seq<W: Write>(
     inner: W,
     sketch: &SequencesSketch,
-    db: &RefDb,
-    lookup: &RefLookup,
+    idx: &RefIndex,
 ) -> io::Result<()> {
-    let ng = db.genomes.len();
-    let mut per_genome: Vec<Vec<u64>> = vec![Vec::new(); ng];
+    // stage 1 -> stage 2: load the distinctive blocks of the hit genomes and
+    // build a per-sample hash -> (genome, index) lookup over just those.
+    let hits = idx.hit_genomes(sketch);
+    let mut map: FxHashMap<u64, (u32, u32)> = FxHashMap::default();
+    for &g in &hits {
+        let arr = idx.load_genome(g)?;
+        for (i, &h) in arr.iter().enumerate() {
+            map.insert(h, (g, i as u32));
+        }
+    }
+
+    let mut per_genome: FxHashMap<u32, Vec<u64>> = FxHashMap::default();
     let mut pool_hits: Vec<u64> = Vec::new();
     let mut novel: Vec<u64> = Vec::new();
     for &h in sketch.kmer_counts.keys() {
-        match lookup.map.get(&h) {
-            Some(&(POOL, idx)) => pool_hits.push(idx as u64),
-            Some(&(g, idx)) => per_genome[g as usize].push(idx as u64),
-            None => novel.push(h),
+        if let Some(&pidx) = idx.pool_map.get(&h) {
+            pool_hits.push(pidx as u64);
+        } else if let Some(&(g, i)) = map.get(&h) {
+            per_genome.entry(g).or_default().push(i as u64);
+        } else {
+            novel.push(h);
         }
     }
 
     let mut payload = Vec::new();
     payload.extend_from_slice(SKETCH_MAGIC);
     payload.push(SKETCH_VERSION);
-    payload.extend_from_slice(&fingerprint(db).to_le_bytes());
+    payload.extend_from_slice(&idx.fingerprint.to_le_bytes());
     write_uvarint(&mut payload, sketch.c as u64)?;
     write_uvarint(&mut payload, sketch.k as u64)?;
     write_string(&mut payload, &sketch.file_name)?;
@@ -451,25 +648,25 @@ pub fn compress_seq<W: Write>(
     payload.push(sketch.paired as u8);
     payload.extend_from_slice(&sketch.mean_read_length.to_le_bytes());
 
-    // hit genomes: sorted ids, delta-coded (strains of a species are contiguous,
-    // so a sample's hits cluster into small gaps)
-    let mut hit_ids: Vec<u32> = (0..ng as u32).filter(|&g| !per_genome[g as usize].is_empty()).collect();
+    // hit genomes: sorted global ids, delta-coded (strains of a species are
+    // contiguous, so a sample's hits cluster into small gaps)
+    let mut hit_ids: Vec<u32> = per_genome.keys().copied().collect();
     hit_ids.sort_unstable();
     write_uvarint(&mut payload, hit_ids.len() as u64)?;
     let mut prev = 0u64;
     for &g in &hit_ids {
         write_uvarint(&mut payload, g as u64 - prev)?;
         prev = g as u64;
-        let idx = &mut per_genome[g as usize];
-        idx.sort_unstable();
-        encode_subset(&mut payload, idx, db.distinctive[g as usize].len() as u64)?;
+        let v = per_genome.get_mut(&g).unwrap();
+        v.sort_unstable();
+        encode_subset(&mut payload, v, idx.genomes[g as usize].dense_domain as u64)?;
     }
 
     // pool
     pool_hits.sort_unstable();
     write_uvarint(&mut payload, pool_hits.len() as u64)?;
     if !pool_hits.is_empty() {
-        encode_subset(&mut payload, &pool_hits, db.pool.len() as u64)?;
+        encode_subset(&mut payload, &pool_hits, idx.pool.len() as u64)?;
     }
 
     // novel hashes (Rice)
@@ -488,8 +685,9 @@ pub fn compress_seq<W: Write>(
     Ok(())
 }
 
-/// Decompress a reference-delta read sketch using its reference DB.
-pub fn decompress_seq<R: Read>(inner: R, db: &RefDb) -> io::Result<SequencesSketch> {
+/// Decompress a reference-delta read sketch. Only the genomes referenced by the
+/// sample (plus the resident pool) are loaded from the index.
+pub fn decompress_seq<R: Read>(inner: R, idx: &RefIndex) -> io::Result<SequencesSketch> {
     let raw = zstd::stream::decode_all(inner)?;
     let mut r = &raw[..];
     let mut magic = [0u8; 4];
@@ -504,7 +702,7 @@ pub fn decompress_seq<R: Read>(inner: R, db: &RefDb) -> io::Result<SequencesSket
     }
     let mut fp = [0u8; 8];
     r.read_exact(&mut fp)?;
-    if u64::from_le_bytes(fp) != fingerprint(db) {
+    if u64::from_le_bytes(fp) != idx.fingerprint {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "reference DB does not match the one used to compress this sample",
@@ -531,16 +729,18 @@ pub fn decompress_seq<R: Read>(inner: R, db: &RefDb) -> io::Result<SequencesSket
     let mut g = 0u64;
     for _ in 0..nhit {
         g += read_uvarint(&mut r)?;
-        let indices = decode_subset(&mut r, db.distinctive[g as usize].len() as u64)?;
+        let domain = idx.genomes[g as usize].dense_domain as u64;
+        let indices = decode_subset(&mut r, domain)?;
+        let arr = idx.load_genome(g as u32)?;
         for i in indices {
-            hashes.push(db.distinctive[g as usize][i as usize]);
+            hashes.push(arr[i as usize]);
         }
     }
     let npool = read_uvarint(&mut r)? as usize;
     if npool > 0 {
-        let indices = decode_subset(&mut r, db.pool.len() as u64)?;
+        let indices = decode_subset(&mut r, idx.pool.len() as u64)?;
         for i in indices {
-            hashes.push(db.pool[i as usize]);
+            hashes.push(idx.pool[i as usize]);
         }
     }
     let novel = read_hashes(&mut r)?;
@@ -662,11 +862,22 @@ pub fn run_ref_build(args: RefBuildArgs) {
     info!("Building k-mer dereplicated reference from {} genomes...", sketches.len());
     let db = build_refdb(&sketches, &taxonomy);
     let n_dist: usize = db.distinctive.iter().map(|d| d.len()).sum();
+    let sparse_div = args.sparse_div.max(1);
+    let n_sparse: usize = if sparse_div <= 1 {
+        n_dist
+    } else {
+        db.distinctive
+            .iter()
+            .map(|d| d.iter().filter(|&&h| h % sparse_div == 0).count())
+            .sum()
+    };
     info!(
-        "Reference: {} genomes, {} distinctive k-mers, {} shared-pool k-mers",
+        "Reference: {} genomes, {} distinctive k-mers, {} shared-pool k-mers, {} stage-1 sparse k-mers (1/{})",
         db.genomes.len(),
         n_dist,
-        db.pool.len()
+        db.pool.len(),
+        n_sparse,
+        sparse_div
     );
 
     let out = format!("{}{}", args.output, REF_DB_SUFFIX);
@@ -674,8 +885,17 @@ pub fn run_ref_build(args: RefBuildArgs) {
         std::fs::create_dir_all(parent).ok();
     }
     let w = BufWriter::new(File::create(&out).unwrap_or_else(|_| panic!("Could not create {}", out)));
-    write_refdb(w, &db).unwrap_or_else(|e| panic!("Failed to write {}: {}", out, e));
+    write_refdb(w, &db, sparse_div).unwrap_or_else(|e| panic!("Failed to write {}: {}", out, e));
     info!("Wrote reference database to {}", out);
+}
+
+/// Open a `.sylref` for querying/compression.
+fn open_refdb_file(path: &str) -> RefIndex {
+    let r = BufReader::with_capacity(
+        10_000_000,
+        File::open(path).unwrap_or_else(|_| panic!("Could not open {}", path)),
+    );
+    open_ref_index(r).unwrap_or_else(|e| panic!("{} is not a valid reference DB: {}", path, e))
 }
 
 pub fn run_ref_compress(args: RefCompressArgs) {
@@ -691,18 +911,15 @@ pub fn run_ref_compress(args: RefCompressArgs) {
     std::fs::create_dir_all(&args.output_dir)
         .expect("Could not create output directory; exiting");
 
-    info!("Loading reference database {}", args.ref_db);
-    let db = {
-        let r = BufReader::with_capacity(10_000_000, File::open(&args.ref_db).unwrap_or_else(|_| panic!("Could not open {}", args.ref_db)));
-        read_refdb(r).unwrap_or_else(|e| panic!("{} is not a valid reference DB: {}", args.ref_db, e))
-    };
+    info!("Loading reference database {} (stage-1 sparse index + pool)", args.ref_db);
+    let idx = open_refdb_file(&args.ref_db);
 
     let outdir = Path::new(&args.output_dir);
     let counter = Mutex::new(0usize);
     if args.decompress {
         args.files.par_iter().for_each(|f| {
             let r = BufReader::with_capacity(10_000_000, File::open(f).unwrap_or_else(|_| panic!("Could not open {}", f)));
-            let sketch = decompress_seq(r, &db).unwrap_or_else(|e| {
+            let sketch = decompress_seq(r, &idx).unwrap_or_else(|e| {
                 error!("Failed to decompress {}: {}", f, e);
                 std::process::exit(1);
             });
@@ -716,8 +933,6 @@ pub fn run_ref_compress(args: RefCompressArgs) {
             info!("Decompressed {} -> {:?}", f, out);
         });
     } else {
-        info!("Building reference lookup...");
-        let lookup = db.build_lookup();
         args.files.par_iter().for_each(|f| {
             let sketch = load_seq_sketch(f);
             let base = Path::new(f).file_name().unwrap().to_str().unwrap();
@@ -727,7 +942,7 @@ pub fn run_ref_compress(args: RefCompressArgs) {
                 .unwrap_or(base);
             let out = outdir.join(format!("{}{}", stem, REF_SAMPLE_SUFFIX));
             let w = BufWriter::new(File::create(&out).unwrap_or_else(|_| panic!("Could not create {:?}", out)));
-            compress_seq(w, &sketch, &db, &lookup)
+            compress_seq(w, &sketch, &idx)
                 .unwrap_or_else(|e| panic!("Failed to compress {}: {}", f, e));
             let mut c = counter.lock().unwrap();
             *c += 1;

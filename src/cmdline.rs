@@ -38,6 +38,8 @@ pub struct RefBuildArgs {
     pub taxonomy: Option<String>,
     #[clap(short='o', long="output", help = "Output reference database name (.sylref appended)")]
     pub output: String,
+    #[clap(long="sparse-subsample", default_value_t = 16, help = "Stage-1 sparse index subsampling divisor: 1/N of each genome's distinctive k-mers are kept uncompressed for fast hit detection. Larger N gives a smaller/faster stage-1 index but coarser detection (1 keeps all).")]
+    pub sparse_div: u64,
     #[clap(short, default_value_t = 3, help = "Number of threads")]
     pub threads: usize,
     #[clap(long="trace", help = "Trace output")]
