@@ -42,7 +42,6 @@ use crate::constants::*;
 use crate::types::*;
 use fxhash::FxHashMap;
 use log::*;
-use memmap2::Mmap;
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::os::unix::fs::FileExt;
@@ -50,10 +49,8 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 const MAGIC: &[u8; 4] = b"SY2D";
-/// Dense blocks Golomb-Rice coded.
-const VERSION_RICE: u8 = 1;
-/// Dense blocks Elias-Fano coded.
-const VERSION_EF: u8 = 2;
+/// Format version (dense blocks are Golomb-Rice coded).
+const VERSION: u8 = 1;
 /// magic (4) + version (1) + footer offset (8)
 const HEADER_LEN: u64 = 13;
 
@@ -252,104 +249,6 @@ fn read_hashes<R: Read>(r: &mut R) -> io::Result<Vec<u64>> {
     Ok(out)
 }
 
-/// Sort + Elias-Fano encode a set of hashes onto `out`. The sorted sequence is
-/// split into high bits (a unary bucket bitvector, ~2 bits/element) and `l` low
-/// bits stored verbatim, where `l = floor(log2(universe / n))`. Self-delimiting
-/// given the leading count. Duplicates are preserved (zero high-gap, repeated 1).
-fn write_hashes_ef(out: &mut Vec<u8>, hashes: &[u64]) {
-    let mut sorted = hashes.to_vec();
-    sorted.sort_unstable();
-    let n = sorted.len();
-    write_uvarint(out, n as u64);
-    if n == 0 {
-        return;
-    }
-    let universe = sorted[n - 1].saturating_add(1);
-    // l = floor(log2(universe / n)), clamped to [0, 63].
-    let l: u32 = {
-        let q = universe / n as u64;
-        if q < 2 {
-            0
-        } else {
-            63 - q.leading_zeros()
-        }
-    };
-    out.push(l as u8);
-    let mut bw = BitWriter::new();
-    // High bitvector: for element i emit (high_i - high_{i-1}) zeros then a 1.
-    let mut prev_high = 0u64;
-    for &v in &sorted {
-        let high = v >> l;
-        for _ in 0..(high - prev_high) {
-            bw.write_bit(0);
-        }
-        bw.write_bit(1);
-        prev_high = high;
-    }
-    // Low bits: l bits per element, in order.
-    if l > 0 {
-        let mask = (1u64 << l) - 1;
-        for &v in &sorted {
-            bw.write_bits(v & mask, l);
-        }
-    }
-    let bits = bw.finish();
-    write_uvarint(out, bits.len() as u64);
-    out.extend_from_slice(&bits);
-}
-
-fn read_hashes_ef<R: Read>(r: &mut R) -> io::Result<Vec<u64>> {
-    let n = read_uvarint(r)? as usize;
-    if n == 0 {
-        return Ok(Vec::new());
-    }
-    let mut lb = [0u8; 1];
-    r.read_exact(&mut lb)?;
-    let l = lb[0] as u32;
-    let blen = read_uvarint(r)? as usize;
-    let mut bits = vec![0u8; blen];
-    r.read_exact(&mut bits)?;
-    let mut br = BitReader::new(&bits);
-    // Recover high parts by scanning the bucket bitvector: 0 advances the bucket,
-    // 1 emits an element at the current bucket value.
-    let mut highs = Vec::with_capacity(n);
-    let mut cur = 0u64;
-    while highs.len() < n {
-        if br.read_bit()? == 1 {
-            highs.push(cur);
-        } else {
-            cur += 1;
-        }
-    }
-    let mut out = Vec::with_capacity(n);
-    if l > 0 {
-        for &h in &highs {
-            let low = br.read_bits(l)?;
-            out.push((h << l) | low);
-        }
-    } else {
-        out.extend_from_slice(&highs);
-    }
-    Ok(out)
-}
-
-/// Dispatch dense-block encode/decode on the database codec.
-fn write_dense_block(out: &mut Vec<u8>, hashes: &[u64], ef: bool) {
-    if ef {
-        write_hashes_ef(out, hashes)
-    } else {
-        write_hashes(out, hashes)
-    }
-}
-
-fn read_dense_block<R: Read>(r: &mut R, ef: bool) -> io::Result<Vec<u64>> {
-    if ef {
-        read_hashes_ef(r)
-    } else {
-        read_hashes(r)
-    }
-}
-
 // --- footer (stage-1 sparse index + metadata) -------------------------------
 
 /// Per-genome metadata plus the stage-1 sparse k-mer subsample. Everything here
@@ -379,25 +278,13 @@ pub struct Footer {
 
 // --- writing ----------------------------------------------------------------
 
-/// Re-pack genome sketches into the two-stage seekable layout (Golomb-Rice dense
-/// blocks). See [`write_two_stage_db_codec`] to choose the dense codec.
-pub fn write_two_stage_db<W: Write>(
-    w: W,
-    sketches: &[GenomeSketch],
-    screen_c: usize,
-) -> io::Result<()> {
-    write_two_stage_db_codec(w, sketches, screen_c, false)
-}
-
 /// Re-pack genome sketches into the two-stage seekable layout and write to `w`.
 /// `screen_c` is the (coarser) stage-1 subsampling rate; it must be `>= c`.
-/// When `use_ef`, dense blocks are Elias-Fano coded (version 2) instead of
-/// Golomb-Rice (version 1).
-pub fn write_two_stage_db_codec<W: Write>(
+/// Dense blocks are Golomb-Rice coded.
+pub fn write_two_stage_db<W: Write>(
     mut w: W,
     sketches: &[GenomeSketch],
     screen_c: usize,
-    use_ef: bool,
 ) -> io::Result<()> {
     let c = sketches.first().map(|s| s.c).unwrap_or(0);
     let k = sketches.first().map(|s| s.k).unwrap_or(0);
@@ -413,11 +300,11 @@ pub fn write_two_stage_db_codec<W: Write>(
 
     for gs in sketches {
         let dense_offset = HEADER_LEN + body.len() as u64;
-        write_dense_block(&mut body, &gs.genome_kmers, use_ef);
+        write_hashes(&mut body, &gs.genome_kmers);
         match &gs.pseudotax_tracked_nonused_kmers {
             Some(p) => {
                 body.push(1);
-                write_dense_block(&mut body, p, use_ef);
+                write_hashes(&mut body, p);
             }
             None => body.push(0),
         }
@@ -447,9 +334,8 @@ pub fn write_two_stage_db_codec<W: Write>(
     let footer_bytes = bincode::serialize(&footer).map_err(io::Error::other)?;
     let footer_offset = HEADER_LEN + body.len() as u64;
 
-    let version = if use_ef { VERSION_EF } else { VERSION_RICE };
     w.write_all(MAGIC)?;
-    w.write_all(&[version])?;
+    w.write_all(&[VERSION])?;
     w.write_all(&footer_offset.to_le_bytes())?;
     w.write_all(&body)?;
     w.write_all(&footer_bytes)?;
@@ -459,26 +345,22 @@ pub fn write_two_stage_db_codec<W: Write>(
 // --- opened database --------------------------------------------------------
 
 /// Backing store for the dense blocks.
-///   * `Mmap`  - whole file memory-mapped; a block is a zero-copy slice. Used for
-///     multi-threaded runs (parallel page-fault decode), at the cost of resident
-///     file pages counting toward RSS.
-///   * `File`  - positional `read_at` of just the requested block bytes. Used for
-///     single-threaded runs: no parallelism to gain from mmap, and it keeps RSS
-///     low (only the block, plus reclaimable OS page cache).
+///   * `File`  - positional `read_at` (pread) of just the requested block bytes.
+///     No shared cursor, so concurrent reads from any number of threads need no
+///     lock; only the touched block bytes (plus reclaimable OS page cache) cost
+///     memory, so RSS stays low. This is the path used for `.syl2db` files.
 ///   * `Owned` - whole file in memory; for in-memory readers / tests.
 enum DenseData {
-    Mmap(Mmap),
     File(File),
     Owned(Vec<u8>),
 }
 
 impl DenseData {
-    /// Whole-file bytes; only valid for the in-memory backings (used to parse the
+    /// Whole-file bytes; only valid for the in-memory backing (used to parse the
     /// header/footer). The `File` backing is read positionally via `with_block`.
     #[inline]
     fn bytes(&self) -> &[u8] {
         match self {
-            DenseData::Mmap(m) => &m[..],
             DenseData::Owned(v) => &v[..],
             DenseData::File(_) => unreachable!("File-backed db is read via with_block"),
         }
@@ -487,14 +369,12 @@ impl DenseData {
 
 /// An opened two-stage database. Construction loads only the stage-1 sparse
 /// index (the bincoded footer); per-genome dense blocks are decoded on demand,
-/// in parallel (each decode reads its own slice of the memory map, no shared
-/// cursor or lock), and cached.
+/// in parallel (each decode positionally reads its own block, no shared cursor
+/// or lock).
 pub struct TwoStageDb {
     pub c: usize,
     pub k: usize,
     pub screen_c: usize,
-    /// Dense blocks are Elias-Fano (version 2) rather than Golomb-Rice (v1).
-    ef: bool,
     /// File offset where the dense-block region ends (start of the footer); used
     /// to bound the last genome's block for positional reads.
     footer_offset: u64,
@@ -506,31 +386,25 @@ pub struct TwoStageDb {
     cache: Mutex<FxHashMap<u32, Arc<GenomeSketch>>>,
 }
 
-/// Parse the magic + version header; return the dense codec flag and the footer
-/// offset.
-fn parse_header(hdr: &[u8]) -> io::Result<(bool, u64)> {
+/// Parse the magic + version header; return the footer offset.
+fn parse_header(hdr: &[u8]) -> io::Result<u64> {
     if hdr.len() < HEADER_LEN as usize || &hdr[0..4] != MAGIC {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "not a sylph two-stage database",
         ));
     }
-    let ef = match hdr[4] {
-        VERSION_RICE => false,
-        VERSION_EF => true,
-        _ => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "unsupported two-stage database version",
-            ))
-        }
-    };
-    let footer_offset = u64::from_le_bytes(hdr[5..13].try_into().unwrap());
-    Ok((ef, footer_offset))
+    if hdr[4] != VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unsupported two-stage database version",
+        ));
+    }
+    Ok(u64::from_le_bytes(hdr[5..13].try_into().unwrap()))
 }
 
 /// Assemble a `TwoStageDb` from its parsed footer + backing store.
-fn build_db(footer: Footer, ef: bool, footer_offset: u64, data: DenseData) -> TwoStageDb {
+fn build_db(footer: Footer, footer_offset: u64, data: DenseData) -> TwoStageDb {
     // Build the stage-1 screen sketches from the sparse subsamples. The screen
     // pass runs with pseudotax disabled, so an empty tracked-kmer set is a safe
     // placeholder that keeps the `--disable-profiling` guard in `contain` happy;
@@ -553,7 +427,6 @@ fn build_db(footer: Footer, ef: bool, footer_offset: u64, data: DenseData) -> Tw
         c: footer.c,
         k: footer.k,
         screen_c: footer.screen_c,
-        ef,
         footer_offset,
         genomes: footer.genomes,
         screen_sketches,
@@ -565,7 +438,7 @@ fn build_db(footer: Footer, ef: bool, footer_offset: u64, data: DenseData) -> Tw
 /// Parse the header + footer of a `.syl2db` already resident in `data`.
 fn from_bytes(data: DenseData) -> io::Result<TwoStageDb> {
     let bytes = data.bytes();
-    let (ef, footer_offset) = parse_header(bytes)?;
+    let footer_offset = parse_header(bytes)?;
     if footer_offset as usize > bytes.len() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -574,7 +447,7 @@ fn from_bytes(data: DenseData) -> io::Result<TwoStageDb> {
     }
     let footer: Footer = bincode::deserialize(&bytes[footer_offset as usize..])
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    Ok(build_db(footer, ef, footer_offset, data))
+    Ok(build_db(footer, footer_offset, data))
 }
 
 /// Open a `.syl2db` from an in-memory reader (reads it all into memory).
@@ -604,14 +477,13 @@ impl TwoStageDb {
     }
 
     /// Run `f` on genome `g`'s whole on-disk region (`genome_kmers` block, the
-    /// pseudotax flag, and the optional pseudotax block). For the mmap/owned
-    /// backings this is a zero-copy slice; for the file backing it is one
-    /// positional read of just that region. No shared cursor, so it is safe to
-    /// call concurrently from many threads.
+    /// pseudotax flag, and the optional pseudotax block). For the file backing
+    /// this is one positional read of just that region; for the owned backing it
+    /// is a zero-copy slice. No shared cursor, so it is safe to call concurrently
+    /// from many threads.
     fn with_block<T>(&self, g: u32, f: impl FnOnce(&[u8]) -> io::Result<T>) -> io::Result<T> {
         let start = self.genomes[g as usize].dense_offset as usize;
         match &self.data {
-            DenseData::Mmap(m) => f(&m[start..]),
             DenseData::Owned(v) => f(&v[start..]),
             DenseData::File(file) => {
                 let end = self.block_end(g) as usize;
@@ -624,18 +496,18 @@ impl TwoStageDb {
 
     /// Decode genome `g`'s full dense `GenomeSketch` without touching the cache.
     /// Concurrent calls from different threads do not contend on any shared
-    /// cursor (mmap slice or positional read). The two-stage pass-1 uses this to
-    /// decode each survivor into a short-lived sketch, probe it, and drop it
+    /// cursor (each does its own positional read). The two-stage pass-1 uses this
+    /// to decode each survivor into a short-lived sketch, probe it, and drop it
     /// unless it passes -- so the discarded majority is never cached.
     pub fn decode_dense(&self, g: u32) -> io::Result<GenomeSketch> {
         let meta = &self.genomes[g as usize];
         let (genome_kmers, pseudotax) = self.with_block(g, |bytes| {
             let mut cur = bytes;
-            let gk = read_dense_block(&mut cur, self.ef)?;
+            let gk = read_hashes(&mut cur)?;
             let mut flag = [0u8; 1];
             cur.read_exact(&mut flag)?;
             let pt = if flag[0] != 0 {
-                Some(read_dense_block(&mut cur, self.ef)?)
+                Some(read_hashes(&mut cur)?)
             } else {
                 None
             };
@@ -664,20 +536,14 @@ impl TwoStageDb {
     }
 }
 
-/// Open a `.syl2db` file from a path. With `mmap`, the whole file is memory
-/// mapped for lock-free parallel decode (higher RSS); otherwise blocks are read
-/// positionally on demand (lower RSS, preferred when single-threaded).
-pub fn open_file(path: &str, mmap: bool) -> io::Result<TwoStageDb> {
+/// Open a `.syl2db` file from a path. Only the header + footer (the stage-1
+/// sparse index) are read up front; dense blocks are read positionally on demand
+/// during profiling, so opening is cheap and RSS stays low.
+pub fn open_file(path: &str) -> io::Result<TwoStageDb> {
     let file = File::open(path)?;
-    if mmap {
-        // Safety: the database is treated as read-only; we never mutate the map
-        // and the file is not expected to change underneath us during a run.
-        let m = unsafe { Mmap::map(&file)? };
-        return from_bytes(DenseData::Mmap(m));
-    }
     let mut hdr = [0u8; HEADER_LEN as usize];
     file.read_exact_at(&mut hdr, 0)?;
-    let (ef, footer_offset) = parse_header(&hdr)?;
+    let footer_offset = parse_header(&hdr)?;
     let flen = file.metadata()?.len();
     if footer_offset > flen {
         return Err(io::Error::new(
@@ -689,7 +555,7 @@ pub fn open_file(path: &str, mmap: bool) -> io::Result<TwoStageDb> {
     file.read_exact_at(&mut fbytes, footer_offset)?;
     let footer: Footer = bincode::deserialize(&fbytes)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    Ok(build_db(footer, ef, footer_offset, DenseData::File(file)))
+    Ok(build_db(footer, footer_offset, DenseData::File(file)))
 }
 
 // --- CLI handler ------------------------------------------------------------
@@ -770,16 +636,15 @@ pub fn run_db_convert(args: DbConvertArgs) {
         }
     }
     info!(
-        "Converting {} genomes (dense -c {}, stage-1 screen -c {}, dense codec {}) -> {}",
+        "Converting {} genomes (dense -c {}, stage-1 screen -c {}) -> {}",
         sketches.len(),
         c,
         args.screen_c,
-        if args.ef { "elias-fano" } else { "golomb-rice" },
         out
     );
     let w =
         BufWriter::new(File::create(&out).unwrap_or_else(|_| panic!("Could not create {}", out)));
-    write_two_stage_db_codec(w, &sketches, args.screen_c, args.ef)
+    write_two_stage_db(w, &sketches, args.screen_c)
         .unwrap_or_else(|e| panic!("Failed to write {}: {}", out, e));
     info!("Wrote two-stage database to {}", out);
 }
@@ -791,18 +656,11 @@ mod tests {
     fn roundtrip_hashes(input: &[u64]) {
         let mut expected = input.to_vec();
         expected.sort_unstable();
-        // Golomb-Rice
         let mut buf = Vec::new();
         write_hashes(&mut buf, input);
         let mut r = &buf[..];
         assert_eq!(read_hashes(&mut r).unwrap(), expected);
         assert!(r.is_empty(), "read_hashes left trailing bytes");
-        // Elias-Fano
-        let mut buf = Vec::new();
-        write_hashes_ef(&mut buf, input);
-        let mut r = &buf[..];
-        assert_eq!(read_hashes_ef(&mut r).unwrap(), expected);
-        assert!(r.is_empty(), "read_hashes_ef left trailing bytes");
     }
 
     #[test]

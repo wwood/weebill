@@ -23,7 +23,6 @@ rand = "0"
 regex = "1"
 fastrand = "2"
 memory-stats = "1"
-memmap2 = "0.9"
 scalable_cuckoo_filter = "0.2"
 serde_yaml = "0.9"
 

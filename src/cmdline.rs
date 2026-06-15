@@ -37,8 +37,6 @@ pub struct DbConvertArgs {
     pub screen_c: usize,
     #[clap(short, default_value_t = 3, help = "Number of threads")]
     pub threads: usize,
-    #[clap(long="ef", hidden=true, help = "Experimental: Elias-Fano code the dense blocks instead of Golomb-Rice.")]
-    pub ef: bool,
     #[clap(long="trace", help = "Trace output")]
     pub trace: bool,
     #[clap(long="debug", help = "Debug output")]

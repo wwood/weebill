@@ -419,10 +419,7 @@ pub fn contain(mut args: ContainArgs, pseudotax_in: bool) {
             std::process::exit(1);
         }
         log::info!("Opening two-stage database {} (loading stage-1 sparse index)...", two_stage_db_files[0]);
-        // Memory-map for parallel decode when multi-threaded; otherwise read
-        // blocks positionally to keep RSS low (mmap's only benefit is parallelism).
-        let use_mmap = args.threads > 1;
-        let db = crate::twostage_db::open_file(two_stage_db_files[0], use_mmap)
+        let db = crate::twostage_db::open_file(two_stage_db_files[0])
             .unwrap_or_else(|e| panic!("{} is not a valid two-stage database: {}", two_stage_db_files[0], e));
         // The database is inherently two-stage; enable the screen-then-densify path.
         args.two_stage = true;
