@@ -253,14 +253,18 @@ fn compute_dense_survivors(
         log::info!("Wrote stage-1 screen dump to {}", path);
     }
 
-    // Stage 2: produce dense sketches for the survivors only. With a .syl2db the
-    // dense k-mers are decoded straight from the genome's seekable block; with a
-    // plain database they are derived/re-sketched by densify_genome.
+    // Stage 2. With a .syl2db we decode each survivor's dense block into a
+    // short-lived sketch, run the (prefetch-friendly) pass-1 profiling on it, and
+    // keep it only if it passes -- so the discarded majority is freed immediately
+    // and never cached, keeping peak RAM proportional to the genomes that survive
+    // rather than to the (much larger) screen-survivor set. With a plain database
+    // the dense sketch is derived/re-sketched by densify_genome and filtered the
+    // same way.
     let dense: Mutex<Vec<GenomeSketch>> = Mutex::new(vec![]);
     survivors.par_iter().for_each(|i| {
         let g = match two_stage_db {
-            Some(db) => match db.load_dense(*i as u32) {
-                Ok(a) => Some((*a).clone()),
+            Some(db) => match db.decode_dense(*i as u32) {
+                Ok(g) => Some(g),
                 Err(e) => {
                     warn!("Could not decode dense block for genome index {}: {}", i, e);
                     None
@@ -271,7 +275,10 @@ fn compute_dense_survivors(
             }
         };
         if let Some(g) = g {
-            dense.lock().unwrap().push(g);
+            // Keep only genomes that pass pass-1 profiling; drop (free) the rest.
+            if get_stats(args, &g, sequence_sketch, None, false).is_some() {
+                dense.lock().unwrap().push(g);
+            }
         }
     });
     let dense = dense.into_inner().unwrap();
@@ -412,7 +419,10 @@ pub fn contain(mut args: ContainArgs, pseudotax_in: bool) {
             std::process::exit(1);
         }
         log::info!("Opening two-stage database {} (loading stage-1 sparse index)...", two_stage_db_files[0]);
-        let db = crate::twostage_db::open_file(two_stage_db_files[0])
+        // Memory-map for parallel decode when multi-threaded; otherwise read
+        // blocks positionally to keep RSS low (mmap's only benefit is parallelism).
+        let use_mmap = args.threads > 1;
+        let db = crate::twostage_db::open_file(two_stage_db_files[0], use_mmap)
             .unwrap_or_else(|e| panic!("{} is not a valid two-stage database: {}", two_stage_db_files[0], e));
         // The database is inherently two-stage; enable the screen-then-densify path.
         args.two_stage = true;
@@ -922,20 +932,84 @@ fn get_stats<'a>(
         }
     }
 
+    let n_kmers = gn_kmers.len();
+    let reassign_log = if winner_map.is_some() && log_reassign {
+        Some((
+            genome_sketch.file_name.as_str(),
+            genome_sketch.first_contig_name.as_str(),
+            kmers_lost_count,
+        ))
+    } else {
+        None
+    };
+    let fin = finalize_stats(args, genome_sketch.k, n_kmers, contain_count, covs, reassign_log)?;
+
+    let seq_name = if let Some(sample) = &sequence_sketch.sample_name {
+        sample.clone()
+    } else {
+        sequence_sketch.file_name.clone()
+    };
+    let kmers_lost = if winner_map.is_some() {
+        Some(kmers_lost_count)
+    } else {
+        None
+    };
+
+    Some(AniResult {
+        naive_ani: fin.naive_ani,
+        final_est_ani: fin.final_est_ani,
+        final_est_cov: fin.final_est_cov,
+        seq_name,
+        gn_name: genome_sketch.file_name.as_str(),
+        contig_name: genome_sketch.first_contig_name.as_str(),
+        mean_cov: fin.mean_cov,
+        median_cov: fin.median_cov,
+        containment_index: (contain_count, n_kmers),
+        lambda: fin.lambda,
+        ani_ci: fin.ani_ci,
+        lambda_ci: fin.lambda_ci,
+        genome_sketch,
+        rel_abund: None,
+        seq_abund: None,
+        kmers_lost,
+    })
+}
+
+/// Scalar outputs of the coverage-correction + ANI estimation.
+struct Finalized {
+    naive_ani: f64,
+    final_est_ani: f64,
+    final_est_cov: f64,
+    median_cov: f64,
+    mean_cov: f64,
+    lambda: AdjustStatus,
+    ani_ci: (Option<f64>, Option<f64>),
+    lambda_ci: (Option<f64>, Option<f64>),
+}
+
+/// Coverage-correction + ANI math shared by `get_stats` (materialized genome)
+/// and the streaming two-stage pass-1 (which never builds a genome `Vec`).
+/// Consumes the matched coverage counts `covs` and the genome k-mer count
+/// `n_kmers`; applies the minimum-ANI gate (returns None below it). When
+/// `reassign_log` is set, logs a drop during pseudotax reassignment.
+fn finalize_stats(
+    args: &ContainArgs,
+    k: usize,
+    n_kmers: usize,
+    contain_count: usize,
+    mut covs: Vec<u32>,
+    reassign_log: Option<(&str, &str, usize)>,
+) -> Option<Finalized> {
     if covs.is_empty() {
         return None;
     }
-    let naive_ani = f64::powf(
-        contain_count as f64 / gn_kmers.len() as f64,
-        1. / genome_sketch.k as f64,
-    );
+    let naive_ani = f64::powf(contain_count as f64 / n_kmers as f64, 1. / k as f64);
     covs.sort();
-    //let covs = &covs[0..covs.len() * 99 / 100];
     let median_cov = covs[covs.len() / 2] as f64;
     let pois = Poisson::new(median_cov).unwrap();
     let mut max_cov = f64::MAX;
-    if median_cov < 30.{
-        for i in covs.len() / 2..covs.len(){
+    if median_cov < 30. {
+        for i in covs.len() / 2..covs.len() {
             let cov = covs[i];
             if pois.cdf(cov.into()) < CUTOFF_PVALUE {
                 max_cov = cov as f64;
@@ -944,18 +1018,12 @@ fn get_stats<'a>(
             }
         }
     }
-    log::trace!("COV VECTOR for {}/{}: {:?}, MAX_COV_THRESHOLD: {}", sequence_sketch.file_name, genome_sketch.file_name ,covs, max_cov);
 
-
-    let mut full_covs = vec![0; gn_kmers.len() - contain_count];
+    let mut full_covs = vec![0; n_kmers - contain_count];
     for cov in covs.iter() {
         if (*cov as f64) <= max_cov {
             full_covs.push(*cov);
         }
-    }
-    let var = var(&full_covs);
-    if var.is_some(){
-        log::trace!("VAR {} {}", var.unwrap(), genome_sketch.file_name);
     }
     let mean_cov = full_covs.iter().sum::<u32>() as f64 / full_covs.len() as f64;
     let geq1_mean_cov = full_covs.iter().sum::<u32>() as f64 / covs.len() as f64;
@@ -972,7 +1040,7 @@ fn get_stats<'a>(
         } else if args.nb {
             test_lambda = binary_search_lambda(&full_covs)
         } else if args.mle {
-            test_lambda = mle_zip(&full_covs, sequence_sketch.k as f64)
+            test_lambda = mle_zip(&full_covs, k as f64)
         } else {
             test_lambda = ratio_lambda(&full_covs, args.min_count_correct)
         };
@@ -984,18 +1052,14 @@ fn get_stats<'a>(
     }
 
     let final_est_cov;
-
     if let AdjustStatus::Lambda(lam) = use_lambda {
         final_est_cov = lam
-    } else if median_cov < MAX_MEDIAN_FOR_MEAN_FINAL_EST{
+    } else if median_cov < MAX_MEDIAN_FOR_MEAN_FINAL_EST {
         final_est_cov = geq1_mean_cov;
-    } else{
-        if args.mean_coverage{
-            final_est_cov = geq1_mean_cov;
-        }
-        else{
-            final_est_cov = median_cov;
-        }
+    } else if args.mean_coverage {
+        final_est_cov = geq1_mean_cov;
+    } else {
+        final_est_cov = median_cov;
     }
 
     let opt_lambda;
@@ -1005,8 +1069,8 @@ fn get_stats<'a>(
         opt_lambda = Some(final_est_cov)
     };
 
-    let opt_est_ani = ani_from_lambda(opt_lambda, mean_cov, sequence_sketch.k as f64, &full_covs);
-    
+    let opt_est_ani = ani_from_lambda(opt_lambda, mean_cov, k as f64, &full_covs);
+
     let final_est_ani;
     if opt_lambda.is_none() || opt_est_ani.is_none() || args.no_adj {
         final_est_ani = naive_ani;
@@ -1014,74 +1078,42 @@ fn get_stats<'a>(
         final_est_ani = opt_est_ani.unwrap();
     }
 
-    let min_ani = if args.minimum_ani.is_some() {args.minimum_ani.unwrap()/100. }
-        else if args.pseudotax { MIN_ANI_P_DEF } 
-        else { MIN_ANI_DEF };
+    let min_ani = if args.minimum_ani.is_some() {
+        args.minimum_ani.unwrap() / 100.
+    } else if args.pseudotax {
+        MIN_ANI_P_DEF
+    } else {
+        MIN_ANI_DEF
+    };
     if final_est_ani < min_ani {
-        if winner_map.is_some(){
-            //Used to be > min ani, now it is not after reassignment
-            if log_reassign{
-                log::info!("Genome/contig {}/{} has ANI = {} < {} after reassigning {} k-mers ({} contained k-mers after reassign)", 
-                    genome_sketch.file_name,
-                    genome_sketch.first_contig_name,
-                    final_est_ani * 100.,
-                    min_ani * 100.,
-                    kmers_lost_count,
-                    contain_count)
-            }
-
+        if let Some((gn, ctg, lost)) = reassign_log {
+            log::info!(
+                "Genome/contig {}/{} has ANI = {} < {} after reassigning {} k-mers ({} contained k-mers after reassign)",
+                gn, ctg, final_est_ani * 100., min_ani * 100., lost, contain_count
+            );
         }
         return None;
     }
 
     let (mut low_ani, mut high_ani, mut low_lambda, mut high_lambda) = (None, None, None, None);
     if !args.no_ci && opt_lambda.is_some() {
-        let bootstrap = bootstrap_interval(&full_covs, sequence_sketch.k as f64, &args);
+        let bootstrap = bootstrap_interval(&full_covs, k as f64, args);
         low_ani = bootstrap.0;
         high_ani = bootstrap.1;
         low_lambda = bootstrap.2;
         high_lambda = bootstrap.3;
     }
 
-    
-    let seq_name;
-    if let Some(sample) = &sequence_sketch.sample_name{
-        seq_name = sample.clone();
-    }
-    else{
-        seq_name = sequence_sketch.file_name.clone();
-    }
-
-    let kmers_lost;
-    if winner_map.is_some(){
-        kmers_lost = Some(kmers_lost_count)
-    }
-    else{
-        kmers_lost = None;
-    }
-
-    let ani_result = AniResult {
+    Some(Finalized {
         naive_ani,
         final_est_ani,
         final_est_cov,
-        seq_name: seq_name,
-        gn_name: genome_sketch.file_name.as_str(),
-        contig_name: genome_sketch.first_contig_name.as_str(),
-        mean_cov: geq1_mean_cov,
         median_cov,
-        containment_index: (contain_count, gn_kmers.len()),
+        mean_cov: geq1_mean_cov,
         lambda: use_lambda,
         ani_ci: (low_ani, high_ani),
         lambda_ci: (low_lambda, high_lambda),
-        genome_sketch: genome_sketch,
-        rel_abund: None,
-        seq_abund: None,
-        kmers_lost: kmers_lost,
-
-    };
-    //log::trace!("Other time {:?}", Instant::now() - start_t_initial);
-
-    return Some(ani_result);
+    })
 }
 
 

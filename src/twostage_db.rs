@@ -45,6 +45,7 @@ use log::*;
 use memmap2::Mmap;
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -457,20 +458,29 @@ pub fn write_two_stage_db_codec<W: Write>(
 
 // --- opened database --------------------------------------------------------
 
-/// Backing bytes for the dense blocks: a memory map (for files) or an owned
-/// buffer (for in-memory readers / tests). Both deref to the whole-file slice,
-/// so a dense block is just `bytes()[dense_offset..]`.
+/// Backing store for the dense blocks.
+///   * `Mmap`  - whole file memory-mapped; a block is a zero-copy slice. Used for
+///     multi-threaded runs (parallel page-fault decode), at the cost of resident
+///     file pages counting toward RSS.
+///   * `File`  - positional `read_at` of just the requested block bytes. Used for
+///     single-threaded runs: no parallelism to gain from mmap, and it keeps RSS
+///     low (only the block, plus reclaimable OS page cache).
+///   * `Owned` - whole file in memory; for in-memory readers / tests.
 enum DenseData {
     Mmap(Mmap),
+    File(File),
     Owned(Vec<u8>),
 }
 
 impl DenseData {
+    /// Whole-file bytes; only valid for the in-memory backings (used to parse the
+    /// header/footer). The `File` backing is read positionally via `with_block`.
     #[inline]
     fn bytes(&self) -> &[u8] {
         match self {
             DenseData::Mmap(m) => &m[..],
             DenseData::Owned(v) => &v[..],
+            DenseData::File(_) => unreachable!("File-backed db is read via with_block"),
         }
     }
 }
@@ -485,6 +495,9 @@ pub struct TwoStageDb {
     pub screen_c: usize,
     /// Dense blocks are Elias-Fano (version 2) rather than Golomb-Rice (v1).
     ef: bool,
+    /// File offset where the dense-block region ends (start of the footer); used
+    /// to bound the last genome's block for positional reads.
+    footer_offset: u64,
     genomes: Vec<GenomeMeta>,
     /// Stage-1 sparse sketches, one per genome, in database order. These stand in
     /// for the full database during the cheap screen.
@@ -493,16 +506,16 @@ pub struct TwoStageDb {
     cache: Mutex<FxHashMap<u32, Arc<GenomeSketch>>>,
 }
 
-/// Parse the header + footer of a `.syl2db` already resident in `data`.
-fn from_bytes(data: DenseData) -> io::Result<TwoStageDb> {
-    let bytes = data.bytes();
-    if bytes.len() < HEADER_LEN as usize || &bytes[0..4] != MAGIC {
+/// Parse the magic + version header; return the dense codec flag and the footer
+/// offset.
+fn parse_header(hdr: &[u8]) -> io::Result<(bool, u64)> {
+    if hdr.len() < HEADER_LEN as usize || &hdr[0..4] != MAGIC {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "not a sylph two-stage database",
         ));
     }
-    let ef = match bytes[4] {
+    let ef = match hdr[4] {
         VERSION_RICE => false,
         VERSION_EF => true,
         _ => {
@@ -512,16 +525,12 @@ fn from_bytes(data: DenseData) -> io::Result<TwoStageDb> {
             ))
         }
     };
-    let footer_offset = u64::from_le_bytes(bytes[5..13].try_into().unwrap()) as usize;
-    if footer_offset > bytes.len() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "two-stage database footer offset out of range",
-        ));
-    }
-    let footer: Footer = bincode::deserialize(&bytes[footer_offset..])
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let footer_offset = u64::from_le_bytes(hdr[5..13].try_into().unwrap());
+    Ok((ef, footer_offset))
+}
 
+/// Assemble a `TwoStageDb` from its parsed footer + backing store.
+fn build_db(footer: Footer, ef: bool, footer_offset: u64, data: DenseData) -> TwoStageDb {
     // Build the stage-1 screen sketches from the sparse subsamples. The screen
     // pass runs with pseudotax disabled, so an empty tracked-kmer set is a safe
     // placeholder that keeps the `--disable-profiling` guard in `contain` happy;
@@ -540,17 +549,32 @@ fn from_bytes(data: DenseData) -> io::Result<TwoStageDb> {
             min_spacing: m.min_spacing,
         })
         .collect();
-
-    Ok(TwoStageDb {
+    TwoStageDb {
         c: footer.c,
         k: footer.k,
         screen_c: footer.screen_c,
         ef,
+        footer_offset,
         genomes: footer.genomes,
         screen_sketches,
         data,
         cache: Mutex::new(FxHashMap::default()),
-    })
+    }
+}
+
+/// Parse the header + footer of a `.syl2db` already resident in `data`.
+fn from_bytes(data: DenseData) -> io::Result<TwoStageDb> {
+    let bytes = data.bytes();
+    let (ef, footer_offset) = parse_header(bytes)?;
+    if footer_offset as usize > bytes.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "two-stage database footer offset out of range",
+        ));
+    }
+    let footer: Footer = bincode::deserialize(&bytes[footer_offset as usize..])
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    Ok(build_db(footer, ef, footer_offset, data))
 }
 
 /// Open a `.syl2db` from an in-memory reader (reads it all into memory).
@@ -568,24 +592,56 @@ impl TwoStageDb {
         self.genomes.is_empty()
     }
 
-    /// Decode genome `g`'s full dense `GenomeSketch` (cached across calls). Reads
-    /// straight from the backing slice at the genome's offset, so concurrent
-    /// calls from different threads do not contend on any shared file cursor.
-    pub fn load_dense(&self, g: u32) -> io::Result<Arc<GenomeSketch>> {
-        if let Some(a) = self.cache.lock().unwrap().get(&g) {
-            return Ok(a.clone());
-        }
-        let meta = &self.genomes[g as usize];
-        let mut cur: &[u8] = &self.data.bytes()[meta.dense_offset as usize..];
-        let genome_kmers = read_dense_block(&mut cur, self.ef)?;
-        let mut flag = [0u8; 1];
-        cur.read_exact(&mut flag)?;
-        let pseudotax = if flag[0] != 0 {
-            Some(read_dense_block(&mut cur, self.ef)?)
+    /// End offset of genome `g`'s region (start of the next genome's block, or
+    /// the footer for the last genome). Genomes are stored in ascending offset.
+    fn block_end(&self, g: u32) -> u64 {
+        let gi = g as usize;
+        if gi + 1 < self.genomes.len() {
+            self.genomes[gi + 1].dense_offset
         } else {
-            None
-        };
-        let sketch = Arc::new(GenomeSketch {
+            self.footer_offset
+        }
+    }
+
+    /// Run `f` on genome `g`'s whole on-disk region (`genome_kmers` block, the
+    /// pseudotax flag, and the optional pseudotax block). For the mmap/owned
+    /// backings this is a zero-copy slice; for the file backing it is one
+    /// positional read of just that region. No shared cursor, so it is safe to
+    /// call concurrently from many threads.
+    fn with_block<T>(&self, g: u32, f: impl FnOnce(&[u8]) -> io::Result<T>) -> io::Result<T> {
+        let start = self.genomes[g as usize].dense_offset as usize;
+        match &self.data {
+            DenseData::Mmap(m) => f(&m[start..]),
+            DenseData::Owned(v) => f(&v[start..]),
+            DenseData::File(file) => {
+                let end = self.block_end(g) as usize;
+                let mut buf = vec![0u8; end - start];
+                file.read_exact_at(&mut buf, start as u64)?;
+                f(&buf)
+            }
+        }
+    }
+
+    /// Decode genome `g`'s full dense `GenomeSketch` without touching the cache.
+    /// Concurrent calls from different threads do not contend on any shared
+    /// cursor (mmap slice or positional read). The two-stage pass-1 uses this to
+    /// decode each survivor into a short-lived sketch, probe it, and drop it
+    /// unless it passes -- so the discarded majority is never cached.
+    pub fn decode_dense(&self, g: u32) -> io::Result<GenomeSketch> {
+        let meta = &self.genomes[g as usize];
+        let (genome_kmers, pseudotax) = self.with_block(g, |bytes| {
+            let mut cur = bytes;
+            let gk = read_dense_block(&mut cur, self.ef)?;
+            let mut flag = [0u8; 1];
+            cur.read_exact(&mut flag)?;
+            let pt = if flag[0] != 0 {
+                Some(read_dense_block(&mut cur, self.ef)?)
+            } else {
+                None
+            };
+            Ok((gk, pt))
+        })?;
+        Ok(GenomeSketch {
             genome_kmers,
             pseudotax_tracked_nonused_kmers: pseudotax,
             file_name: meta.file_name.clone(),
@@ -594,20 +650,46 @@ impl TwoStageDb {
             k: self.k,
             gn_size: meta.gn_size,
             min_spacing: meta.min_spacing,
-        });
+        })
+    }
+
+    /// Decode genome `g`'s full dense `GenomeSketch`, caching it across calls.
+    pub fn load_dense(&self, g: u32) -> io::Result<Arc<GenomeSketch>> {
+        if let Some(a) = self.cache.lock().unwrap().get(&g) {
+            return Ok(a.clone());
+        }
+        let sketch = Arc::new(self.decode_dense(g)?);
         self.cache.lock().unwrap().insert(g, sketch.clone());
         Ok(sketch)
     }
 }
 
-/// Open a `.syl2db` file from a path, memory-mapping it for lock-free parallel
-/// dense-block decoding.
-pub fn open_file(path: &str) -> io::Result<TwoStageDb> {
+/// Open a `.syl2db` file from a path. With `mmap`, the whole file is memory
+/// mapped for lock-free parallel decode (higher RSS); otherwise blocks are read
+/// positionally on demand (lower RSS, preferred when single-threaded).
+pub fn open_file(path: &str, mmap: bool) -> io::Result<TwoStageDb> {
     let file = File::open(path)?;
-    // Safety: the database is treated as read-only; we never mutate the map and
-    // the file is not expected to change underneath us during a run.
-    let mmap = unsafe { Mmap::map(&file)? };
-    from_bytes(DenseData::Mmap(mmap))
+    if mmap {
+        // Safety: the database is treated as read-only; we never mutate the map
+        // and the file is not expected to change underneath us during a run.
+        let m = unsafe { Mmap::map(&file)? };
+        return from_bytes(DenseData::Mmap(m));
+    }
+    let mut hdr = [0u8; HEADER_LEN as usize];
+    file.read_exact_at(&mut hdr, 0)?;
+    let (ef, footer_offset) = parse_header(&hdr)?;
+    let flen = file.metadata()?.len();
+    if footer_offset > flen {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "two-stage database footer offset out of range",
+        ));
+    }
+    let mut fbytes = vec![0u8; (flen - footer_offset) as usize];
+    file.read_exact_at(&mut fbytes, footer_offset)?;
+    let footer: Footer = bincode::deserialize(&fbytes)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    Ok(build_db(footer, ef, footer_offset, DenseData::File(file)))
 }
 
 // --- CLI handler ------------------------------------------------------------
