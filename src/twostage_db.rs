@@ -139,51 +139,88 @@ impl BitWriter {
     }
 }
 
+/// LSB-first bit reader that decodes a word at a time: bytes are buffered into a
+/// 64-bit accumulator so `read_bits`/`read_unary` extract many bits per
+/// instruction (shift/mask, trailing_ones) instead of one bit per call.
 struct BitReader<'a> {
     buf: &'a [u8],
-    byte: usize,
-    bit: u8,
+    pos: usize,
+    acc: u64,
+    nbits: u32,
 }
 
 impl<'a> BitReader<'a> {
     fn new(buf: &'a [u8]) -> Self {
         BitReader {
             buf,
-            byte: 0,
-            bit: 0,
+            pos: 0,
+            acc: 0,
+            nbits: 0,
         }
     }
+    /// Pull bytes into the accumulator until it holds >= 56 bits (so it never
+    /// exceeds 63, keeping shifts in range) or the input is exhausted.
     #[inline]
-    fn read_bit(&mut self) -> io::Result<u32> {
-        if self.byte >= self.buf.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "bitstream truncated",
-            ));
+    fn refill(&mut self) {
+        while self.nbits < 56 && self.pos < self.buf.len() {
+            self.acc |= (self.buf[self.pos] as u64) << self.nbits;
+            self.pos += 1;
+            self.nbits += 8;
         }
-        let b = (self.buf[self.byte] >> self.bit) & 1;
-        self.bit += 1;
-        if self.bit == 8 {
-            self.bit = 0;
-            self.byte += 1;
-        }
-        Ok(b as u32)
     }
     #[inline]
     fn read_bits(&mut self, n: u32) -> io::Result<u64> {
-        let mut v = 0u64;
-        for i in 0..n {
-            v |= (self.read_bit()? as u64) << i;
+        if n == 0 {
+            return Ok(0);
         }
+        if n > 32 {
+            // Split so each half fits the (>=56 bit) accumulator comfortably.
+            let lo = self.read_bits(32)?;
+            let hi = self.read_bits(n - 32)?;
+            return Ok(lo | (hi << 32));
+        }
+        if self.nbits < n {
+            self.refill();
+            if self.nbits < n {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "bitstream truncated",
+                ));
+            }
+        }
+        let v = self.acc & ((1u64 << n) - 1);
+        self.acc >>= n;
+        self.nbits -= n;
         Ok(v)
     }
+    /// Unary = run of 1s terminated by a 0 (matches `BitWriter::write_unary`).
     #[inline]
     fn read_unary(&mut self) -> io::Result<u64> {
         let mut q = 0u64;
-        while self.read_bit()? == 1 {
-            q += 1;
+        loop {
+            if self.nbits == 0 {
+                self.refill();
+                if self.nbits == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "bitstream truncated",
+                    ));
+                }
+            }
+            let ones = (self.acc | (1u64 << self.nbits)).trailing_ones(); // <= nbits
+            if ones >= self.nbits {
+                // all buffered bits are 1s; consume them and continue
+                q += self.nbits as u64;
+                self.acc = 0;
+                self.nbits = 0;
+            } else {
+                // `ones` 1-bits then the terminating 0
+                q += ones as u64;
+                self.acc >>= ones + 1;
+                self.nbits -= ones + 1;
+                return Ok(q);
+            }
         }
-        Ok(q)
     }
 }
 
