@@ -802,3 +802,78 @@ fn test_two_stage_db_convert_and_profile(){
     let mut cmd = Command::cargo_bin("sylph").unwrap();
     cmd.arg("query").arg(&two_stage_db).arg(&sample).assert().failure();
 }
+
+#[serial]
+#[test]
+fn test_two_stage_individual_records(){
+    fresh();
+    let dir = "./tests/results/two_stage_indiv";
+    let _ = fs::remove_dir_all(dir);
+    fs::create_dir_all(dir).unwrap();
+
+    // Dense (-c 50) database built with --individual-records: e.coli-o157 has two
+    // records, so multiple database entries share one file name -- the case that
+    // must be preserved per record by db-convert (and rejected by the densify
+    // fallback).
+    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    cmd.arg("sketch").arg("-c").arg("50").arg("-i")
+        .arg("./test_files/e.coli-EC590.fasta.gz")
+        .arg("./test_files/e.coli-o157.fasta.gz")
+        .arg("./test_files/e.coli-K12.fasta.gz")
+        .arg("-o").arg(format!("{}/db_c50", dir))
+        .assert().success().code(0);
+
+    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    cmd.arg("sketch").arg("-c").arg("50")
+        .arg("./test_files/o157_reads.fastq.gz")
+        .arg("-d").arg(dir)
+        .assert().success().code(0);
+
+    let dense_db = format!("{}/db_c50.syldb", dir);
+    let sample = format!("{}/o157_reads.fastq.gz.sylsp", dir);
+
+    // Convert to a two-stage db (per-record blocks are written individually).
+    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    cmd.arg("db-convert").arg(&dense_db)
+        .arg("--screen-c").arg("200")
+        .arg("-o").arg(format!("{}/db2", dir))
+        .assert().success().code(0);
+    let two_stage_db = format!("{}/db2.syl2db", dir);
+
+    // Per-record key = genome_file (col 2) + contig name (last col).
+    let detected = |tsv: &str| -> Vec<String> {
+        let mut v: Vec<String> = tsv.lines().skip(1)
+            .filter_map(|l| {
+                let cols: Vec<&str> = l.split('\t').collect();
+                if cols.len() < 2 { return None; }
+                Some(format!("{}\t{}", cols[1], cols[cols.len() - 1]))
+            })
+            .collect();
+        v.sort();
+        v
+    };
+
+    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    let two = cmd.arg("profile").arg("--two-stage").arg(&two_stage_db).arg(&sample)
+        .output().expect("Output failed");
+    assert!(two.status.success());
+    let two = str::from_utf8(&two.stdout).expect("not UTF-8").to_string();
+    assert!(two.contains("e.coli-o157.fasta.gz"));
+
+    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    let single = cmd.arg("profile").arg(&dense_db).arg(&sample)
+        .output().expect("Output failed");
+    let single = str::from_utf8(&single.stdout).expect("not UTF-8").to_string();
+
+    // db-convert + two-stage must reproduce single-stage per-record detections
+    // (no collapsing/merging of records sharing a file name).
+    assert_eq!(detected(&two), detected(&single),
+        "two-stage .syl2db lost or merged individual records vs single-stage");
+
+    // The densify fallback (raw .syldb --two-stage, no db-convert) cannot handle
+    // individual records and must error rather than silently corrupt them.
+    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    cmd.arg("profile").arg("--two-stage").arg("--dense-c").arg("50")
+        .arg(&dense_db).arg(&sample)
+        .assert().failure();
+}

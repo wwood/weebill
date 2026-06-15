@@ -217,6 +217,33 @@ fn compute_dense_survivors(
     screen_args.pseudotax = false;
     screen_args.minimum_ani = Some(args.screen_ani);
     screen_args.no_ci = true;
+    // The screen scores against sketches sub-sampled to `screen_c`, so the dense
+    // `-M/--min-number-kmers` floor would over-reject here: a genome/contig has
+    // only ~length/screen_c sparse k-mers, so the dense floor M corresponds to a
+    // length of M*screen_c (e.g. 50*3000 = 150 kb), silently dropping smaller
+    // genomes (viruses, plasmids, short contigs) that single-stage profiling
+    // would report. Scale the floor to the screen resolution so a genome that
+    // could clear the dense floor also clears the screen; genomes truly below the
+    // floor are still rejected at the dense stage.
+    screen_args.min_number_kmers = args.min_number_kmers * dense_c as f64 / screen_c as f64;
+
+    // The densify fallback (no .syl2db) re-sketches whole FASTA files keyed by
+    // file name, which collapses `--individual-records` databases (many records
+    // share a file name) into a single whole-file sketch. Reject that up front;
+    // `db-convert` to a .syl2db preserves individual records and works fine.
+    if two_stage_db.is_none() {
+        let mut seen = std::collections::HashSet::with_capacity(genome_sketches.len());
+        for gs in genome_sketches.iter() {
+            if !seen.insert(gs.file_name.as_str()) {
+                log::error!(
+                    "--two-stage on a raw --individual-records database is unsupported \
+                     (densification re-sketches whole files). Convert it with `sylph db-convert` \
+                     first (a .syl2db preserves individual records). Exiting."
+                );
+                std::process::exit(1);
+            }
+        }
+    }
 
     let survivors: Mutex<Vec<usize>> = Mutex::new(vec![]);
     // Optional per-survivor dump: (genome, matched k-mers, total screen k-mers,
