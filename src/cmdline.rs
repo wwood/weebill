@@ -171,6 +171,8 @@ pub struct ContainArgs {
     pub screen_c: Option<usize>,
     #[clap(long="screen-ani", default_value_t = SCREEN_MIN_ANI_DEFAULT, help_heading = "TWO-STAGE PROFILING", help = "Minimum adjusted ANI (0-100) for a genome to pass the first-stage screen. Deliberately permissive; the dense stage recovers specificity.")]
     pub screen_ani: f64,
+    #[clap(long="screen-min-matches", default_value_t = 1, help_heading = "TWO-STAGE PROFILING", help = "Minimum number of matched stage-1 screen k-mers for a genome to pass the screen and be densely decoded. Default 1 keeps the same results as single-stage; raising it (e.g. with a permissive --screen-ani) cheaply prunes genomes that pass on a handful of chance-shared k-mers, cutting wasted dense decodes at a small sensitivity cost for very-low-coverage genomes.")]
+    pub screen_min_matches: usize,
     #[clap(long="dense-cache", help_heading = "TWO-STAGE PROFILING", help = "Directory of cached per-genome dense sketches (*.sylgn). Genomes (re)sketched for the dense stage are stored here and reused across samples/runs, so a dense database is grown lazily only for genomes that actually appear.")]
     pub dense_cache: Option<String>,
     #[clap(long="screen-dump", hidden=true, help_heading = "TWO-STAGE PROFILING", help = "Debug: write a TSV of every stage-1 screen survivor (genome, matched/total screen k-mers, naive/adjusted ANI, median coverage) to this file.")]

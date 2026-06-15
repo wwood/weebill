@@ -252,6 +252,13 @@ fn compute_dense_survivors(
     (0..genome_sketches.len()).into_par_iter().for_each(|i| {
         let sv = subsample_view(&genome_sketches[i], screen_c);
         if let Some(res) = get_stats(&screen_args, &sv, sequence_sketch, None, false) {
+            // Require at least `--screen-min-matches` matched screen k-mers; this
+            // cheaply drops genomes that clear the (permissive) screen ANI on only
+            // a few chance-shared k-mers, before they cost a dense decode. Default
+            // 1 == current behaviour (get_stats already needs >= 1 match).
+            if res.containment_index.0 < args.screen_min_matches {
+                return;
+            }
             if args.screen_dump.is_some() {
                 dump.lock().unwrap().push((
                     res.gn_name.to_string(),
