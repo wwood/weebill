@@ -219,9 +219,22 @@ fn compute_dense_survivors(
     screen_args.no_ci = true;
 
     let survivors: Mutex<Vec<usize>> = Mutex::new(vec![]);
+    // Optional per-survivor dump: (genome, matched k-mers, total screen k-mers,
+    // naive ANI, adjusted ANI, median coverage).
+    let dump: Mutex<Vec<(String, usize, usize, f64, f64, f64)>> = Mutex::new(vec![]);
     (0..genome_sketches.len()).into_par_iter().for_each(|i| {
         let sv = subsample_view(&genome_sketches[i], screen_c);
-        if get_stats(&screen_args, &sv, sequence_sketch, None, false).is_some() {
+        if let Some(res) = get_stats(&screen_args, &sv, sequence_sketch, None, false) {
+            if args.screen_dump.is_some() {
+                dump.lock().unwrap().push((
+                    res.gn_name.to_string(),
+                    res.containment_index.0,
+                    res.containment_index.1,
+                    res.naive_ani * 100.,
+                    res.final_est_ani * 100.,
+                    res.median_cov,
+                ));
+            }
             survivors.lock().unwrap().push(i);
         }
     });
@@ -231,6 +244,14 @@ fn compute_dense_survivors(
         "{}: stage-1 screen (c={}, min-ANI {}) kept {} / {} candidate genomes",
         sequence_sketch.file_name, screen_c, args.screen_ani, survivors.len(), genome_sketches.len()
     );
+    if let Some(path) = &args.screen_dump {
+        let mut f = BufWriter::new(File::create(path).expect("could not create --screen-dump file"));
+        writeln!(f, "Genome_file\tscreen_matched_kmers\tscreen_total_kmers\tnaive_ani\tscreen_adjusted_ani\tscreen_median_cov").unwrap();
+        for (g, m, t, na, ea, mc) in dump.into_inner().unwrap() {
+            writeln!(f, "{}\t{}\t{}\t{:.3}\t{:.3}\t{}", g, m, t, na, ea, mc).unwrap();
+        }
+        log::info!("Wrote stage-1 screen dump to {}", path);
+    }
 
     // Stage 2: produce dense sketches for the survivors only. With a .syl2db the
     // dense k-mers are decoded straight from the genome's seekable block; with a

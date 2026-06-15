@@ -173,6 +173,8 @@ pub struct ContainArgs {
     pub screen_ani: f64,
     #[clap(long="dense-cache", help_heading = "TWO-STAGE PROFILING", help = "Directory of cached per-genome dense sketches (*.sylgn). Genomes (re)sketched for the dense stage are stored here and reused across samples/runs, so a dense database is grown lazily only for genomes that actually appear.")]
     pub dense_cache: Option<String>,
+    #[clap(long="screen-dump", hidden=true, help_heading = "TWO-STAGE PROFILING", help = "Debug: write a TSV of every stage-1 screen survivor (genome, matched/total screen k-mers, naive/adjusted ANI, median coverage) to this file.")]
+    pub screen_dump: Option<String>,
 
 
     //Hidden options that are embedded in the args but no longer used... 
