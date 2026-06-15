@@ -553,8 +553,8 @@ pub fn open_file(path: &str) -> io::Result<TwoStageDb> {
     }
     let mut fbytes = vec![0u8; (flen - footer_offset) as usize];
     file.read_exact_at(&mut fbytes, footer_offset)?;
-    let footer: Footer = bincode::deserialize(&fbytes)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let footer: Footer =
+        bincode::deserialize(&fbytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     Ok(build_db(footer, footer_offset, DenseData::File(file)))
 }
 
