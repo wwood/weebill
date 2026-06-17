@@ -487,7 +487,6 @@ pub fn contain(mut args: ContainArgs, pseudotax_in: bool) {
         Some(db) => db.screen_sketches.clone(),
         None => get_genome_sketches(&args, &genome_sketch_files, &genome_files),
     };
-    let genome_index_vec = (0..genome_sketches.len()).collect::<Vec<usize>>();
     log::info!("Finished obtaining genome sketches.");
 
     if genome_sketches.is_empty() {

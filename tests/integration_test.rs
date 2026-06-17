@@ -9,7 +9,8 @@ fn fresh(){
     Command::new("rm")
         .arg("-r")
         .args(["./tests/results/test_sketch_dir"])
-        .spawn();
+        .status()
+        .ok();
 }
 
 #[serial]
