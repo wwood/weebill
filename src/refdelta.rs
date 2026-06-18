@@ -75,7 +75,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 const REFDB_MAGIC: &[u8; 4] = b"SYLR";
-const REFDB_VERSION: u8 = 3;
+const REFDB_VERSION: u8 = 4;
 const SKETCH_MAGIC: &[u8; 4] = b"SYLD"; // reference-Delta sample
 const SKETCH_VERSION: u8 = 1;
 
@@ -94,6 +94,7 @@ const HEADER_LEN: u64 = 13;
 /// k-mers are genome-specific, so even 1 is a meaningful signal; over-loading a
 /// genome only costs time, under-loading only costs compression ratio.
 const SPARSE_MIN_HITS: u32 = 1;
+const SPARSE_MPHF_GAMMA: f64 = 2.0;
 const POOL_MPHF_GAMMA: f64 = 2.0;
 
 /// Metadata for one reference genome, in the dereplicated build order.
@@ -210,6 +211,74 @@ fn read_pool_block<R: Read>(r: &mut R, pool_len: usize) -> io::Result<(Mphf<u64>
         pool.push(u64::from_le_bytes(buf));
     }
     Ok((mphf, pool))
+}
+
+#[inline]
+fn sparse_fingerprint(h: u64) -> u32 {
+    (h ^ (h >> 32)) as u32
+}
+
+fn write_sparse_index_block<W: Write>(w: &mut W, keys: &[u64], owners: &[u32]) -> io::Result<()> {
+    if keys.len() != owners.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "sparse index keys and owners have different lengths",
+        ));
+    }
+    let mphf = Mphf::new_parallel(SPARSE_MPHF_GAMMA, keys, Some(0));
+    let mut fingerprints = vec![0u32; keys.len()];
+    let mut ordered_owners = vec![0u32; keys.len()];
+    let mut filled = vec![false; keys.len()];
+    for (&h, &owner) in keys.iter().zip(owners.iter()) {
+        let slot = mphf.hash(&h) as usize;
+        if slot >= keys.len() || filled[slot] {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "MPHF construction produced an invalid sparse slot",
+            ));
+        }
+        fingerprints[slot] = sparse_fingerprint(h);
+        ordered_owners[slot] = owner;
+        filled[slot] = true;
+    }
+
+    let mphf_bytes = bincode::serialize(&mphf)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    write_uvarint(w, mphf_bytes.len() as u64)?;
+    w.write_all(&mphf_bytes)?;
+    for &fp in &fingerprints {
+        w.write_all(&fp.to_le_bytes())?;
+    }
+    for &owner in &ordered_owners {
+        w.write_all(&owner.to_le_bytes())?;
+    }
+    Ok(())
+}
+
+fn read_sparse_index_block<R: Read>(
+    r: &mut R,
+    sparse_len: usize,
+) -> io::Result<(Mphf<u64>, Vec<u32>, Vec<u32>)> {
+    let mphf_len = read_uvarint(r)? as usize;
+    let mut mphf_bytes = vec![0u8; mphf_len];
+    r.read_exact(&mut mphf_bytes)?;
+    let mphf: Mphf<u64> = bincode::deserialize(&mphf_bytes)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+
+    let mut fingerprints = Vec::with_capacity(sparse_len);
+    for _ in 0..sparse_len {
+        let mut buf = [0u8; 4];
+        r.read_exact(&mut buf)?;
+        fingerprints.push(u32::from_le_bytes(buf));
+    }
+
+    let mut owners = Vec::with_capacity(sparse_len);
+    for _ in 0..sparse_len {
+        let mut buf = [0u8; 4];
+        r.read_exact(&mut buf)?;
+        owners.push(u32::from_le_bytes(buf));
+    }
+    Ok((mphf, fingerprints, owners))
 }
 
 // --- building the reference DB ---------------------------------------------
@@ -358,21 +427,30 @@ pub fn write_refdb<W: Write>(mut w: W, db: &RefDb, sparse_div: u64) -> io::Resul
     let ng = db.genomes.len();
     let sp_ids = species_ids(&db.genomes);
 
-    // Body: [sparse section][MPHF pool block][dense block 0][dense block 1]...
+    // Body: [sparse section][MPHF sparse index][MPHF pool block][dense blocks...]
     let mut body: Vec<u8> = Vec::new();
 
     let sparse_off = body.len() as u64; // 0
     let mut sparse_count = vec![0usize; ng];
+    let mut sparse_keys: Vec<u64> = Vec::new();
+    let mut sparse_owners: Vec<u32> = Vec::new();
     for g in 0..ng {
         let mut cnt = 0usize;
         for &h in &db.distinctive[g] {
             if sparse_div <= 1 || h % sparse_div == 0 {
                 body.extend_from_slice(&h.to_le_bytes());
+                sparse_keys.push(h);
+                sparse_owners.push(g as u32);
                 cnt += 1;
             }
         }
         sparse_count[g] = cnt;
     }
+
+    let sparse_index_off = body.len() as u64;
+    write_sparse_index_block(&mut body, &sparse_keys, &sparse_owners)?;
+    drop(sparse_keys);
+    drop(sparse_owners);
 
     let pool_off = body.len() as u64;
     write_pool_block(&mut body, &db.pool)?;
@@ -401,6 +479,7 @@ pub fn write_refdb<W: Write>(mut w: W, db: &RefDb, sparse_div: u64) -> io::Resul
     for g in 0..ng {
         write_uvarint(&mut footer, sparse_count[g] as u64)?;
     }
+    write_uvarint(&mut footer, HEADER_LEN + sparse_index_off)?;
     write_uvarint(&mut footer, HEADER_LEN + pool_off)?;
     write_uvarint(&mut footer, db.pool.len() as u64)?;
     for g in 0..ng {
@@ -447,8 +526,10 @@ pub struct RefIndex {
     sparse_div: u64,
     fingerprint: u64,
     pub genomes: Vec<RefGenomeMeta>,
-    /// stage-1: sparse distinctive hash -> owning genome id.
-    sparse_map: FxHashMap<u64, u32>,
+    /// stage-1: sparse distinctive hash -> owning genome id via MPHF slot arrays.
+    sparse_mphf: Mphf<u64>,
+    sparse_fingerprints: Vec<u32>,
+    sparse_owners: Vec<u32>,
     /// stage-1 hashes grouped per genome (sorted), merged into the dense block on
     /// load to reconstruct the full distinctive array.
     sparse_by_genome: Vec<Vec<u64>>,
@@ -506,6 +587,7 @@ fn open_ref_index_with_mode<R: Read + Seek + Send + 'static>(
     for _ in 0..ng {
         sparse_count.push(read_uvarint(&mut f)? as usize);
     }
+    let sparse_index_offset = read_uvarint(&mut f)?;
     let pool_offset = read_uvarint(&mut f)?;
     let pool_domain = read_uvarint(&mut f)? as usize;
     let mut genomes = Vec::with_capacity(ng);
@@ -530,22 +612,21 @@ fn open_ref_index_with_mode<R: Read + Seek + Send + 'static>(
     // stage 1: sparse section (raw little-endian u64, grouped by genome)
     let total_sparse: usize = sparse_count.iter().sum();
     r.seek(SeekFrom::Start(sparse_offset))?;
-    let mut sbuf = vec![0u8; total_sparse * 8];
-    r.read_exact(&mut sbuf)?;
-    let mut sparse_map: FxHashMap<u64, u32> =
-        FxHashMap::with_capacity_and_hasher(total_sparse, Default::default());
     let mut sparse_by_genome: Vec<Vec<u64>> = Vec::with_capacity(ng);
-    let mut pos = 0usize;
-    for (g, &cnt) in sparse_count.iter().enumerate() {
+    for &cnt in &sparse_count {
         let mut v = Vec::with_capacity(cnt);
         for _ in 0..cnt {
-            let h = u64::from_le_bytes(sbuf[pos..pos + 8].try_into().unwrap());
-            pos += 8;
-            sparse_map.insert(h, g as u32);
+            let mut buf = [0u8; 8];
+            r.read_exact(&mut buf)?;
+            let h = u64::from_le_bytes(buf);
             v.push(h); // stored sorted (distinctive is sorted, filter preserves order)
         }
         sparse_by_genome.push(v);
     }
+
+    r.seek(SeekFrom::Start(sparse_index_offset))?;
+    let (sparse_mphf, sparse_fingerprints, sparse_owners) =
+        read_sparse_index_block(&mut r, total_sparse)?;
 
     // shared pool (loaded once). Hashes are stored in MPHF slot order, so
     // compression can compute a candidate slot and verify it without a HashMap.
@@ -558,7 +639,9 @@ fn open_ref_index_with_mode<R: Read + Seek + Send + 'static>(
         sparse_div,
         fingerprint,
         genomes,
-        sparse_map,
+        sparse_mphf,
+        sparse_fingerprints,
+        sparse_owners,
         sparse_by_genome,
         pool,
         pool_mphf,
@@ -576,8 +659,14 @@ impl RefIndex {
             if self.sparse_div > 1 && h % self.sparse_div != 0 {
                 continue;
             }
-            if let Some(&g) = self.sparse_map.get(&h) {
-                *counts.entry(g).or_insert(0) += 1;
+            if let Some(slot) = self.sparse_mphf.try_hash(&h) {
+                let slot = slot as usize;
+                if slot < self.sparse_fingerprints.len()
+                    && self.sparse_fingerprints[slot] == sparse_fingerprint(h)
+                {
+                    let g = self.sparse_owners[slot];
+                    *counts.entry(g).or_insert(0) += 1;
+                }
             }
         }
         counts
