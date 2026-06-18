@@ -509,6 +509,8 @@ pub struct RefGenomeMeta {
     pub species: String,
     pub is_rep: bool,
     pub species_id: u32,
+    sparse_offset: u64,
+    sparse_count: u32,
     dense_offset: u64,
     dense_domain: u32,
 }
@@ -530,9 +532,6 @@ pub struct RefIndex {
     sparse_mphf: Mphf<u64>,
     sparse_fingerprints: Vec<u32>,
     sparse_owners: Vec<u32>,
-    /// stage-1 hashes grouped per genome (sorted), merged into the dense block on
-    /// load to reconstruct the full distinctive array.
-    sparse_by_genome: Vec<Vec<u64>>,
     /// shared pool, loaded once.
     pool: Vec<u64>,
     pool_mphf: Mphf<u64>,
@@ -590,8 +589,14 @@ fn open_ref_index_with_mode<R: Read + Seek + Send + 'static>(
     let sparse_index_offset = read_uvarint(&mut f)?;
     let pool_offset = read_uvarint(&mut f)?;
     let pool_domain = read_uvarint(&mut f)? as usize;
+    let mut per_genome_sparse_offsets = Vec::with_capacity(ng);
+    let mut sparse_pos = sparse_offset;
+    for &cnt in &sparse_count {
+        per_genome_sparse_offsets.push(sparse_pos);
+        sparse_pos += cnt as u64 * 8;
+    }
     let mut genomes = Vec::with_capacity(ng);
-    for _ in 0..ng {
+    for g in 0..ng {
         let file_name = read_string(&mut f)?;
         let species = read_string(&mut f)?;
         let mut rep = [0u8; 1];
@@ -604,26 +609,14 @@ fn open_ref_index_with_mode<R: Read + Seek + Send + 'static>(
             species,
             is_rep: rep[0] != 0,
             species_id,
+            sparse_offset: per_genome_sparse_offsets[g],
+            sparse_count: sparse_count[g] as u32,
             dense_offset,
             dense_domain,
         });
     }
 
-    // stage 1: sparse section (raw little-endian u64, grouped by genome)
     let total_sparse: usize = sparse_count.iter().sum();
-    r.seek(SeekFrom::Start(sparse_offset))?;
-    let mut sparse_by_genome: Vec<Vec<u64>> = Vec::with_capacity(ng);
-    for &cnt in &sparse_count {
-        let mut v = Vec::with_capacity(cnt);
-        for _ in 0..cnt {
-            let mut buf = [0u8; 8];
-            r.read_exact(&mut buf)?;
-            let h = u64::from_le_bytes(buf);
-            v.push(h); // stored sorted (distinctive is sorted, filter preserves order)
-        }
-        sparse_by_genome.push(v);
-    }
-
     r.seek(SeekFrom::Start(sparse_index_offset))?;
     let (sparse_mphf, sparse_fingerprints, sparse_owners) =
         read_sparse_index_block(&mut r, total_sparse)?;
@@ -642,7 +635,6 @@ fn open_ref_index_with_mode<R: Read + Seek + Send + 'static>(
         sparse_mphf,
         sparse_fingerprints,
         sparse_owners,
-        sparse_by_genome,
         pool,
         pool_mphf,
         reader: Mutex::new(Box::new(r)),
@@ -683,14 +675,22 @@ impl RefIndex {
         if let Some(a) = self.cache.lock().unwrap().get(&g) {
             return Ok(a.clone());
         }
-        let off = self.genomes[g as usize].dense_offset;
-        let complement = {
+        let meta = &self.genomes[g as usize];
+        let (complement, sparse) = {
             let mut rd = self.reader.lock().unwrap();
-            rd.seek(SeekFrom::Start(off))?;
+            rd.seek(SeekFrom::Start(meta.dense_offset))?;
             let mut r: &mut dyn ReadSeek = &mut **rd;
-            read_hashes(&mut r)?
+            let complement = read_hashes(&mut r)?;
+
+            rd.seek(SeekFrom::Start(meta.sparse_offset))?;
+            let mut sparse = Vec::with_capacity(meta.sparse_count as usize);
+            for _ in 0..meta.sparse_count {
+                let mut buf = [0u8; 8];
+                rd.read_exact(&mut buf)?;
+                sparse.push(u64::from_le_bytes(buf));
+            }
+            (complement, sparse)
         };
-        let sparse = &self.sparse_by_genome[g as usize];
         // merge two sorted, disjoint ascending runs into the full distinctive array
         let mut arr = Vec::with_capacity(complement.len() + sparse.len());
         let (mut i, mut j) = (0usize, 0usize);
