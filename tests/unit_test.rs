@@ -31,7 +31,7 @@ fn refdelta_build_two_level_assignment() {
     tax.insert("A_str.fa".into(), ("A".into(), false));
     tax.insert("B_rep.fa".into(), ("B".into(), true));
 
-    let db = refdelta::build_refdb(&sketches, &tax);
+    let db = refdelta::build_refdb_with_pool_min_genomes(&sketches, &tax, 2);
     // ordering: species A (rep first), then strain, then species B
     assert_eq!(db.genomes[0].file_name, "A_rep.fa");
     assert_eq!(db.genomes[1].file_name, "A_str.fa");
@@ -45,6 +45,29 @@ fn refdelta_build_two_level_assignment() {
     assert_eq!(db.distinctive[2], vec![300, 301]);
     // 500 is in two reps -> shared pool
     assert_eq!(db.pool, vec![500]);
+}
+
+#[test]
+fn refdelta_pool_min_genomes_assigns_pairs_to_first_owner() {
+    let sketches = vec![
+        gsketch("A_rep.fa", vec![1, 10, 20]),
+        gsketch("B_rep.fa", vec![2, 10, 20]),
+        gsketch("C_rep.fa", vec![3, 20]),
+    ];
+    let mut tax: FxHashMap<String, (String, bool)> = FxHashMap::default();
+    tax.insert("A_rep.fa".into(), ("A".into(), true));
+    tax.insert("B_rep.fa".into(), ("B".into(), true));
+    tax.insert("C_rep.fa".into(), ("C".into(), true));
+
+    let db = refdelta::build_refdb_with_pool_min_genomes(&sketches, &tax, 3);
+
+    // 10 is shared by exactly two reps, so threshold 3 keeps it distinctive and
+    // assigns it to the first genome in build order. 20 is shared by three reps
+    // and still goes to the shared pool.
+    assert_eq!(db.distinctive[0], vec![1, 10]);
+    assert_eq!(db.distinctive[1], vec![2]);
+    assert_eq!(db.distinctive[2], vec![3]);
+    assert_eq!(db.pool, vec![20]);
 }
 
 fn open_index(db: &refdelta::RefDb, sparse_div: u64) -> refdelta::RefIndex {

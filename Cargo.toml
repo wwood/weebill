@@ -15,6 +15,7 @@ smallvec = { version = "1", features = ["union","serde","write"] }
 serde = { version = "1", features = ["derive"] }
 bincode = "1"
 fxhash = "0"
+boomphf = { version = "0.6", features = ["serde"] }
 clap = { version = "3", features = ["derive"] }
 flate2 = { version = "1.0.17", features = ["zlib-ng"], default-features = false }
 zstd = "0.13"

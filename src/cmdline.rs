@@ -59,6 +59,8 @@ pub struct RefBuildArgs {
     pub output: String,
     #[clap(long="sparse-subsample", default_value_t = 16, help = "Stage-1 sparse index subsampling divisor: 1/N of each genome's distinctive k-mers are kept uncompressed for fast hit detection. Larger N gives a smaller/faster stage-1 index but coarser detection (1 keeps all).")]
     pub sparse_div: u64,
+    #[clap(long="pool-min-genomes", default_value_t = 3, help = "Minimum number of same-tier genomes required before a k-mer is placed in the shared pool. With 3, k-mers shared by exactly two reps/strains are assigned to the first such genome instead of the pool.")]
+    pub pool_min_genomes: u32,
     #[clap(long="max-ram", help = "Approximate peak RAM target (GB) for building. Sizes the number of on-disk partitions the build streams through; a soft target, not a hard limit.")]
     pub max_ram: Option<usize>,
     #[clap(long="tmp-dir", help = "Directory for build scratch files (needs roughly the input database size of free space). Default: alongside the output.")]

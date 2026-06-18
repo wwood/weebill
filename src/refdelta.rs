@@ -18,9 +18,13 @@
 //!     rep (representatives are higher quality, so they win over strains — a
 //!     contaminant k-mer that really belongs to another species' rep is
 //!     attributed there, not to the strain carrying the contamination).
-//!   * A k-mer in two or more reps is ambiguous → the shared **pool**.
+//!   * By default, a k-mer in three or more reps is ambiguous → the shared
+//!     **pool**. `ref-build --pool-min-genomes` can change that threshold; with
+//!     3, exactly two same-tier genomes keep the k-mer assigned to the first
+//!     owner.
 //!   * A k-mer in no rep but exactly one strain is owned by that strain.
-//!   * A k-mer in no rep and several strains → the shared pool.
+//!   * A k-mer in no rep and enough strains to meet the threshold → the shared
+//!     pool.
 //!
 //! ## Two-stage reference database layout (`.sylref`)
 //!
@@ -61,6 +65,7 @@ use crate::compress::{
 };
 use crate::constants::*;
 use crate::types::*;
+use boomphf::Mphf;
 use fxhash::FxHashMap;
 use log::*;
 use rayon::prelude::*;
@@ -70,7 +75,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 const REFDB_MAGIC: &[u8; 4] = b"SYLR";
-const REFDB_VERSION: u8 = 2;
+const REFDB_VERSION: u8 = 3;
 const SKETCH_MAGIC: &[u8; 4] = b"SYLD"; // reference-Delta sample
 const SKETCH_VERSION: u8 = 1;
 
@@ -89,6 +94,7 @@ const HEADER_LEN: u64 = 13;
 /// k-mers are genome-specific, so even 1 is a meaningful signal; over-loading a
 /// genome only costs time, under-loading only costs compression ratio.
 const SPARSE_MIN_HITS: u32 = 1;
+const POOL_MPHF_GAMMA: f64 = 2.0;
 
 /// Metadata for one reference genome, in the dereplicated build order.
 #[derive(Clone, Debug, PartialEq)]
@@ -109,7 +115,7 @@ pub struct RefDb {
     pub genomes: Vec<RefGenome>,
     /// `distinctive[g]` = sorted, deduplicated hashes owned uniquely by genome `g`.
     pub distinctive: Vec<Vec<u64>>,
-    /// Hashes shared by ≥2 genomes (after rep preference), sorted and deduplicated.
+    /// Shared-pool hashes (after rep preference), sorted and deduplicated.
     pub pool: Vec<u64>,
 }
 
@@ -147,6 +153,65 @@ fn fingerprint(db: &RefDb) -> u64 {
     h
 }
 
+fn owner_for_accum(a: &OwnAccum, pool_min_genomes: u32) -> u32 {
+    if a.rep_count > 0 {
+        if a.rep_count >= pool_min_genomes {
+            POOL
+        } else {
+            a.rep_id
+        }
+    } else if a.strain_count >= pool_min_genomes {
+        POOL
+    } else {
+        a.strain_id
+    }
+}
+
+fn build_pool_mphf(pool: &[u64]) -> io::Result<(Mphf<u64>, Vec<u64>)> {
+    let mphf = Mphf::new_parallel(POOL_MPHF_GAMMA, pool, Some(0));
+    let mut ordered = vec![0u64; pool.len()];
+    let mut filled = vec![false; pool.len()];
+    for &h in pool {
+        let slot = mphf.hash(&h) as usize;
+        if slot >= pool.len() || filled[slot] {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "MPHF construction produced an invalid pool slot",
+            ));
+        }
+        ordered[slot] = h;
+        filled[slot] = true;
+    }
+    Ok((mphf, ordered))
+}
+
+fn write_pool_block<W: Write>(w: &mut W, pool: &[u64]) -> io::Result<()> {
+    let (mphf, ordered) = build_pool_mphf(pool)?;
+    let mphf_bytes = bincode::serialize(&mphf)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    write_uvarint(w, mphf_bytes.len() as u64)?;
+    w.write_all(&mphf_bytes)?;
+    for &h in &ordered {
+        w.write_all(&h.to_le_bytes())?;
+    }
+    Ok(())
+}
+
+fn read_pool_block<R: Read>(r: &mut R, pool_len: usize) -> io::Result<(Mphf<u64>, Vec<u64>)> {
+    let mphf_len = read_uvarint(r)? as usize;
+    let mut mphf_bytes = vec![0u8; mphf_len];
+    r.read_exact(&mut mphf_bytes)?;
+    let mphf: Mphf<u64> = bincode::deserialize(&mphf_bytes)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    let mut pool = Vec::with_capacity(pool_len);
+    for _ in 0..pool_len {
+        let mut buf = [0u8; 8];
+        r.read_exact(&mut buf)?;
+        pool.push(u64::from_le_bytes(buf));
+    }
+    Ok((mphf, pool))
+}
+
 // --- building the reference DB ---------------------------------------------
 
 struct OwnAccum {
@@ -165,6 +230,15 @@ pub fn build_refdb(
     sketches: &[GenomeSketch],
     taxonomy: &FxHashMap<String, (String, bool)>,
 ) -> RefDb {
+    build_refdb_with_pool_min_genomes(sketches, taxonomy, 3)
+}
+
+pub fn build_refdb_with_pool_min_genomes(
+    sketches: &[GenomeSketch],
+    taxonomy: &FxHashMap<String, (String, bool)>,
+    pool_min_genomes: u32,
+) -> RefDb {
+    let pool_min_genomes = pool_min_genomes.max(2);
     let c = sketches.first().map(|s| s.c).unwrap_or(0);
     let k = sketches.first().map(|s| s.k).unwrap_or(0);
 
@@ -238,15 +312,7 @@ pub fn build_refdb(
     let mut distinctive: Vec<Vec<u64>> = vec![Vec::new(); genomes.len()];
     let mut pool: Vec<u64> = Vec::new();
     for (&h, a) in acc.iter() {
-        let owner = if a.rep_count == 1 {
-            a.rep_id
-        } else if a.rep_count >= 2 {
-            POOL
-        } else if a.strain_count == 1 {
-            a.strain_id
-        } else {
-            POOL
-        };
+        let owner = owner_for_accum(a, pool_min_genomes);
         if owner == POOL {
             pool.push(h);
         } else {
@@ -292,7 +358,7 @@ pub fn write_refdb<W: Write>(mut w: W, db: &RefDb, sparse_div: u64) -> io::Resul
     let ng = db.genomes.len();
     let sp_ids = species_ids(&db.genomes);
 
-    // Body: [sparse section][pool block][dense block 0][dense block 1]...
+    // Body: [sparse section][MPHF pool block][dense block 0][dense block 1]...
     let mut body: Vec<u8> = Vec::new();
 
     let sparse_off = body.len() as u64; // 0
@@ -309,7 +375,7 @@ pub fn write_refdb<W: Write>(mut w: W, db: &RefDb, sparse_div: u64) -> io::Resul
     }
 
     let pool_off = body.len() as u64;
-    write_hashes(&mut body, &db.pool)?;
+    write_pool_block(&mut body, &db.pool)?;
 
     // Dense blocks store only the *complement* of the stage-1 sparse subset, so a
     // k-mer kept in stage 1 is not also stored here; load merges the two back.
@@ -388,13 +454,30 @@ pub struct RefIndex {
     sparse_by_genome: Vec<Vec<u64>>,
     /// shared pool, loaded once.
     pool: Vec<u64>,
-    pool_map: FxHashMap<u64, u32>,
+    pool_mphf: Mphf<u64>,
     reader: Mutex<Box<dyn ReadSeek>>,
     cache: Mutex<FxHashMap<u32, Arc<Vec<u64>>>>,
+    compression_only: bool,
+}
+
+enum RefOpenMode {
+    Full,
+    CompressionOnly,
 }
 
 /// Open a `.sylref`, loading stage 1 (sparse index) and the shared pool.
-pub fn open_ref_index<R: Read + Seek + Send + 'static>(mut r: R) -> io::Result<RefIndex> {
+pub fn open_ref_index<R: Read + Seek + Send + 'static>(r: R) -> io::Result<RefIndex> {
+    open_ref_index_with_mode(r, RefOpenMode::Full)
+}
+
+pub fn open_ref_index_for_compress<R: Read + Seek + Send + 'static>(r: R) -> io::Result<RefIndex> {
+    open_ref_index_with_mode(r, RefOpenMode::CompressionOnly)
+}
+
+fn open_ref_index_with_mode<R: Read + Seek + Send + 'static>(
+    mut r: R,
+    mode: RefOpenMode,
+) -> io::Result<RefIndex> {
     let mut hdr = [0u8; HEADER_LEN as usize];
     r.read_exact(&mut hdr)?;
     if &hdr[0..4] != REFDB_MAGIC {
@@ -424,7 +507,7 @@ pub fn open_ref_index<R: Read + Seek + Send + 'static>(mut r: R) -> io::Result<R
         sparse_count.push(read_uvarint(&mut f)? as usize);
     }
     let pool_offset = read_uvarint(&mut f)?;
-    let _pool_domain = read_uvarint(&mut f)? as usize;
+    let pool_domain = read_uvarint(&mut f)? as usize;
     let mut genomes = Vec::with_capacity(ng);
     for _ in 0..ng {
         let file_name = read_string(&mut f)?;
@@ -464,14 +547,10 @@ pub fn open_ref_index<R: Read + Seek + Send + 'static>(mut r: R) -> io::Result<R
         sparse_by_genome.push(v);
     }
 
-    // shared pool (loaded once)
+    // shared pool (loaded once). Hashes are stored in MPHF slot order, so
+    // compression can compute a candidate slot and verify it without a HashMap.
     r.seek(SeekFrom::Start(pool_offset))?;
-    let pool = read_hashes(&mut r)?;
-    let mut pool_map: FxHashMap<u64, u32> =
-        FxHashMap::with_capacity_and_hasher(pool.len(), Default::default());
-    for (i, &h) in pool.iter().enumerate() {
-        pool_map.insert(h, i as u32);
-    }
+    let (pool_mphf, pool) = read_pool_block(&mut r, pool_domain)?;
 
     Ok(RefIndex {
         c,
@@ -482,9 +561,10 @@ pub fn open_ref_index<R: Read + Seek + Send + 'static>(mut r: R) -> io::Result<R
         sparse_map,
         sparse_by_genome,
         pool,
-        pool_map,
+        pool_mphf,
         reader: Mutex::new(Box::new(r)),
         cache: Mutex::new(FxHashMap::default()),
+        compression_only: matches!(mode, RefOpenMode::CompressionOnly),
     })
 }
 
@@ -539,6 +619,27 @@ impl RefIndex {
         let arc = Arc::new(arr);
         self.cache.lock().unwrap().insert(g, arc.clone());
         Ok(arc)
+    }
+
+    #[inline]
+    fn pool_index(&self, h: u64) -> Option<u32> {
+        let slot = self.pool_mphf.try_hash(&h)? as usize;
+        if slot < self.pool.len() && self.pool[slot] == h {
+            Some(slot as u32)
+        } else {
+            None
+        }
+    }
+
+    fn ensure_can_decompress(&self) -> io::Result<()> {
+        if self.compression_only {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "reference DB was opened in compression-only mode",
+            ))
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -656,7 +757,7 @@ pub fn compress_seq<W: Write>(
     let mut pool_hits: Vec<u64> = Vec::new();
     let mut novel: Vec<u64> = Vec::new();
     for &h in sketch.kmer_counts.keys() {
-        if let Some(&pidx) = idx.pool_map.get(&h) {
+        if let Some(pidx) = idx.pool_index(h) {
             pool_hits.push(pidx as u64);
         } else if let Some(&(g, i)) = map.get(&h) {
             per_genome.entry(g).or_default().push(i as u64);
@@ -722,6 +823,7 @@ pub fn compress_seq<W: Write>(
 /// Decompress a reference-delta read sketch. Only the genomes referenced by the
 /// sample (plus the resident pool) are loaded from the index.
 pub fn decompress_seq<R: Read>(inner: R, idx: &RefIndex) -> io::Result<SequencesSketch> {
+    idx.ensure_can_decompress()?;
     let raw = zstd::stream::decode_all(inner)?;
     let mut r = &raw[..];
     let mut magic = [0u8; 4];
@@ -927,7 +1029,7 @@ struct ShardOut {
 /// Build ownership for one shard (one hash class): read its genome blocks, tally
 /// rep/strain occurrences per hash, and assign each hash to a single owner genome
 /// or the shared pool, exactly as `build_refdb` does globally.
-fn process_shard(path: &Path, remap: &[u32]) -> io::Result<ShardOut> {
+fn process_shard(path: &Path, remap: &[u32], pool_min_genomes: u32) -> io::Result<ShardOut> {
     let mut r = BufReader::with_capacity(1 << 20, File::open(path)?);
     let mut acc: FxHashMap<u64, OwnAccum> = FxHashMap::default();
     while let Some(fid) = read_uvarint_opt(&mut r)? {
@@ -960,15 +1062,7 @@ fn process_shard(path: &Path, remap: &[u32]) -> io::Result<ShardOut> {
     let mut by_gid: FxHashMap<u32, Vec<u64>> = FxHashMap::default();
     let mut pool: Vec<u64> = Vec::new();
     for (h, a) in acc {
-        let owner = if a.rep_count == 1 {
-            a.rep_id
-        } else if a.rep_count >= 2 {
-            POOL
-        } else if a.strain_count == 1 {
-            a.strain_id
-        } else {
-            POOL
-        };
+        let owner = owner_for_accum(&a, pool_min_genomes);
         if owner == POOL {
             pool.push(h);
         } else {
@@ -997,6 +1091,7 @@ pub fn run_ref_build(args: RefBuildArgs) {
         None => FxHashMap::default(),
     };
     let sparse_div = args.sparse_div.max(1);
+    let pool_min_genomes = args.pool_min_genomes.max(2);
 
     let resolve = |file_name: &str| -> (String, bool) {
         if let Some(v) = taxonomy.get(file_name) {
@@ -1034,9 +1129,10 @@ pub fn run_ref_build(args: RefBuildArgs) {
         _ => 256usize.min(512).max(threads).max(1),
     };
     info!(
-        "Building reference with {} hash partitions ({} threads){}",
+        "Building reference with {} hash partitions ({} threads), shared-pool threshold >= {} genome(s){}",
         p,
         threads,
+        pool_min_genomes,
         match args.max_ram {
             Some(gb) => format!(", ~{} GB RAM target", gb),
             None => String::new(),
@@ -1146,7 +1242,7 @@ pub fn run_ref_build(args: RefBuildArgs) {
     let shard_outs: Vec<ShardOut> = (0..p)
         .into_par_iter()
         .map(|pi| {
-            process_shard(&shard_path(pi), &remap)
+            process_shard(&shard_path(pi), &remap, pool_min_genomes)
                 .unwrap_or_else(|e| panic!("Failed to process scratch shard {}: {}", pi, e))
         })
         .collect();
@@ -1197,11 +1293,24 @@ pub fn run_ref_build(args: RefBuildArgs) {
 
 /// Open a `.sylref` for querying/compression.
 fn open_refdb_file(path: &str) -> RefIndex {
+    open_refdb_file_with_mode(path, false)
+}
+
+fn open_refdb_file_for_compress(path: &str) -> RefIndex {
+    open_refdb_file_with_mode(path, true)
+}
+
+fn open_refdb_file_with_mode(path: &str, compression_only: bool) -> RefIndex {
     let r = BufReader::with_capacity(
         10_000_000,
         File::open(path).unwrap_or_else(|_| panic!("Could not open {}", path)),
     );
-    open_ref_index(r).unwrap_or_else(|e| panic!("{} is not a valid reference DB: {}", path, e))
+    if compression_only {
+        open_ref_index_for_compress(r)
+            .unwrap_or_else(|e| panic!("{} is not a valid reference DB: {}", path, e))
+    } else {
+        open_ref_index(r).unwrap_or_else(|e| panic!("{} is not a valid reference DB: {}", path, e))
+    }
 }
 
 pub fn run_ref_compress(args: RefCompressArgs) {
@@ -1217,8 +1326,16 @@ pub fn run_ref_compress(args: RefCompressArgs) {
     std::fs::create_dir_all(&args.output_dir)
         .expect("Could not create output directory; exiting");
 
-    info!("Loading reference database {} (stage-1 sparse index + pool)", args.ref_db);
-    let idx = open_refdb_file(&args.ref_db);
+    let idx = if args.decompress {
+        info!("Loading reference database {} (full mode)", args.ref_db);
+        open_refdb_file(&args.ref_db)
+    } else {
+        info!(
+            "Loading reference database {} (compression-only mode: stage-1 sparse index + MPHF pool)",
+            args.ref_db
+        );
+        open_refdb_file_for_compress(&args.ref_db)
+    };
 
     let outdir = Path::new(&args.output_dir);
     let counter = Mutex::new(0usize);
