@@ -22,6 +22,75 @@ pub enum Mode {
     ///Inspect sketched .syldb and .sylsp files.
     #[clap(arg_required_else_help = true, display_order = 4)]
     Inspect(InspectArgs),
+    ///Build a k-mer dereplicated reference database (.sylref) for reference-delta sample compression.
+    #[clap(arg_required_else_help = true, display_order = 5)]
+    RefBuild(RefBuildArgs),
+    ///Compress sample sketches against a reference DB (.sylsp -> .sylspr), or --decompress to reverse.
+    #[clap(arg_required_else_help = true, display_order = 6)]
+    RefCompress(RefCompressArgs),
+    ///Convert a standard database (.syldb) into a two-stage seekable database (.syl2db) for `profile --two-stage`.
+    #[clap(arg_required_else_help = true, display_order = 7)]
+    DbConvert(DbConvertArgs),
+}
+
+#[derive(Args)]
+pub struct DbConvertArgs {
+    #[clap(multiple=true, help = "Standard genome database sketches (*.syldb) to convert")]
+    pub files: Vec<String>,
+    #[clap(short='o', long="output", help = "Output two-stage database name (.syl2db appended)")]
+    pub output: String,
+    #[clap(long="screen-c", default_value_t = SCREEN_C_DEFAULT, help = "Subsampling rate -c of the small in-memory stage-1 SCREEN index (the bincoded sparse hashes). Must be >= the database -c. A coarser (larger) value gives a smaller/faster screen index. The dense per-genome blocks always keep every k-mer at the database -c.")]
+    pub screen_c: usize,
+    #[clap(short, default_value_t = 3, help = "Number of threads")]
+    pub threads: usize,
+    #[clap(long="trace", help = "Trace output")]
+    pub trace: bool,
+    #[clap(long="debug", help = "Debug output")]
+    pub debug: bool,
+}
+
+#[derive(Args)]
+pub struct RefBuildArgs {
+    #[clap(multiple=true, help = "Genome database sketches (*.syldb) to build the reference from")]
+    pub files: Vec<String>,
+    #[clap(short='T', long="taxonomy", help_heading = "INPUT", help = "TSV with one line per genome: <genome_file_name><TAB><species><TAB><rep|strain>. The genome name matches the sketched path or its basename. Genomes absent from the file are treated as their own single-genome species representative. Strains of a species are placed contiguously, representatives first.")]
+    pub taxonomy: Option<String>,
+    #[clap(short='o', long="output", help = "Output reference database name (.sylref appended)")]
+    pub output: String,
+    #[clap(long="sparse-subsample", default_value_t = 16, help = "Stage-1 sparse index subsampling divisor: 1/N of each genome's distinctive k-mers are kept uncompressed for fast hit detection. Larger N gives a smaller/faster stage-1 index but coarser detection (1 keeps all).")]
+    pub sparse_div: u64,
+    #[clap(long="pool-min-genomes", default_value_t = 3, help = "Minimum number of same-tier genomes required before a k-mer is placed in the shared pool. With 3, k-mers shared by exactly two reps/strains are assigned to the first such genome instead of the pool.")]
+    pub pool_min_genomes: u32,
+    #[clap(long="max-ram", help = "Approximate peak RAM target (GB) for building. Sizes the number of on-disk partitions the build streams through; a soft target, not a hard limit.")]
+    pub max_ram: Option<usize>,
+    #[clap(long="tmp-dir", help = "Directory for build scratch files (needs roughly the input database size of free space). Default: alongside the output.")]
+    pub tmp_dir: Option<String>,
+    #[clap(short, default_value_t = 3, help = "Number of threads")]
+    pub threads: usize,
+    #[clap(long="trace", help = "Trace output")]
+    pub trace: bool,
+}
+
+#[derive(Args)]
+pub struct RefCompressArgs {
+    #[clap(multiple=true, help = "Sample sketches (*.sylsp) to compress, or (*.sylspr) with --decompress")]
+    pub files: Vec<String>,
+    #[clap(short='r', long="reference", help = "Reference database (*.sylref) produced by `sylph ref-build`")]
+    pub ref_db: Option<String>,
+    #[clap(long="decompress", help = "Reverse the operation: reconstruct *.sylsp from *.sylspr")]
+    pub decompress: bool,
+    #[clap(long="inspect", help = "Inspect reference-delta sketches (*.sylspr) and report metadata plus encoded section sizes")]
+    pub inspect: bool,
+    #[clap(long="verify", help = "Verify existing *.sylspr inputs by decompressing them and requiring exact equality to the original sketch path stored in each file")]
+    pub verify: bool,
+    #[clap(short='d', long="output-directory", default_value = "./", help = "Output directory")]
+    pub output_dir: String,
+    #[clap(short, default_value_t = 3, help = "Number of threads")]
+    pub threads: usize,
+    #[clap(long="trace", help = "Trace output")]
+    pub trace: bool,
+    #[clap(long="debug", help = "Debug output")]
+    pub debug: bool,
 }
 
 
@@ -86,7 +155,7 @@ pub struct SketchArgs {
     pub second_pair: Vec<String>,
 }
 
-#[derive(Args)]
+#[derive(Args, Clone)]
 pub struct ContainArgs {
     #[clap(multiple=true, help = "Pre-sketched *.syldb/*.sylsp files. Raw single-end fastq/fasta are allowed and will be automatically sketched to .sylsp/.syldb")]
     pub files: Vec<String>,
@@ -145,8 +214,25 @@ pub struct ContainArgs {
 
     #[clap(short='o',long="output-file", help = "Output to this file (TSV format). [default: stdout]", help_heading="INPUT/OUTPUT")]
     pub out_file_name: Option<String>,
+    #[clap(long="reference", help_heading="INPUT/OUTPUT", help = "Reference database (*.sylref from `sylph ref-build`) used to decode reference-delta compressed samples (*.sylspr). Required when any input is a *.sylspr file.")]
+    pub reference: Option<String>,
     #[clap(long="log-reassignments", help = "Output information for how k-mers for genomes are reassigned during `profile`. Caution: can be verbose and slows down computation.")]
     pub log_reassignments: bool,
+
+    #[clap(long="two-stage", help_heading = "TWO-STAGE PROFILING", help = "Two-stage profiling (profile only): cheaply SCREEN the sample against the (sparse) database, then densely profile ONLY the genomes that pass the screen. Lets a sparse pre-built database (e.g. -c 200 GTDB) deliver dense -c profiling without ever building/loading a dense full database.")]
+    pub two_stage: bool,
+    #[clap(long="dense-c", default_value_t = DENSE_C_DEFAULT, help_heading = "TWO-STAGE PROFILING", help = "Subsampling rate -c for the dense second stage. Genomes passing the screen are (re)sketched at this rate from their source fasta if the database is sparser than this. The sample sketch must have -c <= this value.")]
+    pub dense_c: usize,
+    #[clap(long="screen-c", help_heading = "TWO-STAGE PROFILING", help = "Subsampling rate -c for the cheap first-stage screen. Default: the database's own -c. Must be >= the database -c (a sketch can only be made sparser, never denser).")]
+    pub screen_c: Option<usize>,
+    #[clap(long="screen-ani", default_value_t = SCREEN_MIN_ANI_DEFAULT, help_heading = "TWO-STAGE PROFILING", help = "Minimum adjusted ANI (0-100) for a genome to pass the first-stage screen. Deliberately permissive; the dense stage recovers specificity.")]
+    pub screen_ani: f64,
+    #[clap(long="screen-min-matches", default_value_t = 1, help_heading = "TWO-STAGE PROFILING", help = "Minimum number of matched stage-1 screen k-mers for a genome to pass the screen and be densely decoded. Default 1 keeps the same results as single-stage; raising it (e.g. with a permissive --screen-ani) cheaply prunes genomes that pass on a handful of chance-shared k-mers, cutting wasted dense decodes at a small sensitivity cost for very-low-coverage genomes.")]
+    pub screen_min_matches: usize,
+    #[clap(long="dense-cache", help_heading = "TWO-STAGE PROFILING", help = "Directory of cached per-genome dense sketches (*.sylgn). Genomes (re)sketched for the dense stage are stored here and reused across samples/runs, so a dense database is grown lazily only for genomes that actually appear.")]
+    pub dense_cache: Option<String>,
+    #[clap(long="screen-dump", hidden=true, help_heading = "TWO-STAGE PROFILING", help = "Debug: write a TSV of every stage-1 screen survivor (genome, matched/total screen k-mers, naive/adjusted ANI, median coverage) to this file.")]
+    pub screen_dump: Option<String>,
 
 
     //Hidden options that are embedded in the args but no longer used... 

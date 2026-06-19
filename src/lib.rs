@@ -1,10 +1,12 @@
 pub mod sketch;
 pub mod compress;
+pub mod refdelta;
 pub mod constants;
 pub mod types;
 pub mod seeding;
 pub mod cmdline;
 pub mod contain;
+pub mod twostage_db;
 pub mod inference;
 pub mod inspect;
 

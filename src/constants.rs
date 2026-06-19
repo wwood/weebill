@@ -7,6 +7,8 @@ pub const QUERY_FILE_SUFFIX: &str = ".syldb";
 pub const SAMPLE_FILE_SUFFIX: &str = ".sylsp";
 pub const QUERY_COMP_FILE_SUFFIX: &str = ".syldbc";
 pub const SAMPLE_COMP_FILE_SUFFIX: &str = ".sylspc";
+pub const REF_DB_SUFFIX: &str = ".sylref";
+pub const REF_SAMPLE_SUFFIX: &str = ".sylspr";
 pub const QUERY_FILE_SUFFIX_VALID : [&str;3] = [QUERY_FILE_SUFFIX, ".sylqueries", QUERY_COMP_FILE_SUFFIX];
 pub const SAMPLE_FILE_SUFFIX_VALID : [&str;3] = [SAMPLE_FILE_SUFFIX, ".sylsample", SAMPLE_COMP_FILE_SUFFIX];
 pub const MIN_ANI_DEF: f64 = 0.9;
@@ -17,3 +19,10 @@ pub const MAX_DEDUP_COUNT: u32 = 4;
 pub const MAX_DEDUP_LEN: usize = 10000000;
 pub const DEFAULT_FPR: f64 = 0.0001;
 pub const MED_KMER_FOR_ID_EST: f64 = 3.;
+pub const DENSE_C_DEFAULT: usize = 50;
+pub const SCREEN_C_DEFAULT: usize = 3000;
+pub const SCREEN_MIN_ANI_DEFAULT: f64 = 85.;
+pub const GENOME_SKETCH_SUFFIX: &str = ".sylgn";
+/// Two-stage seekable database: a small bincoded sparse (screen) index plus
+/// per-genome Golomb-Rice compressed dense blocks loaded on demand.
+pub const TWO_STAGE_DB_SUFFIX: &str = ".syl2db";

@@ -190,7 +190,7 @@ impl<'a, R: Read> BitReader<'a, R> {
 
 // --- primitive encoders -----------------------------------------------------
 
-fn write_uvarint<W: Write>(w: &mut W, mut x: u64) -> io::Result<()> {
+pub(crate) fn write_uvarint<W: Write>(w: &mut W, mut x: u64) -> io::Result<()> {
     loop {
         let mut byte = (x & 0x7f) as u8;
         x >>= 7;
@@ -204,7 +204,7 @@ fn write_uvarint<W: Write>(w: &mut W, mut x: u64) -> io::Result<()> {
     }
 }
 
-fn read_uvarint<R: Read>(r: &mut R) -> io::Result<u64> {
+pub(crate) fn read_uvarint<R: Read>(r: &mut R) -> io::Result<u64> {
     let mut result: u64 = 0;
     let mut shift: u32 = 0;
     loop {
@@ -224,12 +224,12 @@ fn read_uvarint<R: Read>(r: &mut R) -> io::Result<u64> {
     }
 }
 
-fn write_string<W: Write>(w: &mut W, s: &str) -> io::Result<()> {
+pub(crate) fn write_string<W: Write>(w: &mut W, s: &str) -> io::Result<()> {
     write_uvarint(w, s.len() as u64)?;
     w.write_all(s.as_bytes())
 }
 
-fn read_string<R: Read>(r: &mut R) -> io::Result<String> {
+pub(crate) fn read_string<R: Read>(r: &mut R) -> io::Result<String> {
     let len = read_uvarint(r)? as usize;
     let mut buf = vec![0u8; len];
     r.read_exact(&mut buf)?;
@@ -276,7 +276,7 @@ fn rice_cost(sorted: &[u64], k: u32) -> u128 {
 /// Sort + delta + Golomb–Rice encode a list of hash values. Order is not
 /// preserved (hash sets are order-independent for sylph's purposes); duplicates,
 /// if any, are preserved as zero gaps. The block is byte-aligned on completion.
-fn write_hashes<W: Write>(w: &mut W, hashes: &[u64]) -> io::Result<()> {
+pub(crate) fn write_hashes<W: Write>(w: &mut W, hashes: &[u64]) -> io::Result<()> {
     write_uvarint(w, hashes.len() as u64)?;
     if hashes.is_empty() {
         return Ok(());
@@ -312,7 +312,7 @@ fn write_hashes<W: Write>(w: &mut W, hashes: &[u64]) -> io::Result<()> {
     bw.finish()
 }
 
-fn read_hashes<R: Read>(r: &mut R) -> io::Result<Vec<u64>> {
+pub(crate) fn read_hashes<R: Read>(r: &mut R) -> io::Result<Vec<u64>> {
     let n = read_uvarint(r)? as usize;
     if n == 0 {
         return Ok(Vec::new());
@@ -438,6 +438,22 @@ pub fn read_genome_sketches_compressed<R: Read>(mut inner: R) -> io::Result<Vec<
         out.push(read_genome_sketch(&mut r)?);
     }
     Ok(out)
+}
+
+/// Stream a compressed genome database one sketch at a time, invoking `f` for
+/// each. Lets callers process huge databases without holding every sketch in RAM.
+pub fn stream_genome_sketches_compressed<R: Read, F: FnMut(GenomeSketch) -> io::Result<()>>(
+    mut inner: R,
+    mut f: F,
+) -> io::Result<usize> {
+    read_and_check_header(&mut inner, TYPE_GENOME_DB)?;
+    let mut r = BufReader::with_capacity(1 << 22, zstd::stream::read::Decoder::new(inner)?);
+    let n = read_uvarint(&mut r)? as usize;
+    for _ in 0..n {
+        let s = read_genome_sketch(&mut r)?;
+        f(s)?;
+    }
+    Ok(n)
 }
 
 /// Write a sample (read) sketch in the compressed format.

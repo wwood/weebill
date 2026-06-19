@@ -2,7 +2,9 @@ use clap::Parser;
 use sylph::cmdline::*;
 use sylph::sketch;
 use sylph::contain;
+use sylph::twostage_db;
 use sylph::inspect;
+use sylph::refdelta;
 //use std::panic::set_hook;
 
 //Use this allocator when statically compiling
@@ -27,5 +29,8 @@ fn main() {
         Mode::Query(contain_args) => contain::contain(contain_args, false),
         Mode::Profile(contain_args) => contain::contain(contain_args, true),
         Mode::Inspect(inspect_args) => inspect::inspect(inspect_args),
+        Mode::RefBuild(args) => refdelta::run_ref_build(args),
+        Mode::RefCompress(args) => refdelta::run_ref_compress(args),
+        Mode::DbConvert(args) => twostage_db::run_db_convert(args),
     }
 }
