@@ -633,6 +633,24 @@ fn test_refdelta_query_with_reference(){
     assert!(Path::new(&format!("{}/o157_reads.fastq.gz.sylspr", dir)).exists(),
         "ref-compress did not produce a .sylspr");
 
+    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    let inspect = cmd.arg("ref-compress")
+        .arg("--inspect")
+        .arg(format!("{}/o157_reads.fastq.gz.sylspr", dir))
+        .output().expect("Output failed");
+    assert!(inspect.status.success());
+    let inspect_stdout = str::from_utf8(&inspect.stdout).expect("Output was not valid UTF-8");
+    assert!(inspect_stdout.contains("reference_db"));
+    assert!(inspect_stdout.contains("assigned_to_genomes"));
+    assert!(inspect_stdout.contains(&format!("{}/ref.sylref", dir)));
+
+    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    cmd.arg("ref-compress")
+        .arg("--verify")
+        .arg("-r").arg(format!("{}/ref.sylref", dir))
+        .arg(format!("{}/o157_reads.fastq.gz.sylspr", dir))
+        .assert().success().code(0);
+
     // querying the .sylspr via --reference must match querying the original .sylsp
     let mut cmd = Command::cargo_bin("sylph").unwrap();
     let orig = cmd.arg("query")

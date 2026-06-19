@@ -76,9 +76,13 @@ pub struct RefCompressArgs {
     #[clap(multiple=true, help = "Sample sketches (*.sylsp) to compress, or (*.sylspr) with --decompress")]
     pub files: Vec<String>,
     #[clap(short='r', long="reference", help = "Reference database (*.sylref) produced by `sylph ref-build`")]
-    pub ref_db: String,
+    pub ref_db: Option<String>,
     #[clap(long="decompress", help = "Reverse the operation: reconstruct *.sylsp from *.sylspr")]
     pub decompress: bool,
+    #[clap(long="inspect", help = "Inspect reference-delta sketches (*.sylspr) and report metadata plus encoded section sizes")]
+    pub inspect: bool,
+    #[clap(long="verify", help = "Verify existing *.sylspr inputs by decompressing them and requiring exact equality to the original sketch path stored in each file")]
+    pub verify: bool,
     #[clap(short='d', long="output-directory", default_value = "./", help = "Output directory")]
     pub output_dir: String,
     #[clap(short, default_value_t = 3, help = "Number of threads")]

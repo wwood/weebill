@@ -78,7 +78,7 @@ fn open_index(db: &refdelta::RefDb, sparse_div: u64) -> refdelta::RefIndex {
 
 fn refdelta_roundtrip(sketch: &SequencesSketch, idx: &refdelta::RefIndex) {
     let mut buf = Vec::new();
-    refdelta::compress_seq(&mut buf, sketch, idx).unwrap();
+    refdelta::compress_seq(&mut buf, sketch, idx, "unit-test.sylref").unwrap();
     let decoded = refdelta::decompress_seq(&buf[..], idx).unwrap();
     assert_eq!(*sketch, decoded);
 }
