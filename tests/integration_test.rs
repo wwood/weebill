@@ -6,17 +6,16 @@ use std::process::Command;
 use std::str; // Run programs
 
 fn fresh() {
-    Command::new("rm")
-        .arg("-r")
-        .args(["./tests/results/test_sketch_dir"])
-        .status()
-        .ok();
+    let dir = "./tests/results/test_sketch_dir";
+    if Path::new(dir).exists() {
+        let _ = fs::remove_dir_all(dir);
+    }
 }
 
 #[serial]
 #[test]
 fn test_sketch_commands() {
-    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
     let assert = cmd
         .arg("sketch")
         .arg("test_files/e.coli-EC590.fasta.gz")
@@ -29,7 +28,7 @@ fn test_sketch_commands() {
         .assert();
     assert.success().code(0);
 
-    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
     let assert = cmd
         .arg("profile")
         .arg("./tests/results/test_sketch_dir/o157_reads.fastq.gz.sylsp")
@@ -37,7 +36,7 @@ fn test_sketch_commands() {
         .assert();
     assert.success().code(0);
 
-    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
     let assert = cmd
         .arg("profile")
         .arg("-l")
@@ -45,7 +44,7 @@ fn test_sketch_commands() {
         .assert();
     assert.success().code(0);
 
-    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
     let assert = cmd
         .arg("profile")
         .arg("./tests/results/test_sketch_dir/o157_reads.fastq.gz.sylsp")
@@ -53,7 +52,7 @@ fn test_sketch_commands() {
         .assert();
     assert.success().code(0);
 
-    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
     let assert = cmd
         .arg("profile")
         .arg("./test_files/o157_reads.fastq.gz")
@@ -64,7 +63,7 @@ fn test_sketch_commands() {
         .assert();
     assert.success().code(0);
 
-    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
     let assert = cmd
         .arg("sketch")
         .arg("-1")
@@ -81,7 +80,7 @@ fn test_sketch_commands() {
     );
     fresh();
 
-    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
     let assert = cmd
         .arg("sketch")
         .arg("--l1")
@@ -98,7 +97,7 @@ fn test_sketch_commands() {
     );
 
     fresh();
-    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
     let assert = cmd
         .arg("sketch")
         .arg("-g")
@@ -126,7 +125,7 @@ fn test_sketch_commands() {
 fn test_profile_vs_query() {
     fresh();
 
-    let mut output = Command::cargo_bin("sylph").unwrap();
+    let mut output = Command::cargo_bin("weebill").unwrap();
     let output = output
         .arg("profile")
         .arg("./test_files/o157_reads.fastq.gz")
@@ -137,7 +136,7 @@ fn test_profile_vs_query() {
     dbg!(stdout.matches('\n').count());
     assert!(stdout.matches('\n').count() == 2);
 
-    let mut output = Command::cargo_bin("sylph").unwrap();
+    let mut output = Command::cargo_bin("weebill").unwrap();
     let output = output
         .arg("query")
         .arg("./test_files/o157_reads.fastq.gz")
@@ -156,7 +155,7 @@ fn test_profile_vs_query() {
 #[test]
 fn test_sketch_list() {
     fresh();
-    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
     let assert = cmd
         .arg("sketch")
         .arg("-r")
@@ -182,7 +181,7 @@ fn test_sketch_list() {
     );
     fresh();
 
-    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
     let assert = cmd
         .arg("sketch")
         .arg("-g")
@@ -208,7 +207,7 @@ fn test_sketch_list() {
     );
     fresh();
 
-    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
     let assert = cmd
         .arg("sketch")
         .arg("--gl")
@@ -223,7 +222,7 @@ fn test_sketch_list() {
     );
     fresh();
 
-    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
     let assert = cmd
         .arg("sketch")
         .arg("--rl")
@@ -253,7 +252,7 @@ fn test_sketch_list() {
 fn test_profile_disabling() {
     fresh();
 
-    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
     let assert = cmd
         .arg("sketch")
         .arg("-g")
@@ -266,7 +265,7 @@ fn test_profile_disabling() {
         .assert();
     assert.success().code(0);
 
-    let mut output = Command::cargo_bin("sylph").unwrap();
+    let mut output = Command::cargo_bin("weebill").unwrap();
     let assert = output
         .arg("profile")
         .arg("./test_files/o157_reads.fastq.gz")
@@ -274,7 +273,7 @@ fn test_profile_disabling() {
         .assert();
     assert.failure().code(1);
 
-    let mut output = Command::cargo_bin("sylph").unwrap();
+    let mut output = Command::cargo_bin("weebill").unwrap();
     let assert = output
         .arg("query")
         .arg("./test_files/o157_reads.fastq.gz")
@@ -288,7 +287,7 @@ fn test_profile_disabling() {
 #[test]
 fn test_sketch_fasta_fastq_concord() {
     fresh();
-    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
     let assert = cmd
         .arg("sketch")
         .arg("./test_files/e.coli-EC590.fasta.gz")
@@ -300,7 +299,7 @@ fn test_sketch_fasta_fastq_concord() {
         .assert();
     assert.success().code(0);
 
-    let mut output = Command::cargo_bin("sylph").unwrap();
+    let mut output = Command::cargo_bin("weebill").unwrap();
     let out1 = output
         .arg("profile")
         .arg("./test_files/o157_reads.fastq.gz")
@@ -308,7 +307,7 @@ fn test_sketch_fasta_fastq_concord() {
         .output()
         .expect("Fail");
 
-    let mut output = Command::cargo_bin("sylph").unwrap();
+    let mut output = Command::cargo_bin("weebill").unwrap();
     let out2 = output
         .arg("profile")
         .arg("./test_files/o157_reads.fastq.gz")
@@ -316,7 +315,7 @@ fn test_sketch_fasta_fastq_concord() {
         .output()
         .expect("Fail");
 
-    let mut output = Command::cargo_bin("sylph").unwrap();
+    let mut output = Command::cargo_bin("weebill").unwrap();
     let out3 = output
         .arg("profile")
         .arg("./tests/results/test_sketch_dir/o157_reads.fastq.gz.sylsp")
@@ -338,7 +337,7 @@ fn test_sketch_fasta_fastq_concord() {
 #[test]
 fn test_sample_names() {
     fresh();
-    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
     let assert = cmd
         .arg("sketch")
         .arg("-1")
@@ -357,7 +356,7 @@ fn test_sample_names() {
     );
     fresh();
 
-    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
     let assert = cmd
         .arg("sketch")
         .arg("test_files/t1.fq")
@@ -377,7 +376,7 @@ fn test_sample_names() {
         "Output file was not created"
     );
 
-    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
     let output = cmd
         .arg("profile")
         .arg("./tests/results/test_sketch_dir/S2.sylsp")
@@ -389,7 +388,7 @@ fn test_sample_names() {
     assert!(stdout.contains("S2"));
     assert!(!stdout.contains("o157_reads"));
 
-    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
     let assert = cmd
         .arg("sketch")
         .arg("-1")
@@ -407,7 +406,7 @@ fn test_sample_names() {
         "Output file was not created, -S"
     );
 
-    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
     let assert = cmd
         .arg("sketch")
         .arg("-1")
@@ -433,21 +432,21 @@ fn test_sample_names() {
 #[serial]
 #[test]
 fn test_fpr() {
-    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
     let assert = cmd
         .arg("sketch")
         .arg("-1")
         .arg("test_files/t1.fq")
         .arg("-2")
         .arg("test_files/t2.fq")
-        .arg("-d ")
+        .arg("-d")
         .arg("./tests/results/test_sketch_dir")
         .arg("0")
         .assert();
     assert.success().code(0);
     fresh();
 
-    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
     let assert = cmd
         .arg("sketch")
         .arg("-1")
@@ -461,7 +460,7 @@ fn test_fpr() {
         .assert();
     assert.success().code(0);
     fresh();
-    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
     let assert = cmd
         .arg("sketch")
         .arg("-1")
@@ -479,7 +478,7 @@ fn test_fpr() {
 #[serial]
 #[test]
 fn test_raw_inputs_profile_simple() {
-    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
     let assert = cmd
         .arg("profile")
         .arg("./test_files/e.coli-o157.fasta.gz")
@@ -491,7 +490,7 @@ fn test_raw_inputs_profile_simple() {
     assert.success().code(0);
     fresh();
 
-    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
     let assert = cmd
         .arg("profile")
         .arg("./test_files/e.coli-o157.fasta.gz")
@@ -501,7 +500,7 @@ fn test_raw_inputs_profile_simple() {
     assert.failure().code(1);
     fresh();
 
-    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
     let assert = cmd
         .arg("profile")
         .arg("./test_files/e.coli-o157.fasta.gz")
@@ -519,7 +518,7 @@ fn test_raw_inputs_profile_simple() {
 #[serial]
 #[test]
 fn test_estimate_read_counts() {
-    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
     let output = cmd
         .arg("profile")
         .arg("--estimate-read-counts")
@@ -540,7 +539,7 @@ fn test_estimate_read_counts() {
 
     fresh();
 
-    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
     let output = cmd
         .arg("profile")
         .arg("./test_files/e.coli-o157.fasta.gz")
@@ -564,7 +563,7 @@ fn test_estimate_read_counts() {
 #[serial]
 #[test]
 fn test_raw_inputs_profile_with_sketch() {
-    let mut output = Command::cargo_bin("sylph").unwrap();
+    let mut output = Command::cargo_bin("weebill").unwrap();
     let output = output
         .arg("profile")
         .arg("./test_files/e.coli-EC590.fasta.gz")
@@ -576,7 +575,7 @@ fn test_raw_inputs_profile_with_sketch() {
         .expect("Output failed");
     let stdout_1 = str::from_utf8(&output.stdout).expect("Output was not valid UTF-8");
 
-    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
     let assert = cmd
         .arg("sketch")
         .arg("-1")
@@ -588,7 +587,7 @@ fn test_raw_inputs_profile_with_sketch() {
         .assert();
     assert.success().code(0);
 
-    let mut output = Command::cargo_bin("sylph").unwrap();
+    let mut output = Command::cargo_bin("weebill").unwrap();
     let output = output
         .arg("profile")
         .arg("./test_files/e.coli-EC590.fasta.gz")
@@ -603,7 +602,7 @@ fn test_raw_inputs_profile_with_sketch() {
 #[serial]
 #[test]
 fn test_inspect() {
-    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
     let assert = cmd
         .arg("sketch")
         .arg("test_files/e.coli-EC590.fasta.gz")
@@ -615,7 +614,7 @@ fn test_inspect() {
         .arg("./tests/results/test_sketch_dir")
         .assert();
     assert.success().code(0);
-    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
     let assert = cmd
         .arg("sketch")
         .arg("-1")
@@ -627,7 +626,7 @@ fn test_inspect() {
         .assert();
     assert.success().code(0);
 
-    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
     let output = cmd
         .arg("inspect")
         .arg("./tests/results/test_sketch_dir/k12_R1.fq.paired.sylsp")
@@ -637,7 +636,7 @@ fn test_inspect() {
     let stdout = str::from_utf8(&output.stdout).expect("Output was not valid UTF-8");
     assert!(stdout.contains("k12_R1.fq"));
 
-    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
     let output = cmd
         .arg("inspect")
         .arg("./tests/results/test_sketch_dir/db.syldb")
@@ -655,7 +654,7 @@ fn test_refdelta_query_with_reference() {
     let dir = "./tests/results/test_sketch_dir";
 
     // sketch a database and a sample
-    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
     cmd.arg("sketch")
         .arg("test_files/e.coli-K12.fasta.gz")
         .arg("test_files/e.coli-o157.fasta.gz")
@@ -667,7 +666,7 @@ fn test_refdelta_query_with_reference() {
         .assert()
         .success()
         .code(0);
-    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
     cmd.arg("sketch")
         .arg("test_files/o157_reads.fastq.gz")
         .arg("-d")
@@ -677,7 +676,7 @@ fn test_refdelta_query_with_reference() {
         .code(0);
 
     // build a reference and compress the sample sketch against it
-    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
     cmd.arg("ref-build")
         .arg(format!("{}/db.syldb", dir))
         .arg("-o")
@@ -685,7 +684,7 @@ fn test_refdelta_query_with_reference() {
         .assert()
         .success()
         .code(0);
-    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
     cmd.arg("ref-compress")
         .arg(format!("{}/o157_reads.fastq.gz.sylsp", dir))
         .arg("-r")
@@ -700,7 +699,7 @@ fn test_refdelta_query_with_reference() {
         "ref-compress did not produce a .sylspr"
     );
 
-    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
     let inspect = cmd
         .arg("ref-compress")
         .arg("--inspect")
@@ -713,7 +712,7 @@ fn test_refdelta_query_with_reference() {
     assert!(inspect_stdout.contains("assigned_to_genomes"));
     assert!(inspect_stdout.contains(&format!("{}/ref.sylref", dir)));
 
-    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
     cmd.arg("ref-compress")
         .arg("--verify")
         .arg("-r")
@@ -724,7 +723,7 @@ fn test_refdelta_query_with_reference() {
         .code(0);
 
     // querying the .sylspr via --reference must match querying the original .sylsp
-    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
     let orig = cmd
         .arg("query")
         .arg(format!("{}/db.syldb", dir))
@@ -733,7 +732,7 @@ fn test_refdelta_query_with_reference() {
         .expect("Output failed");
     let orig = str::from_utf8(&orig.stdout).expect("Output was not valid UTF-8");
 
-    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
     let from_ref = cmd
         .arg("query")
         .arg(format!("{}/db.syldb", dir))
@@ -751,7 +750,7 @@ fn test_refdelta_query_with_reference() {
     );
 
     // a .sylspr without --reference must fail
-    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
     cmd.arg("query")
         .arg(format!("{}/db.syldb", dir))
         .arg(format!("{}/o157_reads.fastq.gz.sylspr", dir))
@@ -767,7 +766,7 @@ fn test_two_stage_profile() {
     let _ = fs::remove_dir_all(dir);
 
     // Sparse (-c 200) database that retains the source fasta paths.
-    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
     cmd.arg("sketch")
         .arg("-c")
         .arg("200")
@@ -781,7 +780,7 @@ fn test_two_stage_profile() {
         .code(0);
 
     // Dense (-c 50) read sample.
-    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
     cmd.arg("sketch")
         .arg("-c")
         .arg("50")
@@ -798,7 +797,7 @@ fn test_two_stage_profile() {
 
     // Two-stage profile: screen at c=200, densely profile the survivors at c=50
     // by re-sketching their source fastas, caching the dense sketches.
-    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
     let output = cmd
         .arg("profile")
         .arg("--two-stage")
@@ -825,7 +824,7 @@ fn test_two_stage_profile() {
 
     // Genomes detected by two-stage must equal those of a plain single-stage
     // profile of the same dense reads against a dense (-c 50) database.
-    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
     cmd.arg("sketch")
         .arg("-c")
         .arg("50")
@@ -837,7 +836,7 @@ fn test_two_stage_profile() {
         .assert()
         .success()
         .code(0);
-    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
     let output = cmd
         .arg("profile")
         .arg(format!("{}/db_c50.syldb", dir))
@@ -873,7 +872,7 @@ fn test_two_stage_db_convert_and_profile() {
     fs::create_dir_all(dir).unwrap();
 
     // Dense (-c 50) database carrying profiling k-mers.
-    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
     cmd.arg("sketch")
         .arg("-c")
         .arg("50")
@@ -887,7 +886,7 @@ fn test_two_stage_db_convert_and_profile() {
         .code(0);
 
     // Dense (-c 50) read sample.
-    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
     cmd.arg("sketch")
         .arg("-c")
         .arg("50")
@@ -903,7 +902,7 @@ fn test_two_stage_db_convert_and_profile() {
 
     // Convert the dense db into a two-stage seekable database: dense blocks at
     // c=50, sparse stage-1 screen index at c=200.
-    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
     cmd.arg("db-convert")
         .arg(&dense_db)
         .arg("--screen-c")
@@ -931,7 +930,7 @@ fn test_two_stage_db_convert_and_profile() {
 
     // Profile --two-stage directly against the .syl2db: stage 1 screens via the
     // sparse index, stage 2 decodes only the screened genomes' dense blocks.
-    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
     let output = cmd
         .arg("profile")
         .arg("--two-stage")
@@ -946,7 +945,7 @@ fn test_two_stage_db_convert_and_profile() {
     assert!(from_db2.contains("e.coli-o157.fasta.gz"));
 
     // The detected genome set must equal a plain single-stage dense profile.
-    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
     let output = cmd
         .arg("profile")
         .arg(&dense_db)
@@ -973,7 +972,7 @@ fn test_two_stage_db_convert_and_profile() {
     );
 
     // `query` must refuse a .syl2db (it is profile-only).
-    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
     cmd.arg("query")
         .arg(&two_stage_db)
         .arg(&sample)
@@ -993,7 +992,7 @@ fn test_two_stage_individual_records() {
     // records, so multiple database entries share one file name -- the case that
     // must be preserved per record by db-convert (and rejected by the densify
     // fallback).
-    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
     cmd.arg("sketch")
         .arg("-c")
         .arg("50")
@@ -1007,7 +1006,7 @@ fn test_two_stage_individual_records() {
         .success()
         .code(0);
 
-    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
     cmd.arg("sketch")
         .arg("-c")
         .arg("50")
@@ -1022,7 +1021,7 @@ fn test_two_stage_individual_records() {
     let sample = format!("{}/o157_reads.fastq.gz.sylsp", dir);
 
     // Convert to a two-stage db (per-record blocks are written individually).
-    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
     cmd.arg("db-convert")
         .arg(&dense_db)
         .arg("--screen-c")
@@ -1051,7 +1050,7 @@ fn test_two_stage_individual_records() {
         v
     };
 
-    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
     let two = cmd
         .arg("profile")
         .arg("--two-stage")
@@ -1063,7 +1062,7 @@ fn test_two_stage_individual_records() {
     let two = str::from_utf8(&two.stdout).expect("not UTF-8").to_string();
     assert!(two.contains("e.coli-o157.fasta.gz"));
 
-    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
     let single = cmd
         .arg("profile")
         .arg(&dense_db)
@@ -1084,7 +1083,7 @@ fn test_two_stage_individual_records() {
 
     // The densify fallback (raw .syldb --two-stage, no db-convert) cannot handle
     // individual records and must error rather than silently corrupt them.
-    let mut cmd = Command::cargo_bin("sylph").unwrap();
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
     cmd.arg("profile")
         .arg("--two-stage")
         .arg("--dense-c")
