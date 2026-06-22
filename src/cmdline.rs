@@ -111,6 +111,11 @@ pub struct RefBuildArgs {
     pub threads: usize,
     #[clap(long = "trace", help = "Trace output")]
     pub trace: bool,
+    #[clap(
+        long = "all-kmers-index",
+        help = "Build a minimal perfect hash over ALL reference k-mers (not just the FracMinHash subset). Enables 1-error-tolerant k-mer matching during ref-compress so sequencing-error k-mers are recovered cheaply as reference offsets. Significantly increases .sylref file size and build memory; the resulting .sylspr files require a v5 reference DB to decompress."
+    )]
+    pub all_kmers_index: bool,
 }
 
 #[derive(Args)]

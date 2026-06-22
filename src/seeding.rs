@@ -202,3 +202,28 @@ pub fn fmh_seeds_positions(
         }
     }
 }
+
+/// Reverse complement of a 2-bit encoded k-mer.
+/// Bit position 0 (bits 0-1) is the last base in the sequence (rightmost); position k-1 is the first.
+#[inline]
+pub fn rc_kmer(mut kmer: u64, k: usize) -> u64 {
+    let mut rc = 0u64;
+    for _ in 0..k {
+        rc = (rc << 2) | (3 - (kmer & 3));
+        kmer >>= 2;
+    }
+    rc
+}
+
+/// Canonical (minimum of forward and reverse complement) form of a k-mer.
+#[inline]
+pub fn canonical_kmer(kmer: u64, k: usize) -> u64 {
+    kmer.min(rc_kmer(kmer, k))
+}
+
+/// Replace the base at bit-position `pos` (0 = last base in sequence) with `new_base` (0=A,1=C,2=G,3=T).
+#[inline]
+pub fn mutate_kmer(kmer: u64, pos: usize, new_base: u8) -> u64 {
+    let shift = 2 * pos;
+    (kmer & !(3u64 << shift)) | ((new_base as u64) << shift)
+}

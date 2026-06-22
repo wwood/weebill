@@ -64,6 +64,7 @@ use crate::compress::{
     write_string, write_uvarint,
 };
 use crate::constants::*;
+use crate::seeding::{canonical_kmer, mm_hash64, mutate_kmer, rev_hash_64};
 use crate::types::*;
 use boomphf::Mphf;
 use fxhash::FxHashMap;
@@ -75,9 +76,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 const REFDB_MAGIC: &[u8; 4] = b"SYLR";
-const REFDB_VERSION: u8 = 4;
+const REFDB_VERSION: u8 = 5; // v4 = no all-kmers index; v5 = with all-kmers index
 const SKETCH_MAGIC: &[u8; 4] = b"SYLD"; // reference-Delta sample
-const SKETCH_VERSION: u8 = 3;
+const SKETCH_VERSION: u8 = 4; // v3 = no error kmers; v4 = with error-kmer section
 
 const SCHEME_BITMASK: u8 = 0;
 const SCHEME_PRESENT_RICE: u8 = 1;
@@ -96,6 +97,7 @@ const HEADER_LEN: u64 = 13;
 const SPARSE_MIN_HITS: u32 = 1;
 const SPARSE_MPHF_GAMMA: f64 = 2.0;
 const POOL_MPHF_GAMMA: f64 = 2.0;
+const ALLKMERS_MPHF_GAMMA: f64 = 1.7;
 
 /// Metadata for one reference genome, in the dereplicated build order.
 #[derive(Clone, Debug, PartialEq)]
@@ -211,6 +213,105 @@ fn read_pool_block<R: Read>(r: &mut R, pool_len: usize) -> io::Result<(Mphf<u64>
         pool.push(u64::from_le_bytes(buf));
     }
     Ok((mphf, pool))
+}
+
+/// Build and serialize an MPHF over `all_keys` (sorted, deduplicated), returning the
+/// MPHF and a slot-indexed hash array for zero-false-positive verification.
+fn build_allkmers_index(all_keys: &[u64]) -> io::Result<(Mphf<u64>, Vec<u64>)> {
+    let mphf = Mphf::new_parallel(ALLKMERS_MPHF_GAMMA, all_keys, Some(0));
+    let n = all_keys.len();
+    let mut by_slot = vec![0u64; n];
+    let mut filled = vec![false; n];
+    for &h in all_keys {
+        let slot = mphf.hash(&h) as usize;
+        if slot >= n || filled[slot] {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "all-kmers MPHF construction produced an invalid slot",
+            ));
+        }
+        by_slot[slot] = h;
+        filled[slot] = true;
+    }
+    Ok((mphf, by_slot))
+}
+
+fn write_allkmers_block<W: Write>(w: &mut W, mphf: &Mphf<u64>, by_slot: &[u64]) -> io::Result<()> {
+    let mphf_bytes = bincode::serialize(mphf)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    write_uvarint(w, mphf_bytes.len() as u64)?;
+    w.write_all(&mphf_bytes)?;
+    for &h in by_slot {
+        w.write_all(&h.to_le_bytes())?;
+    }
+    Ok(())
+}
+
+fn read_allkmers_block<R: Read>(r: &mut R, count: usize) -> io::Result<(Mphf<u64>, Vec<u64>)> {
+    let mphf_len = read_uvarint(r)? as usize;
+    let mut mphf_bytes = vec![0u8; mphf_len];
+    r.read_exact(&mut mphf_bytes)?;
+    let mphf: Mphf<u64> = bincode::deserialize(&mphf_bytes)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    let mut by_slot = Vec::with_capacity(count);
+    for _ in 0..count {
+        let mut buf = [0u8; 8];
+        r.read_exact(&mut buf)?;
+        by_slot.push(u64::from_le_bytes(buf));
+    }
+    Ok((mphf, by_slot))
+}
+
+/// For a novel read k-mer (with canonical raw form `read_raw`), search the all-kmers MPHF for a
+/// reference k-mer that is one substitution away. Returns `(ref_slot, pos_in_ref, new_base)` —
+/// the mutation to apply to the *reference* k-mer to reconstruct the read k-mer.
+fn find_ref_error_neighbor(
+    read_raw: u64,
+    k: usize,
+    mphf: &Mphf<u64>,
+    by_slot: &[u64],
+) -> Option<(u64, u8, u8)> {
+    for pos in 0..k {
+        let read_base = ((read_raw >> (2 * pos)) & 3) as u8;
+        for new_base in 0..4u8 {
+            if new_base == read_base {
+                continue;
+            }
+            let neighbor_raw = mutate_kmer(read_raw, pos, new_base);
+            let canonical_nb = canonical_kmer(neighbor_raw, k);
+            let nb_hash = mm_hash64(canonical_nb);
+            if let Some(slot) = mphf.try_hash(&nb_hash) {
+                let slot = slot as usize;
+                if slot < by_slot.len() && by_slot[slot] == nb_hash {
+                    // Found the reference k-mer. Find which mutation on the reference
+                    // recovers the read k-mer (needed for lossless decompression).
+                    let ref_raw = rev_hash_64(nb_hash);
+                    if let Some((rpos, rbase)) = find_reverse_mutation(ref_raw, read_raw, k) {
+                        return Some((slot as u64, rpos, rbase));
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Find `(pos, new_base)` such that `canonical_kmer(mutate_kmer(ref_raw, pos, new_base), k) == read_raw`.
+/// Always succeeds for a valid Hamming-1 pair; returns None only if called incorrectly.
+fn find_reverse_mutation(ref_raw: u64, read_raw: u64, k: usize) -> Option<(u8, u8)> {
+    for pos in 0..k {
+        let ref_base = ((ref_raw >> (2 * pos)) & 3) as u8;
+        for new_base in 0..4u8 {
+            if new_base == ref_base {
+                continue;
+            }
+            let mutated = mutate_kmer(ref_raw, pos, new_base);
+            if canonical_kmer(mutated, k) == read_raw {
+                return Some((pos as u8, new_base));
+            }
+        }
+    }
+    None
 }
 
 #[inline]
@@ -422,8 +523,14 @@ fn species_ids(genomes: &[RefGenome]) -> Vec<u32> {
 
 /// Write a `.sylref` in the seekable two-stage layout. `sparse_div` controls the
 /// stage-1 subsampling rate (keep 1/`sparse_div` of each genome's distinctive
-/// k-mers); `sparse_div <= 1` keeps all of them.
-pub fn write_refdb<W: Write>(mut w: W, db: &RefDb, sparse_div: u64) -> io::Result<()> {
+/// k-mers); `sparse_div <= 1` keeps all of them. When `all_kmers_index` is true, an
+/// additional MPHF over every reference k-mer is embedded (v5 format); otherwise v4.
+pub fn write_refdb<W: Write>(
+    mut w: W,
+    db: &RefDb,
+    sparse_div: u64,
+    all_kmers_index: bool,
+) -> io::Result<()> {
     let ng = db.genomes.len();
     let sp_ids = species_ids(&db.genomes);
 
@@ -468,6 +575,26 @@ pub fn write_refdb<W: Write>(mut w: W, db: &RefDb, sparse_div: u64) -> io::Resul
         write_hashes(&mut body, &complement)?;
     }
 
+    // Optional all-kmers MPHF block (v5 only).
+    let allkmers_info: Option<(u64, usize)> = if all_kmers_index {
+        let mut all_keys: Vec<u64> = db
+            .distinctive
+            .iter()
+            .flatten()
+            .copied()
+            .chain(db.pool.iter().copied())
+            .collect();
+        all_keys.sort_unstable();
+        all_keys.dedup();
+        let n = all_keys.len();
+        let (mphf, by_slot) = build_allkmers_index(&all_keys)?;
+        let off = body.len() as u64;
+        write_allkmers_block(&mut body, &mphf, &by_slot)?;
+        Some((off, n))
+    } else {
+        None
+    };
+
     // Footer (zstd-compressed): metadata + absolute offsets into the file.
     let mut footer: Vec<u8> = Vec::new();
     write_uvarint(&mut footer, db.c as u64)?;
@@ -490,11 +617,20 @@ pub fn write_refdb<W: Write>(mut w: W, db: &RefDb, sparse_div: u64) -> io::Resul
         write_uvarint(&mut footer, HEADER_LEN + dense_off[g])?;
         write_uvarint(&mut footer, db.distinctive[g].len() as u64)?;
     }
+    // v5 extension: all-kmers index location (0 = not present).
+    if let Some((off, count)) = allkmers_info {
+        write_uvarint(&mut footer, HEADER_LEN + off)?;
+        write_uvarint(&mut footer, count as u64)?;
+    } else {
+        write_uvarint(&mut footer, 0u64)?; // 0 = no all-kmers index
+        write_uvarint(&mut footer, 0u64)?;
+    }
     let footer_comp = zstd::stream::encode_all(&footer[..], 9)?;
     let footer_offset = HEADER_LEN + body.len() as u64;
 
+    let version = if all_kmers_index { 5u8 } else { 4u8 };
     w.write_all(REFDB_MAGIC)?;
-    w.write_all(&[REFDB_VERSION])?;
+    w.write_all(&[version])?;
     w.write_all(&footer_offset.to_le_bytes())?;
     w.write_all(&body)?;
     w.write_all(&footer_comp)?;
@@ -538,6 +674,13 @@ pub struct RefIndex {
     reader: Mutex<Box<dyn ReadSeek>>,
     cache: Mutex<FxHashMap<u32, Arc<Vec<u64>>>>,
     compression_only: bool,
+    /// All-kmers index: MPHF over every reference k-mer (distinctive + pool), built with
+    /// `ref-build --all-kmers-index`. When present, enables 1-error k-mer recovery during
+    /// compression. Also required to decompress v4 sketches.
+    all_kmers_mphf: Option<Mphf<u64>>,
+    /// Hash value at each MPHF slot (slot → hash), used to verify membership and to
+    /// reconstruct the reference k-mer sequence for error k-mer decoding.
+    all_kmers_hashes: Option<Vec<u64>>,
 }
 
 enum RefOpenMode {
@@ -566,10 +709,11 @@ fn open_ref_index_with_mode<R: Read + Seek + Send + 'static>(
             "not a sylph reference DB",
         ));
     }
-    if hdr[4] != REFDB_VERSION {
+    let db_ver = hdr[4];
+    if db_ver < 4 || db_ver > REFDB_VERSION {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "unsupported reference DB version",
+            format!("unsupported reference DB version {} (supported: 4-{})", db_ver, REFDB_VERSION),
         ));
     }
     let footer_offset = u64::from_le_bytes(hdr[5..13].try_into().unwrap());
@@ -622,6 +766,16 @@ fn open_ref_index_with_mode<R: Read + Seek + Send + 'static>(
         });
     }
 
+    // v5 extension: all-kmers index location (written for both v4 and v5 refdbs,
+    // but only non-zero when an all-kmers index was built).
+    let (allkmers_offset, allkmers_count) = if db_ver >= 5 {
+        let off = read_uvarint(&mut f)?;
+        let cnt = read_uvarint(&mut f)? as usize;
+        (off, cnt)
+    } else {
+        (0u64, 0usize)
+    };
+
     let total_sparse: usize = sparse_count.iter().sum();
     r.seek(SeekFrom::Start(sparse_index_offset))?;
     let (sparse_mphf, sparse_fingerprints, sparse_owners) =
@@ -631,6 +785,15 @@ fn open_ref_index_with_mode<R: Read + Seek + Send + 'static>(
     // compression can compute a candidate slot and verify it without a HashMap.
     r.seek(SeekFrom::Start(pool_offset))?;
     let (pool_mphf, pool) = read_pool_block(&mut r, pool_domain)?;
+
+    // All-kmers index (optional): loaded eagerly when present.
+    let (all_kmers_mphf, all_kmers_hashes) = if allkmers_offset > 0 && allkmers_count > 0 {
+        r.seek(SeekFrom::Start(allkmers_offset))?;
+        let (mphf, by_slot) = read_allkmers_block(&mut r, allkmers_count)?;
+        (Some(mphf), Some(by_slot))
+    } else {
+        (None, None)
+    };
 
     Ok(RefIndex {
         c,
@@ -646,6 +809,8 @@ fn open_ref_index_with_mode<R: Read + Seek + Send + 'static>(
         reader: Mutex::new(Box::new(r)),
         cache: Mutex::new(FxHashMap::default()),
         compression_only: matches!(mode, RefOpenMode::CompressionOnly),
+        all_kmers_mphf,
+        all_kmers_hashes,
     })
 }
 
@@ -904,9 +1069,41 @@ pub fn compress_seq_with_meta<W: Write>(
         encode_subset(&mut pool_section, &pool_hits, idx.pool.len() as u64)?;
     }
 
-    // novel hashes (Rice)
+    // Error k-mers: novel hashes that are 1 substitution away from a reference k-mer.
+    // Only possible when the reference DB was built with --all-kmers-index (v5).
+    // Encoded as delta-coded MPHF slot + 1-byte packed (pos<<2|base) for the mutation
+    // that, applied to the *reference* k-mer, reconstructs the read k-mer.
+    let mut error_section: Vec<u8> = Vec::new();
+    let truly_novel: Vec<u64>;
+    if let (Some(mphf), Some(by_slot)) = (&idx.all_kmers_mphf, &idx.all_kmers_hashes) {
+        let mut enc_slots: Vec<(u64, u8, u8)> = Vec::new(); // (slot, pos_in_ref, new_base)
+        let mut still_novel: Vec<u64> = Vec::new();
+        for &h in &novel {
+            let read_raw = rev_hash_64(h);
+            if let Some((slot, rpos, rbase)) =
+                find_ref_error_neighbor(read_raw, idx.k, mphf, by_slot)
+            {
+                enc_slots.push((slot, rpos, rbase));
+            } else {
+                still_novel.push(h);
+            }
+        }
+        enc_slots.sort_unstable_by_key(|&(s, _, _)| s);
+        write_uvarint(&mut error_section, enc_slots.len() as u64)?;
+        let mut prev_slot = 0u64;
+        for (slot, rpos, rbase) in enc_slots {
+            write_uvarint(&mut error_section, slot - prev_slot)?;
+            prev_slot = slot;
+            error_section.push((rpos << 2) | (rbase & 3));
+        }
+        truly_novel = still_novel;
+    } else {
+        truly_novel = novel;
+    };
+
+    // Truly novel hashes (Rice) — those unexplained even by 1-error matching.
     let mut novel_section = Vec::new();
-    write_hashes(&mut novel_section, &novel)?;
+    write_hashes(&mut novel_section, &truly_novel)?;
 
     // counts, in ascending-hash order (reproducible on decode)
     let mut count_section = Vec::new();
@@ -916,9 +1113,13 @@ pub fn compress_seq_with_meta<W: Write>(
         write_uvarint(&mut count_section, sketch.kmer_counts[h] as u64)?;
     }
 
+    // Use sketch version 4 when an error section is present (even if empty, for
+    // consistency), 3 otherwise.
+    let sketch_ver = if idx.all_kmers_mphf.is_some() { 4u8 } else { 3u8 };
+
     let mut payload = Vec::new();
     payload.extend_from_slice(SKETCH_MAGIC);
-    payload.push(SKETCH_VERSION);
+    payload.push(sketch_ver);
     payload.extend_from_slice(&idx.fingerprint.to_le_bytes());
     write_string(&mut payload, ref_db_name)?;
     write_uvarint(&mut payload, sketch.c as u64)?;
@@ -937,14 +1138,21 @@ pub fn compress_seq_with_meta<W: Write>(
     write_uvarint(&mut payload, hit_ids.len() as u64)?;
     write_uvarint(&mut payload, assigned_hits as u64)?;
     write_uvarint(&mut payload, pool_hits.len() as u64)?;
-    write_uvarint(&mut payload, novel.len() as u64)?;
+    write_uvarint(&mut payload, truly_novel.len() as u64)?;
     write_uvarint(&mut payload, hit_section.len() as u64)?;
     write_uvarint(&mut payload, pool_section.len() as u64)?;
     write_uvarint(&mut payload, novel_section.len() as u64)?;
     write_uvarint(&mut payload, count_section.len() as u64)?;
+    if sketch_ver >= 4 {
+        // error_section starts with the count (uvarint); store byte length too for inspect.
+        write_uvarint(&mut payload, error_section.len() as u64)?;
+    }
     payload.extend_from_slice(&hit_section);
     payload.extend_from_slice(&pool_section);
     payload.extend_from_slice(&novel_section);
+    if sketch_ver >= 4 {
+        payload.extend_from_slice(&error_section);
+    }
     payload.extend_from_slice(&count_section);
 
     let mut enc = zstd::stream::write::Encoder::new(inner, ZSTD_LEVEL)?;
@@ -1016,8 +1224,10 @@ pub fn decompress_seq_with_meta<R: Read>(
         ReadSketchMeta::default()
     };
 
+    // Header metadata: 8 uvarints for v2-3; 9 for v4 (adds error section byte length).
     if ver[0] >= 2 {
-        for _ in 0..8 {
+        let n_meta = if ver[0] >= 4 { 9 } else { 8 };
+        for _ in 0..n_meta {
             let _ = read_uvarint(&mut r)?;
         }
     }
@@ -1043,6 +1253,33 @@ pub fn decompress_seq_with_meta<R: Read>(
     }
     let novel = read_hashes(&mut r)?;
     hashes.extend_from_slice(&novel);
+
+    // v4: error k-mers section — reconstruct read k-mers from (ref_slot, pos, base).
+    if ver[0] >= 4 {
+        let by_slot = idx.all_kmers_hashes.as_deref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "sketch was compressed with error-kmer matching (v4) but the reference DB has \
+                 no all-kmers index; rebuild with `ref-build --all-kmers-index`",
+            )
+        })?;
+        let n_error = read_uvarint(&mut r)? as usize;
+        let mut prev_slot = 0u64;
+        for _ in 0..n_error {
+            let delta = read_uvarint(&mut r)?;
+            let slot = prev_slot + delta;
+            prev_slot = slot;
+            let mut packed = [0u8; 1];
+            r.read_exact(&mut packed)?;
+            let rpos = (packed[0] >> 2) as usize;
+            let rbase = packed[0] & 3;
+            let ref_hash = by_slot[slot as usize];
+            let ref_raw = rev_hash_64(ref_hash);
+            let mutated_raw = mutate_kmer(ref_raw, rpos, rbase);
+            let canonical_mutated = canonical_kmer(mutated_raw, k);
+            hashes.push(mm_hash64(canonical_mutated));
+        }
+    }
 
     hashes.sort_unstable();
     let mut kmer_counts = FxHashMap::with_capacity_and_hasher(hashes.len(), Default::default());
@@ -1232,6 +1469,7 @@ struct RefSketchInspect {
     pool_section_bytes: Option<u64>,
     novel_section_bytes: Option<u64>,
     count_section_bytes: Option<u64>,
+    error_section_bytes: Option<u64>,
 }
 
 fn inspect_ref_sketch(path: &str) -> io::Result<RefSketchInspect> {
@@ -1292,19 +1530,22 @@ fn inspect_ref_sketch(path: &str) -> io::Result<RefSketchInspect> {
         pool_section_bytes,
         novel_section_bytes,
         count_section_bytes,
+        error_section_bytes,
     ) = if ver[0] >= 2 {
+        let hg = Some(read_uvarint(&mut r)?);
+        let ag = Some(read_uvarint(&mut r)?);
+        let sp = Some(read_uvarint(&mut r)?);
+        let nv = Some(read_uvarint(&mut r)?);
+        let hs = Some(read_uvarint(&mut r)?);
+        let ps = Some(read_uvarint(&mut r)?);
+        let ns = Some(read_uvarint(&mut r)?);
+        let cs = Some(read_uvarint(&mut r)?);
+        let es = if ver[0] >= 4 { Some(read_uvarint(&mut r)?) } else { None };
         (
-            Some(read_uvarint(&mut r)?),
-            Some(read_uvarint(&mut r)?),
-            Some(read_uvarint(&mut r)?),
-            Some(read_uvarint(&mut r)?),
-            Some(read_uvarint(&mut r)?),
-            Some(read_uvarint(&mut r)?),
-            Some(read_uvarint(&mut r)?),
-            Some(read_uvarint(&mut r)?),
+            hg, ag, sp, nv, hs, ps, ns, cs, es,
         )
     } else {
-        (None, None, None, None, None, None, None, None)
+        (None, None, None, None, None, None, None, None, None)
     };
     let header_metadata_bytes = raw.len() - r.len();
 
@@ -1331,6 +1572,7 @@ fn inspect_ref_sketch(path: &str) -> io::Result<RefSketchInspect> {
         pool_section_bytes,
         novel_section_bytes,
         count_section_bytes,
+        error_section_bytes,
     })
 }
 
@@ -1340,7 +1582,7 @@ fn opt_u64(x: Option<u64>) -> String {
 
 fn run_ref_inspect(files: &[String]) {
     println!(
-        "file\tversion\tcompressed_bytes\tpayload_bytes\treference_fingerprint\treference_db\tsample_file\tsample_name\tc\tk\tpaired\tmean_read_length\tnum_reads\theader_metadata_payload_bytes\thit_genomes\tassigned_to_genomes\tshared_pool\tnovel\ttotal_hashes\thit_section_payload_bytes\tpool_section_payload_bytes\tnovel_section_payload_bytes\tcount_section_payload_bytes"
+        "file\tversion\tcompressed_bytes\tpayload_bytes\treference_fingerprint\treference_db\tsample_file\tsample_name\tc\tk\tpaired\tmean_read_length\tnum_reads\theader_metadata_payload_bytes\thit_genomes\tassigned_to_genomes\tshared_pool\tnovel\ttotal_hashes\thit_section_payload_bytes\tpool_section_payload_bytes\tnovel_section_payload_bytes\tcount_section_payload_bytes\terror_section_payload_bytes"
     );
     for f in files {
         let x = inspect_ref_sketch(f).unwrap_or_else(|e| panic!("Failed to inspect {}: {}", f, e));
@@ -1349,7 +1591,7 @@ fn run_ref_inspect(files: &[String]) {
             _ => "-".to_string(),
         };
         println!(
-            "{}\t{}\t{}\t{}\t{:016x}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{:016x}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             x.path,
             x.version,
             x.compressed_bytes,
@@ -1373,6 +1615,7 @@ fn run_ref_inspect(files: &[String]) {
             opt_u64(x.pool_section_bytes),
             opt_u64(x.novel_section_bytes),
             opt_u64(x.count_section_bytes),
+            opt_u64(x.error_section_bytes),
         );
     }
 }
@@ -1773,7 +2016,8 @@ pub fn run_ref_build(args: RefBuildArgs) {
 
     let w =
         BufWriter::new(File::create(&out).unwrap_or_else(|_| panic!("Could not create {}", out)));
-    write_refdb(w, &db, sparse_div).unwrap_or_else(|e| panic!("Failed to write {}: {}", out, e));
+    write_refdb(w, &db, sparse_div, args.all_kmers_index)
+        .unwrap_or_else(|e| panic!("Failed to write {}: {}", out, e));
     info!("Wrote reference database to {}", out);
 }
 

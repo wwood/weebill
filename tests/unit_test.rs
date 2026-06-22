@@ -72,7 +72,7 @@ fn refdelta_pool_min_genomes_assigns_pairs_to_first_owner() {
 
 fn open_index(db: &refdelta::RefDb, sparse_div: u64) -> refdelta::RefIndex {
     let mut dbuf = Vec::new();
-    refdelta::write_refdb(&mut dbuf, db, sparse_div).unwrap();
+    refdelta::write_refdb(&mut dbuf, db, sparse_div, false).unwrap();
     refdelta::open_ref_index(std::io::Cursor::new(dbuf)).unwrap()
 }
 
