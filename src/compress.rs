@@ -40,7 +40,7 @@ use fxhash::FxHashMap;
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 
 const MAGIC: &[u8; 4] = b"SYLZ";
-const VERSION: u8 = 3;
+const VERSION: u8 = 4;
 const TYPE_GENOME_DB: u8 = 1;
 const TYPE_SEQ_SAMPLE: u8 = 2;
 
@@ -76,7 +76,11 @@ struct BitWriter<'a, W: Write> {
 
 impl<'a, W: Write> BitWriter<'a, W> {
     fn new(w: &'a mut W) -> Self {
-        BitWriter { w, acc: 0, nbits: 0 }
+        BitWriter {
+            w,
+            acc: 0,
+            nbits: 0,
+        }
     }
 
     #[inline]
@@ -96,7 +100,11 @@ impl<'a, W: Write> BitWriter<'a, W> {
         if n == 0 {
             return Ok(());
         }
-        let masked = if n >= 64 { val } else { val & ((1u64 << n) - 1) };
+        let masked = if n >= 64 {
+            val
+        } else {
+            val & ((1u64 << n) - 1)
+        };
         self.acc = (self.acc << n) | masked as u128;
         self.nbits += n;
         self.flush_bytes()
@@ -143,7 +151,11 @@ struct BitReader<'a, R: Read> {
 
 impl<'a, R: Read> BitReader<'a, R> {
     fn new(r: &'a mut R) -> Self {
-        BitReader { r, cur: 0, nleft: 0 }
+        BitReader {
+            r,
+            cur: 0,
+            nleft: 0,
+        }
     }
 
     #[inline]
@@ -342,7 +354,7 @@ fn write_header<W: Write>(w: &mut W, sketch_type: u8) -> io::Result<()> {
     w.write_all(&[VERSION, sketch_type])
 }
 
-fn read_and_check_header<R: Read>(r: &mut R, expected_type: u8) -> io::Result<()> {
+fn read_and_check_header<R: Read>(r: &mut R, expected_type: u8) -> io::Result<u8> {
     let mut magic = [0u8; 4];
     r.read_exact(&mut magic)?;
     if &magic != MAGIC {
@@ -353,7 +365,7 @@ fn read_and_check_header<R: Read>(r: &mut R, expected_type: u8) -> io::Result<()
     }
     let mut meta = [0u8; 2];
     r.read_exact(&mut meta)?;
-    if meta[0] != VERSION {
+    if meta[0] < 3 || meta[0] > VERSION {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unsupported compressed sketch version {}", meta[0]),
@@ -365,7 +377,7 @@ fn read_and_check_header<R: Read>(r: &mut R, expected_type: u8) -> io::Result<()
             "compressed sketch is of an unexpected type",
         ));
     }
-    Ok(())
+    Ok(meta[0])
 }
 
 fn write_genome_sketch<W: Write>(w: &mut W, s: &GenomeSketch) -> io::Result<()> {
@@ -457,7 +469,16 @@ pub fn stream_genome_sketches_compressed<R: Read, F: FnMut(GenomeSketch) -> io::
 }
 
 /// Write a sample (read) sketch in the compressed format.
-pub fn write_seq_sketch_compressed<W: Write>(mut inner: W, s: &SequencesSketch) -> io::Result<()> {
+pub fn write_seq_sketch_compressed<W: Write>(inner: W, s: &SequencesSketch) -> io::Result<()> {
+    write_seq_sketch_compressed_with_meta(inner, s, ReadSketchMeta::default())
+}
+
+/// Write a sample sketch with extra metadata used for sketch merging.
+pub fn write_seq_sketch_compressed_with_meta<W: Write>(
+    mut inner: W,
+    s: &SequencesSketch,
+    meta: ReadSketchMeta,
+) -> io::Result<()> {
     write_header(&mut inner, TYPE_SEQ_SAMPLE)?;
     let mut w = BufWriter::new(zstd::stream::write::Encoder::new(inner, ZSTD_LEVEL)?);
     write_uvarint(&mut w, s.c as u64)?;
@@ -472,6 +493,7 @@ pub fn write_seq_sketch_compressed<W: Write>(mut inner: W, s: &SequencesSketch) 
     }
     write_bool(&mut w, s.paired)?;
     write_f64(&mut w, s.mean_read_length)?;
+    write_uvarint(&mut w, meta.num_reads)?;
 
     // Struct-of-arrays: Rice-coded sorted keys, then their counts as varints.
     let mut pairs: Vec<(u64, u32)> = s.kmer_counts.iter().map(|(&k, &v)| (k, v)).collect();
@@ -489,8 +511,15 @@ pub fn write_seq_sketch_compressed<W: Write>(mut inner: W, s: &SequencesSketch) 
 }
 
 /// Read a sample (read) sketch from the compressed format.
-pub fn read_seq_sketch_compressed<R: Read>(mut inner: R) -> io::Result<SequencesSketch> {
-    read_and_check_header(&mut inner, TYPE_SEQ_SAMPLE)?;
+pub fn read_seq_sketch_compressed<R: Read>(inner: R) -> io::Result<SequencesSketch> {
+    read_seq_sketch_compressed_with_meta(inner).map(|(sketch, _)| sketch)
+}
+
+/// Read a sample sketch plus merge metadata from the compressed format.
+pub fn read_seq_sketch_compressed_with_meta<R: Read>(
+    mut inner: R,
+) -> io::Result<(SequencesSketch, ReadSketchMeta)> {
+    let version = read_and_check_header(&mut inner, TYPE_SEQ_SAMPLE)?;
     let mut r = BufReader::with_capacity(1 << 22, zstd::stream::read::Decoder::new(inner)?);
     let c = read_uvarint(&mut r)? as usize;
     let k = read_uvarint(&mut r)? as usize;
@@ -502,6 +531,13 @@ pub fn read_seq_sketch_compressed<R: Read>(mut inner: R) -> io::Result<Sequences
     };
     let paired = read_bool(&mut r)?;
     let mean_read_length = read_f64(&mut r)?;
+    let meta = if version >= 4 {
+        ReadSketchMeta {
+            num_reads: read_uvarint(&mut r)?,
+        }
+    } else {
+        ReadSketchMeta::default()
+    };
 
     let keys = read_hashes(&mut r)?;
     let mut kmer_counts = FxHashMap::with_capacity_and_hasher(keys.len(), Default::default());
@@ -510,13 +546,16 @@ pub fn read_seq_sketch_compressed<R: Read>(mut inner: R) -> io::Result<Sequences
         kmer_counts.insert(key, count);
     }
 
-    Ok(SequencesSketch {
-        kmer_counts,
-        c,
-        k,
-        file_name,
-        sample_name,
-        paired,
-        mean_read_length,
-    })
+    Ok((
+        SequencesSketch {
+            kmer_counts,
+            c,
+            k,
+            file_name,
+            sample_name,
+            paired,
+            mean_read_length,
+        },
+        meta,
+    ))
 }

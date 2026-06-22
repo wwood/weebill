@@ -11,6 +11,7 @@ use std::thread;
 use std::time::Duration;
 
 use crate::constants::*;
+use crate::refdelta;
 use crate::seeding::*;
 use crate::types::*;
 use log::*;
@@ -29,35 +30,56 @@ type Marker = u32;
 /// format.
 fn write_read_sketch_file(
     read_sketch: &SequencesSketch,
+    meta: ReadSketchMeta,
     sketch_name: &str,
     paired: bool,
     sample_output_dir: &str,
     compressed_sample_output_dir: &Option<String>,
+    ref_index: Option<&refdelta::RefIndex>,
+    ref_db_name: Option<&str>,
 ) {
-    let (dir, compressed) = match compressed_sample_output_dir {
-        Some(d) => (d.as_str(), true),
-        None => (sample_output_dir, false),
+    let (dir, output_kind) = if ref_index.is_some() {
+        (sample_output_dir, REF_SAMPLE_SUFFIX)
+    } else {
+        match compressed_sample_output_dir {
+            Some(d) => (d.as_str(), SAMPLE_COMP_FILE_SUFFIX),
+            None => (sample_output_dir, SAMPLE_FILE_SUFFIX),
+        }
     };
     std::fs::create_dir_all(dir)
         .expect("Could not create directory for output sample files. Exiting...");
     let read_file_path = Path::new(sketch_name).file_name().unwrap();
     let file_path = Path::new(dir).join(read_file_path);
-    let suffix = if compressed {
-        SAMPLE_COMP_FILE_SUFFIX
-    } else {
-        SAMPLE_FILE_SUFFIX
-    };
     let file_path_str = if paired {
-        format!("{}.paired{}", file_path.to_str().unwrap(), suffix)
+        format!("{}.paired{}", file_path.to_str().unwrap(), output_kind)
     } else {
-        format!("{}{}", file_path.to_str().unwrap(), suffix)
+        format!("{}{}", file_path.to_str().unwrap(), output_kind)
     };
     let mut read_sk_file = BufWriter::new(
         File::create(&file_path_str).expect(&format!("{} path not valid; exiting ", file_path_str)),
     );
-    if compressed {
-        crate::compress::write_seq_sketch_compressed(&mut read_sk_file, read_sketch)
-            .expect(&format!("Failed to write compressed sketch {}", file_path_str));
+    if let Some(idx) = ref_index {
+        refdelta::compress_seq_with_meta(
+            &mut read_sk_file,
+            read_sketch,
+            idx,
+            ref_db_name.unwrap_or(""),
+            meta,
+        )
+        .expect(&format!(
+            "Failed to write reference-compressed sketch {}",
+            file_path_str
+        ));
+    } else if compressed_sample_output_dir.is_some() {
+        crate::compress::write_seq_sketch_compressed_with_meta(
+            &mut read_sk_file,
+            read_sketch,
+            meta,
+        )
+        .expect(&format!(
+            "Failed to write compressed sketch {}",
+            file_path_str
+        ));
     } else {
         bincode::serialize_into(&mut read_sk_file, read_sketch).unwrap();
     }
@@ -184,6 +206,7 @@ fn check_args_valid(args: &SketchArgs) {
         && args.list_sequence.is_none()
         && args.first_pair.is_empty()
         && args.second_pair.is_empty()
+        && args.interleaved.is_empty()
         && args.genomes.is_none()
         && args.reads.is_none()
         && args.list_genomes.is_none()
@@ -197,6 +220,10 @@ fn check_args_valid(args: &SketchArgs) {
 
     if args.fpr < 0. || args.fpr >= 1. {
         error!("Invalid FPR for sketching. Must be in [0,1).");
+        std::process::exit(1);
+    }
+    if args.reference.is_some() && args.compressed_sample_output_dir.is_some() {
+        error!("--reference writes *.sylspr sample sketches directly and cannot be combined with --compressed-database.");
         std::process::exit(1);
     }
 }
@@ -323,10 +350,19 @@ pub fn sketch(args: SketchArgs) {
     parse_ambiguous_files(&args, &mut read_inputs, &mut genome_inputs);
     parse_reads_and_genomes(&args, &mut read_inputs, &mut genome_inputs);
     parse_paired_end_reads(&args, &mut first_pairs, &mut second_pairs);
+    let interleaved_inputs = args.interleaved.clone();
+    let ref_index = args.reference.as_ref().map(|path| {
+        let r = BufReader::with_capacity(
+            10_000_000,
+            File::open(path).unwrap_or_else(|_| panic!("Could not open {}", path)),
+        );
+        refdelta::open_ref_index_for_compress(r)
+            .unwrap_or_else(|e| panic!("{} is not a valid reference DB: {}", path, e))
+    });
 
     let sample_names = parse_sample_names(&args);
     if let Some(names) = &sample_names {
-        if names.len() != first_pairs.len() + read_inputs.len() {
+        if names.len() != first_pairs.len() + interleaved_inputs.len() + read_inputs.len() {
             log::error!("Sample name length is not equal to the number of reads. Exiting");
             std::process::exit(1);
         }
@@ -373,7 +409,7 @@ pub fn sketch(args: SketchArgs) {
                     error!("Could not create directory at {}", args.sample_output_dir);
                     std::process::exit(1);
                 }
-                let read_sketch = read_sketch_opt.unwrap();
+                let (read_sketch, meta) = read_sketch_opt.unwrap();
 
                 let sketch_name = if sample_name.is_some() {
                     read_sketch.sample_name.as_ref().unwrap().clone()
@@ -383,10 +419,50 @@ pub fn sketch(args: SketchArgs) {
 
                 write_read_sketch_file(
                     &read_sketch,
+                    meta,
                     &sketch_name,
                     true,
                     &args.sample_output_dir,
                     &args.compressed_sample_output_dir,
+                    ref_index.as_ref(),
+                    args.reference.as_deref(),
+                );
+            }
+        });
+    }
+
+    if !interleaved_inputs.is_empty() {
+        info!("Sketching interleaved sequences...");
+        let iter_vec: Vec<usize> = (0..interleaved_inputs.len()).into_iter().collect();
+        iter_vec.into_par_iter().for_each(|i| {
+            let read_file = &interleaved_inputs[i];
+            let mut sample_name = None;
+            if let Some(name) = &sample_names {
+                sample_name = Some(name[i + first_pairs.len()].clone());
+            }
+            let read_sketch_opt = sketch_interleaved_sequences(
+                read_file,
+                args.c,
+                args.k,
+                sample_name.clone(),
+                args.no_dedup,
+                args.fpr,
+            );
+            if let Some((read_sketch, meta)) = read_sketch_opt {
+                let sketch_name = if sample_name.is_some() {
+                    read_sketch.sample_name.as_ref().unwrap().clone()
+                } else {
+                    read_sketch.file_name.clone()
+                };
+                write_read_sketch_file(
+                    &read_sketch,
+                    meta,
+                    &sketch_name,
+                    true,
+                    &args.sample_output_dir,
+                    &args.compressed_sample_output_dir,
+                    ref_index.as_ref(),
+                    args.reference.as_deref(),
                 );
             }
         });
@@ -407,7 +483,7 @@ pub fn sketch(args: SketchArgs) {
         check_vram_and_block(max_ram, read_file);
         let mut sample_name = None;
         if let Some(name) = &sample_names {
-            sample_name = Some(name[i + first_pairs.len()].clone());
+            sample_name = Some(name[i + first_pairs.len() + interleaved_inputs.len()].clone());
         }
 
         let read_sketch_opt;
@@ -420,7 +496,7 @@ pub fn sketch(args: SketchArgs) {
         );
 
         if read_sketch_opt.is_some() {
-            let read_sketch = read_sketch_opt.unwrap();
+            let (read_sketch, meta) = read_sketch_opt.unwrap();
             let sketch_name = if sample_name.is_some() {
                 read_sketch.sample_name.as_ref().unwrap().clone()
             } else {
@@ -428,10 +504,13 @@ pub fn sketch(args: SketchArgs) {
             };
             write_read_sketch_file(
                 &read_sketch,
+                meta,
                 &sketch_name,
                 false,
                 &args.sample_output_dir,
                 &args.compressed_sample_output_dir,
+                ref_index.as_ref(),
+                args.reference.as_deref(),
             );
         }
     });
@@ -822,7 +901,7 @@ pub fn sketch_pair_sequences(
     sample_name: Option<String>,
     no_dedup: bool,
     dedup_fpr: f64,
-) -> Option<SequencesSketch> {
+) -> Option<(SequencesSketch, ReadSketchMeta)> {
     let r1o = parse_fastx_file(&read_file1);
     let r2o = parse_fastx_file(&read_file2);
     let mut read_sketch = SequencesSketch::new(read_file1.to_string(), c, k, true, sample_name, 0.);
@@ -929,7 +1008,9 @@ pub fn sketch_pair_sequences(
             break;
         }
     }
-    let percent = (num_dup_removed as f64)/((read_sketch.kmer_counts.values().sum::<u32>() as f64) + num_dup_removed as f64) * 100.;
+    let percent = (num_dup_removed as f64)
+        / ((read_sketch.kmer_counts.values().sum::<u32>() as f64) + num_dup_removed as f64)
+        * 100.;
     log::debug!(
         "Number of sketched k-mers removed due to read duplication for {}: {}. Percentage: {:.2}%",
         read_sketch.file_name,
@@ -937,7 +1018,167 @@ pub fn sketch_pair_sequences(
         percent,
     );
     read_sketch.mean_read_length = mean_read_length;
-    return Some(read_sketch);
+    return Some((
+        read_sketch,
+        ReadSketchMeta {
+            num_reads: counter as u64,
+        },
+    ));
+}
+
+fn base_read_name(id: &[u8]) -> String {
+    let full = std::str::from_utf8(id).unwrap_or("");
+    let first_token = full.split_whitespace().next().unwrap_or(full);
+    first_token
+        .strip_suffix("/1")
+        .or_else(|| first_token.strip_suffix("/2"))
+        .or_else(|| first_token.strip_suffix(".1"))
+        .or_else(|| first_token.strip_suffix(".2"))
+        .unwrap_or(first_token)
+        .to_string()
+}
+
+pub fn sketch_interleaved_sequences(
+    read_file: &str,
+    c: usize,
+    k: usize,
+    sample_name: Option<String>,
+    no_dedup: bool,
+    dedup_fpr: f64,
+) -> Option<(SequencesSketch, ReadSketchMeta)> {
+    let reader = parse_fastx_file(read_file);
+    if reader.is_err() {
+        log::error!(
+            "Interleaved paired-end reading failed for '{}'. Make sure the file is present and valid.",
+            read_file
+        );
+        std::process::exit(1);
+    }
+
+    let mut reader = reader.unwrap();
+    let mut read_sketch = SequencesSketch::new(read_file.to_string(), c, k, true, sample_name, 0.);
+    let mut num_dup_removed = 0;
+    let mut kmer_pair_set = FxHashSet::default();
+    let mut fpr = 0.001;
+    if dedup_fpr != 0. {
+        fpr = dedup_fpr;
+    }
+    let mut kmer_pair_set_approx = ScalableCuckooFilterBuilder::new()
+        .initial_capacity(1_000_000_0)
+        .false_positive_probability(fpr)
+        .hasher(FxHasher::default())
+        .finish();
+
+    let mut mean_read_length: f64 = 0.;
+    let mut counter: f64 = 0.;
+    let mut pending: Option<(String, Vec<u8>)> = None;
+
+    while let Some(rec_result) = reader.next() {
+        let rec = match rec_result {
+            Ok(rec) => rec,
+            Err(_) => return None,
+        };
+        let current_name = base_read_name(rec.id());
+        let current_seq = rec.seq().to_vec();
+
+        if let Some((prev_name, prev_seq)) = pending.take() {
+            if prev_name != current_name {
+                log::error!(
+                    "Interleaved file '{}' has non-matching consecutive read names '{}' and '{}'.",
+                    read_file,
+                    prev_name,
+                    current_name
+                );
+                std::process::exit(1);
+            }
+
+            let mut temp_vec1 = vec![];
+            let mut temp_vec2 = vec![];
+            extract_markers(&prev_seq, &mut temp_vec1, c, k);
+            extract_markers(&current_seq, &mut temp_vec2, c, k);
+            let kmer_pair = pair_kmer(&prev_seq, &current_seq);
+
+            counter += 1.;
+            mean_read_length =
+                mean_read_length + ((prev_seq.len() as f64) - mean_read_length) / counter;
+
+            for km in temp_vec1.iter() {
+                if dedup_fpr == 0. {
+                    dup_removal_lsh_full_exact(
+                        &mut read_sketch.kmer_counts,
+                        &mut kmer_pair_set,
+                        km,
+                        kmer_pair,
+                        &mut num_dup_removed,
+                        no_dedup,
+                        None,
+                    );
+                } else {
+                    dup_removal_lsh_full(
+                        &mut read_sketch.kmer_counts,
+                        &mut kmer_pair_set_approx,
+                        km,
+                        kmer_pair,
+                        &mut num_dup_removed,
+                        no_dedup,
+                    );
+                }
+            }
+            for km in temp_vec2.iter() {
+                if temp_vec1.contains(km) {
+                    continue;
+                }
+                if dedup_fpr == 0. {
+                    dup_removal_lsh_full_exact(
+                        &mut read_sketch.kmer_counts,
+                        &mut kmer_pair_set,
+                        km,
+                        kmer_pair,
+                        &mut num_dup_removed,
+                        no_dedup,
+                        None,
+                    );
+                } else {
+                    dup_removal_lsh_full(
+                        &mut read_sketch.kmer_counts,
+                        &mut kmer_pair_set_approx,
+                        km,
+                        kmer_pair,
+                        &mut num_dup_removed,
+                        no_dedup,
+                    );
+                }
+            }
+        } else {
+            pending = Some((current_name, current_seq));
+        }
+    }
+
+    if let Some((name, _)) = pending {
+        log::error!(
+            "Interleaved file '{}' ended with an unpaired read '{}'.",
+            read_file,
+            name
+        );
+        std::process::exit(1);
+    }
+
+    let percent = (num_dup_removed as f64)
+        / ((read_sketch.kmer_counts.values().sum::<u32>() as f64) + num_dup_removed as f64)
+        * 100.;
+    log::debug!(
+        "Number of sketched k-mers removed due to read duplication for {}: {}. Percentage: {:.2}%",
+        read_sketch.file_name,
+        num_dup_removed,
+        percent,
+    );
+    read_sketch.mean_read_length = mean_read_length;
+    Some((
+        read_sketch,
+        ReadSketchMeta {
+            num_reads: counter as u64,
+        },
+    ))
 }
 
 pub fn sketch_sequences_needle(
@@ -946,7 +1187,7 @@ pub fn sketch_sequences_needle(
     k: usize,
     sample_name: Option<String>,
     no_dedup: bool,
-) -> Option<SequencesSketch> {
+) -> Option<(SequencesSketch, ReadSketchMeta)> {
     let mut kmer_map = HashMap::default();
     let ref_file = &read_file;
     let reader = parse_fastx_file(&ref_file);
@@ -957,7 +1198,7 @@ pub fn sketch_sequences_needle(
 
     if !reader.is_ok() {
         warn!("{} is not a valid fasta/fastq file; skipping.", ref_file);
-        return None
+        return None;
     } else {
         let mut reader = reader.unwrap();
         while let Some(record) = reader.next() {
@@ -993,13 +1234,18 @@ pub fn sketch_sequences_needle(
         }
     }
 
-    return Some(SequencesSketch {
-        kmer_counts: kmer_map,
-        file_name: read_file.to_string(),
-        c,
-        k,
-        paired: false,
-        sample_name: sample_name,
-        mean_read_length,
-    });
+    return Some((
+        SequencesSketch {
+            kmer_counts: kmer_map,
+            file_name: read_file.to_string(),
+            c,
+            k,
+            paired: false,
+            sample_name: sample_name,
+            mean_read_length,
+        },
+        ReadSketchMeta {
+            num_reads: counter as u64,
+        },
+    ));
 }

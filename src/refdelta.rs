@@ -77,7 +77,7 @@ use std::sync::{Arc, Mutex};
 const REFDB_MAGIC: &[u8; 4] = b"SYLR";
 const REFDB_VERSION: u8 = 4;
 const SKETCH_MAGIC: &[u8; 4] = b"SYLD"; // reference-Delta sample
-const SKETCH_VERSION: u8 = 2;
+const SKETCH_VERSION: u8 = 3;
 
 const SCHEME_BITMASK: u8 = 0;
 const SCHEME_PRESENT_RICE: u8 = 1;
@@ -561,10 +561,16 @@ fn open_ref_index_with_mode<R: Read + Seek + Send + 'static>(
     let mut hdr = [0u8; HEADER_LEN as usize];
     r.read_exact(&mut hdr)?;
     if &hdr[0..4] != REFDB_MAGIC {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "not a sylph reference DB"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "not a sylph reference DB",
+        ));
     }
     if hdr[4] != REFDB_VERSION {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "unsupported reference DB version"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unsupported reference DB version",
+        ));
     }
     let footer_offset = u64::from_le_bytes(hdr[5..13].try_into().unwrap());
 
@@ -818,7 +824,10 @@ fn decode_subset<R: Read>(r: &mut R, domain: u64) -> io::Result<Vec<u64>> {
             }
             Ok(present)
         }
-        _ => Err(io::Error::new(io::ErrorKind::InvalidData, "bad subset scheme")),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "bad subset scheme",
+        )),
     }
 }
 
@@ -831,6 +840,16 @@ pub fn compress_seq<W: Write>(
     sketch: &SequencesSketch,
     idx: &RefIndex,
     ref_db_name: &str,
+) -> io::Result<()> {
+    compress_seq_with_meta(inner, sketch, idx, ref_db_name, ReadSketchMeta::default())
+}
+
+pub fn compress_seq_with_meta<W: Write>(
+    inner: W,
+    sketch: &SequencesSketch,
+    idx: &RefIndex,
+    ref_db_name: &str,
+    meta: ReadSketchMeta,
 ) -> io::Result<()> {
     // stage 1 -> stage 2: load the distinctive blocks of the hit genomes and
     // build a per-sample hash -> (genome, index) lookup over just those.
@@ -870,7 +889,11 @@ pub fn compress_seq<W: Write>(
         let v = per_genome.get_mut(&g).unwrap();
         v.sort_unstable();
         assigned_hits += v.len();
-        encode_subset(&mut hit_section, v, idx.genomes[g as usize].dense_domain as u64)?;
+        encode_subset(
+            &mut hit_section,
+            v,
+            idx.genomes[g as usize].dense_domain as u64,
+        )?;
     }
 
     // pool
@@ -910,6 +933,7 @@ pub fn compress_seq<W: Write>(
     }
     payload.push(sketch.paired as u8);
     payload.extend_from_slice(&sketch.mean_read_length.to_le_bytes());
+    write_uvarint(&mut payload, meta.num_reads)?;
     write_uvarint(&mut payload, hit_ids.len() as u64)?;
     write_uvarint(&mut payload, assigned_hits as u64)?;
     write_uvarint(&mut payload, pool_hits.len() as u64)?;
@@ -932,18 +956,31 @@ pub fn compress_seq<W: Write>(
 /// Decompress a reference-delta read sketch. Only the genomes referenced by the
 /// sample (plus the resident pool) are loaded from the index.
 pub fn decompress_seq<R: Read>(inner: R, idx: &RefIndex) -> io::Result<SequencesSketch> {
+    decompress_seq_with_meta(inner, idx).map(|(sketch, _)| sketch)
+}
+
+pub fn decompress_seq_with_meta<R: Read>(
+    inner: R,
+    idx: &RefIndex,
+) -> io::Result<(SequencesSketch, ReadSketchMeta)> {
     idx.ensure_can_decompress()?;
     let raw = zstd::stream::decode_all(inner)?;
     let mut r = &raw[..];
     let mut magic = [0u8; 4];
     r.read_exact(&mut magic)?;
     if &magic != SKETCH_MAGIC {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "not a reference-delta sketch"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "not a reference-delta sketch",
+        ));
     }
     let mut ver = [0u8; 1];
     r.read_exact(&mut ver)?;
     if ver[0] == 0 || ver[0] > SKETCH_VERSION {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "unsupported reference-delta version"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unsupported reference-delta version",
+        ));
     }
     let mut fp = [0u8; 8];
     r.read_exact(&mut fp)?;
@@ -971,6 +1008,13 @@ pub fn decompress_seq<R: Read>(inner: R, idx: &RefIndex) -> io::Result<Sequences
     let mut mrl = [0u8; 8];
     r.read_exact(&mut mrl)?;
     let mean_read_length = f64::from_le_bytes(mrl);
+    let meta = if ver[0] >= 3 {
+        ReadSketchMeta {
+            num_reads: read_uvarint(&mut r)?,
+        }
+    } else {
+        ReadSketchMeta::default()
+    };
 
     if ver[0] >= 2 {
         for _ in 0..8 {
@@ -1007,15 +1051,18 @@ pub fn decompress_seq<R: Read>(inner: R, idx: &RefIndex) -> io::Result<Sequences
         kmer_counts.insert(h, count);
     }
 
-    Ok(SequencesSketch {
-        kmer_counts,
-        c,
-        k,
-        file_name,
-        sample_name,
-        paired: paired[0] != 0,
-        mean_read_length,
-    })
+    Ok((
+        SequencesSketch {
+            kmer_counts,
+            c,
+            k,
+            file_name,
+            sample_name,
+            paired: paired[0] != 0,
+            mean_read_length,
+        },
+        meta,
+    ))
 }
 
 // --- CLI handlers -----------------------------------------------------------
@@ -1041,12 +1088,21 @@ fn load_seq_sketch(path: &str) -> SequencesSketch {
     }
 }
 
-fn compare_seq_sketches(original: &SequencesSketch, decoded: &SequencesSketch) -> Result<(), String> {
+fn compare_seq_sketches(
+    original: &SequencesSketch,
+    decoded: &SequencesSketch,
+) -> Result<(), String> {
     if original.c != decoded.c {
-        return Err(format!("c differs: original={} decoded={}", original.c, decoded.c));
+        return Err(format!(
+            "c differs: original={} decoded={}",
+            original.c, decoded.c
+        ));
     }
     if original.k != decoded.k {
-        return Err(format!("k differs: original={} decoded={}", original.k, decoded.k));
+        return Err(format!(
+            "k differs: original={} decoded={}",
+            original.k, decoded.k
+        ));
     }
     if original.file_name != decoded.file_name {
         return Err(format!(
@@ -1166,6 +1222,7 @@ struct RefSketchInspect {
     sample_name: String,
     paired: bool,
     mean_read_length: f64,
+    num_reads: Option<u64>,
     header_metadata_bytes: usize,
     hit_genomes: Option<u64>,
     assigned_to_genomes: Option<u64>,
@@ -1184,12 +1241,18 @@ fn inspect_ref_sketch(path: &str) -> io::Result<RefSketchInspect> {
     let mut magic = [0u8; 4];
     r.read_exact(&mut magic)?;
     if &magic != SKETCH_MAGIC {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "not a reference-delta sketch"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "not a reference-delta sketch",
+        ));
     }
     let mut ver = [0u8; 1];
     r.read_exact(&mut ver)?;
     if ver[0] == 0 || ver[0] > SKETCH_VERSION {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "unsupported reference-delta version"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unsupported reference-delta version",
+        ));
     }
     let mut fp = [0u8; 8];
     r.read_exact(&mut fp)?;
@@ -1214,6 +1277,11 @@ fn inspect_ref_sketch(path: &str) -> io::Result<RefSketchInspect> {
     let mut mrl = [0u8; 8];
     r.read_exact(&mut mrl)?;
     let mean_read_length = f64::from_le_bytes(mrl);
+    let num_reads = if ver[0] >= 3 {
+        Some(read_uvarint(&mut r)?)
+    } else {
+        None
+    };
 
     let (
         hit_genomes,
@@ -1253,6 +1321,7 @@ fn inspect_ref_sketch(path: &str) -> io::Result<RefSketchInspect> {
         sample_name,
         paired: paired[0] != 0,
         mean_read_length,
+        num_reads,
         header_metadata_bytes,
         hit_genomes,
         assigned_to_genomes,
@@ -1271,7 +1340,7 @@ fn opt_u64(x: Option<u64>) -> String {
 
 fn run_ref_inspect(files: &[String]) {
     println!(
-        "file\tversion\tcompressed_bytes\tpayload_bytes\treference_fingerprint\treference_db\tsample_file\tsample_name\tc\tk\tpaired\tmean_read_length\theader_metadata_payload_bytes\thit_genomes\tassigned_to_genomes\tshared_pool\tnovel\ttotal_hashes\thit_section_payload_bytes\tpool_section_payload_bytes\tnovel_section_payload_bytes\tcount_section_payload_bytes"
+        "file\tversion\tcompressed_bytes\tpayload_bytes\treference_fingerprint\treference_db\tsample_file\tsample_name\tc\tk\tpaired\tmean_read_length\tnum_reads\theader_metadata_payload_bytes\thit_genomes\tassigned_to_genomes\tshared_pool\tnovel\ttotal_hashes\thit_section_payload_bytes\tpool_section_payload_bytes\tnovel_section_payload_bytes\tcount_section_payload_bytes"
     );
     for f in files {
         let x = inspect_ref_sketch(f).unwrap_or_else(|e| panic!("Failed to inspect {}: {}", f, e));
@@ -1280,7 +1349,7 @@ fn run_ref_inspect(files: &[String]) {
             _ => "-".to_string(),
         };
         println!(
-            "{}\t{}\t{}\t{}\t{:016x}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{:016x}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             x.path,
             x.version,
             x.compressed_bytes,
@@ -1293,6 +1362,7 @@ fn run_ref_inspect(files: &[String]) {
             x.k,
             x.paired,
             x.mean_read_length,
+            opt_u64(x.num_reads),
             x.header_metadata_bytes,
             opt_u64(x.hit_genomes),
             opt_u64(x.assigned_to_genomes),
@@ -1310,16 +1380,22 @@ fn run_ref_inspect(files: &[String]) {
 fn run_ref_verify(files: &[String], idx: &RefIndex) {
     for f in files {
         let ref_path = Path::new(f);
-        let inspect = inspect_ref_sketch(f).unwrap_or_else(|e| panic!("Failed to inspect {}: {}", f, e));
+        let inspect =
+            inspect_ref_sketch(f).unwrap_or_else(|e| panic!("Failed to inspect {}: {}", f, e));
         let original_path = find_original_sketch_path(ref_path, &inspect.sample_file)
             .unwrap_or_else(|e| panic!("Failed to locate original sketch for {}: {}", f, e));
-        let original = load_seq_sketch(
-            original_path
-                .to_str()
-                .unwrap_or_else(|| panic!("Original sketch path is not valid UTF-8: {:?}", original_path)),
-        );
-        verify_ref_sketch(ref_path, &original, idx)
-            .unwrap_or_else(|e| panic!("Verification failed for {} against {:?}: {}", f, original_path, e));
+        let original = load_seq_sketch(original_path.to_str().unwrap_or_else(|| {
+            panic!(
+                "Original sketch path is not valid UTF-8: {:?}",
+                original_path
+            )
+        }));
+        verify_ref_sketch(ref_path, &original, idx).unwrap_or_else(|e| {
+            panic!(
+                "Verification failed for {} against {:?}: {}",
+                f, original_path, e
+            )
+        });
         info!("Verified {} against {:?}", f, original_path);
     }
 }
@@ -1353,7 +1429,10 @@ fn parse_taxonomy(path: &str) -> FxHashMap<String, (String, bool)> {
                 std::process::exit(1);
             }
         };
-        map.insert(cols[0].trim().to_string(), (cols[1].trim().to_string(), is_rep));
+        map.insert(
+            cols[0].trim().to_string(),
+            (cols[1].trim().to_string(), is_rep),
+        );
     }
     map
 }
@@ -1561,7 +1640,8 @@ pub fn run_ref_build(args: RefBuildArgs) {
         .map(|i| {
             BufWriter::with_capacity(
                 1 << 16,
-                File::create(shard_path(i)).unwrap_or_else(|e| panic!("Could not create scratch shard: {}", e)),
+                File::create(shard_path(i))
+                    .unwrap_or_else(|e| panic!("Could not create scratch shard: {}", e)),
             )
         })
         .collect();
@@ -1608,7 +1688,8 @@ pub fn run_ref_build(args: RefBuildArgs) {
         });
     }
     for mut w in writers {
-        w.flush().unwrap_or_else(|e| panic!("Failed to flush scratch shard: {}", e));
+        w.flush()
+            .unwrap_or_else(|e| panic!("Failed to flush scratch shard: {}", e));
     }
 
     let ng = meta.len();
@@ -1617,7 +1698,10 @@ pub fn run_ref_build(args: RefBuildArgs) {
         error!("No genome sketches found; exiting");
         std::process::exit(1);
     }
-    info!("Routed {} genomes ({} k-mers) into {} partitions; assigning owners...", ng, total_instances, p);
+    info!(
+        "Routed {} genomes ({} k-mers) into {} partitions; assigning owners...",
+        ng, total_instances, p
+    );
 
     // build order (species, reps first, then file name) and file-id -> genome-id remap
     let mut order: Vec<usize> = (0..ng).collect();
@@ -1687,7 +1771,8 @@ pub fn run_ref_build(args: RefBuildArgs) {
         sparse_div
     );
 
-    let w = BufWriter::new(File::create(&out).unwrap_or_else(|_| panic!("Could not create {}", out)));
+    let w =
+        BufWriter::new(File::create(&out).unwrap_or_else(|_| panic!("Could not create {}", out)));
     write_refdb(w, &db, sparse_div).unwrap_or_else(|e| panic!("Failed to write {}: {}", out, e));
     info!("Wrote reference database to {}", out);
 }
@@ -1756,14 +1841,16 @@ pub fn run_ref_compress(args: RefCompressArgs) {
         return;
     }
 
-    std::fs::create_dir_all(&args.output_dir)
-        .expect("Could not create output directory; exiting");
+    std::fs::create_dir_all(&args.output_dir).expect("Could not create output directory; exiting");
 
     let outdir = Path::new(&args.output_dir);
     let counter = Mutex::new(0usize);
     if args.decompress {
         args.files.par_iter().for_each(|f| {
-            let r = BufReader::with_capacity(10_000_000, File::open(f).unwrap_or_else(|_| panic!("Could not open {}", f)));
+            let r = BufReader::with_capacity(
+                10_000_000,
+                File::open(f).unwrap_or_else(|_| panic!("Could not open {}", f)),
+            );
             let sketch = decompress_seq(r, &idx).unwrap_or_else(|e| {
                 error!("Failed to decompress {}: {}", f, e);
                 std::process::exit(1);
@@ -1771,7 +1858,9 @@ pub fn run_ref_compress(args: RefCompressArgs) {
             let base = Path::new(f).file_name().unwrap().to_str().unwrap();
             let stem = base.strip_suffix(REF_SAMPLE_SUFFIX).unwrap_or(base);
             let out = outdir.join(format!("{}{}", stem, SAMPLE_FILE_SUFFIX));
-            let mut w = BufWriter::new(File::create(&out).unwrap_or_else(|_| panic!("Could not create {:?}", out)));
+            let mut w = BufWriter::new(
+                File::create(&out).unwrap_or_else(|_| panic!("Could not create {:?}", out)),
+            );
             bincode::serialize_into(&mut w, &sketch).unwrap();
             let mut c = counter.lock().unwrap();
             *c += 1;
@@ -1786,7 +1875,9 @@ pub fn run_ref_compress(args: RefCompressArgs) {
                 .or_else(|| base.strip_suffix(SAMPLE_COMP_FILE_SUFFIX))
                 .unwrap_or(base);
             let out = outdir.join(format!("{}{}", stem, REF_SAMPLE_SUFFIX));
-            let w = BufWriter::new(File::create(&out).unwrap_or_else(|_| panic!("Could not create {:?}", out)));
+            let w = BufWriter::new(
+                File::create(&out).unwrap_or_else(|_| panic!("Could not create {:?}", out)),
+            );
             compress_seq(w, &sketch, &idx, ref_db)
                 .unwrap_or_else(|e| panic!("Failed to compress {}: {}", f, e));
             let mut c = counter.lock().unwrap();
