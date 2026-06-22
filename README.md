@@ -119,6 +119,18 @@ To incorporate *taxonomy* into sylph's outputs, see the [sylph-tax repository](h
 > [!TIP] 
 > The new [sylph-tax](https://github.com/bluenote-1577/sylph-tax) program replaces the old [sylph-utils](https://github.com/bluenote-1577/sylph-utils) repository. 
 
+## Development
+
+Tests and formatting are checked in CI (`cargo fmt --check` and `cargo test`) on every push and pull request.
+
+A versioned pre-commit hook is provided to reject commits with unformatted Rust code. After cloning, enable it once with:
+
+```sh
+git config core.hooksPath .githooks
+```
+
+The hook runs `cargo fmt --all -- --check`; run `cargo fmt` to fix formatting before committing.
+
 ## Changelog
 
 #### Version v0.8.0 - 2024-12-12. 

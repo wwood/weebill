@@ -1,0 +1,9 @@
+#!/bin/sh
+# Pre-commit hook: reject the commit if Rust code is not formatted.
+# Run `cargo fmt` to fix, then re-commit.
+
+if ! cargo fmt --all -- --check; then
+    echo
+    echo "error: Rust code is not formatted. Run 'cargo fmt' and re-stage your changes." >&2
+    exit 1
+fi
