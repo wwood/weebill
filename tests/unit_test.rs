@@ -1,9 +1,9 @@
 use assert_cmd::prelude::*; // Add methods on commands
-use sylph::seeding;
+use fxhash::FxHashMap;
 use sylph::compress;
 use sylph::refdelta;
+use sylph::seeding;
 use sylph::types::{GenomeSketch, SequencesSketch};
-use fxhash::FxHashMap;
 
 fn gsketch(file_name: &str, kmers: Vec<u64>) -> GenomeSketch {
     GenomeSketch {
@@ -105,7 +105,15 @@ fn refdelta_compress_decompress_roundtrip() {
 
     // distinctive hits + pool hit + novel hashes + counts
     let mut counts: FxHashMap<u64, u32> = FxHashMap::default();
-    for (h, c) in [(1u64, 5u32), (2, 3), (100, 7), (200, 2), (500, 4), (999, 1), (98765, 9)] {
+    for (h, c) in [
+        (1u64, 5u32),
+        (2, 3),
+        (100, 7),
+        (200, 2),
+        (500, 4),
+        (999, 1),
+        (98765, 9),
+    ] {
         counts.insert(h, c);
     }
     let sketch = SequencesSketch {
@@ -216,7 +224,11 @@ fn compress_genome_roundtrip() {
 
     let mut buf = Vec::new();
     compress::write_genome_sketches_compressed(&mut buf, &sketches).unwrap();
-    assert_eq!(&buf[..4], b"SYLZ", "compressed output must start with SYLZ magic");
+    assert_eq!(
+        &buf[..4],
+        b"SYLZ",
+        "compressed output must start with SYLZ magic"
+    );
     let decoded = compress::read_genome_sketches_compressed(&buf[..]).unwrap();
 
     assert_eq!(decoded.len(), sketches.len());
@@ -230,9 +242,15 @@ fn compress_genome_roundtrip() {
 
         let mut a = orig.genome_kmers.clone();
         a.sort_unstable();
-        assert_eq!(a, dec.genome_kmers, "genome_kmers must match as a sorted multiset");
+        assert_eq!(
+            a, dec.genome_kmers,
+            "genome_kmers must match as a sorted multiset"
+        );
 
-        match (&orig.pseudotax_tracked_nonused_kmers, &dec.pseudotax_tracked_nonused_kmers) {
+        match (
+            &orig.pseudotax_tracked_nonused_kmers,
+            &dec.pseudotax_tracked_nonused_kmers,
+        ) {
             (Some(oa), Some(da)) => {
                 let mut oa = oa.clone();
                 oa.sort_unstable();
@@ -279,7 +297,10 @@ fn compress_seq_roundtrip() {
     };
     let mut buf2 = Vec::new();
     compress::write_seq_sketch_compressed(&mut buf2, &sketch2).unwrap();
-    assert_eq!(sketch2, compress::read_seq_sketch_compressed(&buf2[..]).unwrap());
+    assert_eq!(
+        sketch2,
+        compress::read_seq_sketch_compressed(&buf2[..]).unwrap()
+    );
 }
 
 #[test]
@@ -306,8 +327,7 @@ fn compress_detection_does_not_collide_with_legacy() {
     assert!(!compress::peek_is_compressed(&mut slice2).unwrap());
 }
 
-fn test_hash(){
-
+fn test_hash() {
     let key = 19238239812933123;
     println!("{}", format!("{key:b}"));
     let h = seeding::mm_hash64(key);
@@ -316,18 +336,17 @@ fn test_hash(){
     println!("{}", format!("{rev:b}"));
     assert!(rev == key);
 
-    if is_x86_feature_detected!("avx2"){
-        unsafe{
+    if is_x86_feature_detected!("avx2") {
+        unsafe {
             let key = key as i64;
             println!("{}", format!("{key:b}"));
             use std::arch::x86_64::*;
             use sylph::avx2_seeding::*;
             let mut rolling_kmer_f_marker = _mm256_set_epi64x(0, 0, 0, key);
-                let hash_256 = mm_hash256(rolling_kmer_f_marker);
-                let v1 = _mm256_extract_epi64(hash_256, 0);
-                println!("{}", format!("{v1:b}"));
-                assert!(v1 == h as i64);
+            let hash_256 = mm_hash256(rolling_kmer_f_marker);
+            let v1 = _mm256_extract_epi64(hash_256, 0);
+            println!("{}", format!("{v1:b}"));
+            assert!(v1 == h as i64);
         }
-
     }
 }

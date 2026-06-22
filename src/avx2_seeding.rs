@@ -1,5 +1,5 @@
-use std::arch::x86_64::*;
 use crate::types::*;
+use std::arch::x86_64::*;
 
 #[inline]
 #[target_feature(enable = "avx2")]
@@ -39,7 +39,7 @@ pub unsafe fn extract_markers_avx2(string: &[u8], kmer_vec: &mut Vec<u64>, c: us
     let string2 = &string[len..2 * len + k - 1];
     let string3 = &string[2 * len..3 * len + k - 1];
     let string4 = &string[3 * len..4 * len + k - 1];
-    if string.len() < k+1{
+    if string.len() < k + 1 {
         return;
     }
 
@@ -148,7 +148,13 @@ pub unsafe fn extract_markers_avx2(string: &[u8], kmer_vec: &mut Vec<u64>, c: us
 }
 
 #[target_feature(enable = "avx2")]
-pub unsafe fn extract_markers_avx2_positions(string: &[u8], kmer_vec: &mut Vec<(usize, usize,u64)>, c: usize, k: usize, contig_number: usize) {
+pub unsafe fn extract_markers_avx2_positions(
+    string: &[u8],
+    kmer_vec: &mut Vec<(usize, usize, u64)>,
+    c: usize,
+    k: usize,
+    contig_number: usize,
+) {
     if string.len() < k {
         return;
     }
@@ -257,10 +263,10 @@ pub unsafe fn extract_markers_avx2_positions(string: &[u8], kmer_vec: &mut Vec<(
             kmer_vec.push((contig_number, len + i, v2 as u64));
         }
         if v3 < threshold_marker {
-            kmer_vec.push((contig_number, 2*len + i, v3 as u64));
+            kmer_vec.push((contig_number, 2 * len + i, v3 as u64));
         }
         if v4 < threshold_marker {
-            kmer_vec.push((contig_number, 3*len + i, v4 as u64));
+            kmer_vec.push((contig_number, 3 * len + i, v4 as u64));
         }
     }
 }

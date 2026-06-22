@@ -1,6 +1,6 @@
 pub const EM_ABUND_CUTOFF: f64 = 0.01;
 pub const PAIR_REGEX: &str = r"(.+)(_?1|_?2)(\..+)";
-pub const CUTOFF_PVALUE:f64 = 0.9999999999;
+pub const CUTOFF_PVALUE: f64 = 0.9999999999;
 pub const SAMPLE_SIZE_CUTOFF: usize = 25;
 pub const MEDIAN_ANI_THRESHOLD: f64 = 2.;
 pub const QUERY_FILE_SUFFIX: &str = ".syldb";
@@ -9,8 +9,10 @@ pub const QUERY_COMP_FILE_SUFFIX: &str = ".syldbc";
 pub const SAMPLE_COMP_FILE_SUFFIX: &str = ".sylspc";
 pub const REF_DB_SUFFIX: &str = ".sylref";
 pub const REF_SAMPLE_SUFFIX: &str = ".sylspr";
-pub const QUERY_FILE_SUFFIX_VALID : [&str;3] = [QUERY_FILE_SUFFIX, ".sylqueries", QUERY_COMP_FILE_SUFFIX];
-pub const SAMPLE_FILE_SUFFIX_VALID : [&str;3] = [SAMPLE_FILE_SUFFIX, ".sylsample", SAMPLE_COMP_FILE_SUFFIX];
+pub const QUERY_FILE_SUFFIX_VALID: [&str; 3] =
+    [QUERY_FILE_SUFFIX, ".sylqueries", QUERY_COMP_FILE_SUFFIX];
+pub const SAMPLE_FILE_SUFFIX_VALID: [&str; 3] =
+    [SAMPLE_FILE_SUFFIX, ".sylsample", SAMPLE_COMP_FILE_SUFFIX];
 pub const MIN_ANI_DEF: f64 = 0.9;
 pub const MIN_ANI_P_DEF: f64 = 0.95;
 pub const MAX_MEDIAN_FOR_MEAN_FINAL_EST: f64 = 15.;
