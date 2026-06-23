@@ -25,6 +25,16 @@ sub-commands are sylph's). This fork adds smaller-on-disk sketch formats while k
   `.sylspr` samples directly via `--reference <ref.sylref>`. `ref-build` is streaming and parallel
   with RAM bounded by `--max-ram`, and the two-stage `.sylref` loads only the genome blocks a sample
   needs. `ref-compress` also supports `--decompress`, `inspect`, and `verify` modes.
+- **Error-k-mer encoding** — `ref-build --store-genomes` additionally stores each species
+  representative's nucleotide sequence (2-bit packed, ~0.25 byte/bp) in the `.sylref`. `ref-compress`
+  then recognises sample hashes that are a *single-base substitution* of a reference k-mer — the
+  dominant kind of sequencing-error hash — and stores them as compact `(genome position, k-mer
+  offset, replacement base)` triples (positions sorted and Golomb–Rice delta-coded, the three fields
+  in separate arrays for the zstd wrapper) instead of full-price "novel" hashes. The genome sequence
+  itself acts as the perfect-hash fingerprint, so matches are reconstructed exactly and the round trip
+  stays lossless. On 100× Illumina-like reads at 0.5% error this roughly halves the `.sylspr`
+  (~91% of non-reference hashes are single-error k-mers); the cost is the one-time per-reference
+  genome storage, amortised across all samples compressed against it.
 - **`weebill merge`** — a new sub-command that merges several sample sketches into a single sketch
   (summing per-genome k-mer counts). It reads any mix of legacy (`.sylsp`), compressed (`.sylspc`),
   and reference-compressed (`.sylspr`, via `--reference`) inputs, and can write the result in any of

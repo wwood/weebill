@@ -14,6 +14,41 @@ pub fn mm_hash64(kmer: u64) -> u64 {
     key
 }
 
+/// Exact inverse of [`mm_hash64`]. The first forward step is `!(key + (key << 21))`
+/// (an operator-precedence quirk preserved for sketch compatibility), so this is
+/// deliberately NOT the same as [`rev_hash_64`], which inverts the *intended*
+/// `(!key) + (key << 21)` and therefore does not actually invert `mm_hash64`.
+/// `rev_mm_hash64(mm_hash64(x)) == x` for every `u64 x`.
+#[inline]
+pub fn rev_mm_hash64(hashed_key: u64) -> u64 {
+    let mut key = hashed_key;
+    // invert: key = key.wrapping_add(key << 31)
+    let mut tmp = key.wrapping_sub(key << 31);
+    key = key.wrapping_sub(tmp << 31);
+    // invert: key = key ^ key >> 28
+    tmp = key ^ key >> 28;
+    key = key ^ tmp >> 28;
+    // invert: key = key.wrapping_mul(21)
+    key = key.wrapping_mul(14933078535860113213u64);
+    // invert: key = key ^ key >> 14
+    tmp = key ^ key >> 14;
+    tmp = key ^ tmp >> 14;
+    tmp = key ^ tmp >> 14;
+    key = key ^ tmp >> 14;
+    // invert: key = key.wrapping_mul(265)
+    key = key.wrapping_mul(15244667743933553977u64);
+    // invert: key = key ^ key >> 24
+    tmp = key ^ key >> 24;
+    key = key ^ tmp >> 24;
+    // invert: key = !(key + (key << 21)); recover x from w = x + (x << 21)
+    let w = !key;
+    let mut x = w;
+    for _ in 0..6 {
+        x = w.wrapping_sub(x << 21);
+    }
+    x
+}
+
 #[inline]
 pub fn rev_hash_64(hashed_key: u64) -> u64 {
     let mut key = hashed_key;

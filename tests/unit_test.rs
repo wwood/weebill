@@ -2,8 +2,9 @@ use assert_cmd::prelude::*; // Add methods on commands
 use fxhash::FxHashMap;
 use sylph::compress;
 use sylph::refdelta;
+use sylph::refdelta::{GenomeSeq, GenomeSource};
 use sylph::seeding;
-use sylph::types::{GenomeSketch, SequencesSketch};
+use sylph::types::{GenomeSketch, SequencesSketch, BYTE_TO_SEQ};
 
 fn gsketch(file_name: &str, kmers: Vec<u64>) -> GenomeSketch {
     GenomeSketch {
@@ -70,10 +71,14 @@ fn refdelta_pool_min_genomes_assigns_pairs_to_first_owner() {
     assert_eq!(db.pool, vec![20]);
 }
 
+fn write_refdb_to_vec(db: &refdelta::RefDb, sparse_div: u64) -> Vec<u8> {
+    let mut cur = std::io::Cursor::new(Vec::new());
+    refdelta::write_refdb(&mut cur, db, sparse_div).unwrap();
+    cur.into_inner()
+}
+
 fn open_index(db: &refdelta::RefDb, sparse_div: u64) -> refdelta::RefIndex {
-    let mut dbuf = Vec::new();
-    refdelta::write_refdb(&mut dbuf, db, sparse_div).unwrap();
-    refdelta::open_ref_index(std::io::Cursor::new(dbuf)).unwrap()
+    refdelta::open_ref_index(std::io::Cursor::new(write_refdb_to_vec(db, sparse_div))).unwrap()
 }
 
 fn refdelta_roundtrip(sketch: &SequencesSketch, idx: &refdelta::RefIndex) {
@@ -174,6 +179,174 @@ fn refdelta_compress_decompress_roundtrip() {
             mean_read_length: 100.0,
         },
         &idx_sparse,
+    );
+}
+
+/// Build the error-k-mer test fixture: a random single-contig genome, its
+/// FracMinHash sketch, and a `.sylref` (opened) that stores the genome sequence.
+fn error_kmer_fixture(
+    seed: u64,
+    len: usize,
+    c: usize,
+    k: usize,
+) -> (Vec<u8>, Vec<u64>, refdelta::RefIndex) {
+    // deterministic random ACGT genome
+    let bases = [b'A', b'C', b'G', b'T'];
+    let mut state = seed | 1;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let genome: Vec<u8> = (0..len).map(|_| bases[(next() % 4) as usize]).collect();
+
+    let mut kmers = Vec::new();
+    seeding::fmh_seeds(&genome, &mut kmers, c, k);
+    kmers.sort_unstable();
+    kmers.dedup();
+
+    let gsketch = GenomeSketch {
+        genome_kmers: kmers.clone(),
+        pseudotax_tracked_nonused_kmers: None,
+        file_name: "ecoli_like.fa".to_string(),
+        first_contig_name: "c".to_string(),
+        c,
+        k,
+        gn_size: len,
+        min_spacing: 0,
+    };
+    let tax: FxHashMap<String, (String, bool)> = FxHashMap::default();
+    let mut db = refdelta::build_refdb(&[gsketch], &tax);
+    // store the genome sequence (codes) for the single representative (id 0)
+    let codes: Vec<u8> = genome.iter().map(|&b| BYTE_TO_SEQ[b as usize]).collect();
+    db.rep_seqs = vec![Some(GenomeSource::InMemory(GenomeSeq {
+        contigs: vec![codes],
+    }))];
+
+    let idx = refdelta::open_ref_index(std::io::Cursor::new(write_refdb_to_vec(&db, 1))).unwrap();
+    assert!(idx.has_genome_seqs());
+    (genome, kmers, idx)
+}
+
+#[test]
+fn rev_mm_hash64_inverts_mm_hash64() {
+    // exact inverse over arbitrary u64s ...
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    for _ in 0..100_000 {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        assert_eq!(seeding::rev_mm_hash64(seeding::mm_hash64(state)), state);
+    }
+    // ... and specifically over canonical k=31 k-mer values (the masked domain the
+    // error-k-mer decoder relies on)
+    let mask = (1u64 << 62) - 1;
+    let mut s = 1u64;
+    for _ in 0..100_000 {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        let kmer = s & mask;
+        assert_eq!(
+            seeding::rev_mm_hash64(seeding::mm_hash64(kmer)) & mask,
+            kmer
+        );
+    }
+}
+
+#[test]
+fn refdelta_error_kmer_roundtrip_and_savings() {
+    let (c, k) = (20usize, 31usize);
+    let (genome, genome_kmers, idx) = error_kmer_fixture(0x1234_5678, 40_000, c, k);
+
+    // Mutate the genome at positions spaced > k apart, so every changed k-mer
+    // window contains exactly one substitution: a single-base variant of a real
+    // genome k-mer. Sketching the mutated genome yields those error k-mers.
+    let mut mutated = genome.clone();
+    let bases = [b'A', b'C', b'G', b'T'];
+    let mut p = 200usize;
+    while p < mutated.len() - 1 {
+        let orig = mutated[p];
+        // pick a different base deterministically
+        let nb = bases.iter().find(|&&b| b != orig).copied().unwrap();
+        mutated[p] = nb;
+        p += 2 * k + 7; // spacing > k
+    }
+    let mut mutated_kmers = Vec::new();
+    seeding::fmh_seeds(&mutated, &mut mutated_kmers, c, k);
+    mutated_kmers.sort_unstable();
+    mutated_kmers.dedup();
+
+    let genome_set: std::collections::HashSet<u64> = genome_kmers.iter().copied().collect();
+    let error_kmers: Vec<u64> = mutated_kmers
+        .iter()
+        .copied()
+        .filter(|h| !genome_set.contains(h))
+        .collect();
+    assert!(
+        error_kmers.len() > 20,
+        "fixture should produce many error k-mers, got {}",
+        error_kmers.len()
+    );
+
+    // Sample = all real genome k-mers (guarantees the genome is a hit) + error
+    // k-mers + one hash that is genuinely novel.
+    let mut counts: FxHashMap<u64, u32> = FxHashMap::default();
+    for &h in &genome_kmers {
+        counts.insert(h, 3);
+    }
+    for (i, &h) in error_kmers.iter().enumerate() {
+        counts.insert(h, (i % 4 + 1) as u32);
+    }
+    let genuinely_novel = 0xDEAD_BEEF_0000_0001u64 % (u64::MAX / c as u64);
+    counts.entry(genuinely_novel).or_insert(7);
+
+    let sketch = SequencesSketch {
+        kmer_counts: counts,
+        c,
+        k,
+        file_name: "reads.fq".into(),
+        sample_name: Some("s".into()),
+        paired: false,
+        mean_read_length: 150.0,
+    };
+
+    // round trip is lossless
+    let mut buf = Vec::new();
+    refdelta::compress_seq(&mut buf, &sketch, &idx, "ref.sylref").unwrap();
+    let decoded = refdelta::decompress_seq(&buf[..], &idx).unwrap();
+    assert_eq!(sketch, decoded, "error-k-mer sketch must roundtrip exactly");
+
+    // compressing against a reference WITHOUT stored genomes (no error encoding)
+    // must be larger: the error k-mers fall back to full-price novel coding.
+    let tax: FxHashMap<String, (String, bool)> = FxHashMap::default();
+    let plain_db = refdelta::build_refdb(
+        &[GenomeSketch {
+            genome_kmers: genome_kmers.clone(),
+            pseudotax_tracked_nonused_kmers: None,
+            file_name: "ecoli_like.fa".to_string(),
+            first_contig_name: "c".to_string(),
+            c,
+            k,
+            gn_size: genome.len(),
+            min_spacing: 0,
+        }],
+        &tax,
+    );
+    let plain_idx =
+        refdelta::open_ref_index(std::io::Cursor::new(write_refdb_to_vec(&plain_db, 1))).unwrap();
+    assert!(!plain_idx.has_genome_seqs());
+    let mut buf_plain = Vec::new();
+    refdelta::compress_seq(&mut buf_plain, &sketch, &plain_idx, "ref.sylref").unwrap();
+    let decoded_plain = refdelta::decompress_seq(&buf_plain[..], &plain_idx).unwrap();
+    assert_eq!(sketch, decoded_plain);
+
+    assert!(
+        buf.len() < buf_plain.len(),
+        "error-k-mer encoding should be smaller: with-genomes={} no-genomes={}",
+        buf.len(),
+        buf_plain.len()
     );
 }
 

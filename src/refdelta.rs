@@ -64,9 +64,10 @@ use crate::compress::{
     write_string, write_uvarint,
 };
 use crate::constants::*;
+use crate::seeding::{mm_hash64, rev_mm_hash64};
 use crate::types::*;
 use boomphf::Mphf;
-use fxhash::FxHashMap;
+use fxhash::{FxHashMap, FxHashSet};
 use log::*;
 use rayon::prelude::*;
 use std::fs::File;
@@ -75,9 +76,13 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 const REFDB_MAGIC: &[u8; 4] = b"SYLR";
-const REFDB_VERSION: u8 = 4;
+/// v5 adds an optional per-rep-genome 2-bit nucleotide section (`--store-genomes`)
+/// used by error-k-mer encoding. v4 files (no genomes) are still readable.
+const REFDB_VERSION: u8 = 5;
+const REFDB_MIN_VERSION: u8 = 4;
 const SKETCH_MAGIC: &[u8; 4] = b"SYLD"; // reference-Delta sample
-const SKETCH_VERSION: u8 = 3;
+/// v4 adds the single-substitution error-k-mer section. v3 samples still decode.
+const SKETCH_VERSION: u8 = 4;
 
 const SCHEME_BITMASK: u8 = 0;
 const SCHEME_PRESENT_RICE: u8 = 1;
@@ -118,6 +123,167 @@ pub struct RefDb {
     pub distinctive: Vec<Vec<u64>>,
     /// Shared-pool hashes (after rep preference), sorted and deduplicated.
     pub pool: Vec<u64>,
+    /// Optional nucleotide-sequence source per genome (only set for species
+    /// representatives, used by error-k-mer encoding). `rep_seqs[g] == None` for
+    /// a genome with no stored sequence. An empty vec means "no genomes stored".
+    /// At write time each source is read/packed and streamed to disk one genome
+    /// at a time, so building a reference over hundreds of thousands of genomes
+    /// never holds every sequence in RAM.
+    pub rep_seqs: Vec<Option<GenomeSource>>,
+}
+
+/// Where a genome's nucleotide sequence comes from when writing the reference.
+#[derive(Clone, Debug, PartialEq)]
+pub enum GenomeSource {
+    /// Already-decoded sequence (used by tests and small inputs).
+    InMemory(GenomeSeq),
+    /// A FASTA path read and 2-bit packed on demand at write time (streaming).
+    Path(String),
+}
+
+/// A genome's nucleotide sequence, one `Vec` of 2-bit base codes (0=A,1=C,2=G,
+/// 3=T; any non-ACGT base maps to 0, exactly as the sketcher does) per contig.
+/// K-mers never span contigs.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GenomeSeq {
+    pub contigs: Vec<Vec<u8>>,
+}
+
+impl GenomeSeq {
+    /// Cumulative base offset of each contig (so a global base index uniquely maps
+    /// back to a single contig and local position). `cum[i]` = sum of contig
+    /// lengths < `i`; the final entry is the total base count.
+    fn cumulative(&self) -> Vec<u64> {
+        let mut cum = Vec::with_capacity(self.contigs.len() + 1);
+        let mut acc = 0u64;
+        cum.push(0);
+        for c in &self.contigs {
+            acc += c.len() as u64;
+            cum.push(acc);
+        }
+        cum
+    }
+
+    /// Map a global base index (a k-mer start) to `(contig, local_start)`.
+    fn locate(&self, cum: &[u64], global: u64) -> (usize, usize) {
+        // contigs are few; a linear scan with the precomputed prefix sums is fine.
+        let mut ci = 0;
+        while ci + 1 < cum.len() && cum[ci + 1] <= global {
+            ci += 1;
+        }
+        (ci, (global - cum[ci]) as usize)
+    }
+}
+
+/// Forward and reverse-complement 2-bit packings of the k-mer at `codes[start..start+k]`,
+/// matching `seeding::fmh_seeds` exactly: the forward k-mer has base 0 in the high
+/// bits, the reverse complement is built from the per-base complements.
+#[inline]
+fn window_fr(codes: &[u8], start: usize, k: usize) -> (u64, u64) {
+    let mut f = 0u64;
+    let mut r = 0u64;
+    for j in 0..k {
+        let nuc_f = codes[start + j] as u64;
+        let nuc_r = 3 - nuc_f;
+        f = (f << 2) | nuc_f;
+        r |= nuc_r << (2 * j);
+    }
+    (f, r)
+}
+
+/// The canonical (min of forward / reverse-complement) FracMinHash hash of the
+/// k-mer at `start` with the base at offset `off` replaced by `base`. Mirrors the
+/// read sketcher so a reconstructed error k-mer hashes identically.
+#[inline]
+fn substituted_hash(f: u64, r: u64, k: usize, off: usize, base: u8) -> u64 {
+    let shift_f = 2 * (k - 1 - off);
+    let shift_r = 2 * off;
+    let f2 = (f & !(3u64 << shift_f)) | ((base as u64) << shift_f);
+    let r2 = (r & !(3u64 << shift_r)) | (((3 - base) as u64) << shift_r);
+    mm_hash64(f2.min(r2))
+}
+
+// --- genome sequence (de)serialization (2-bit packed) -----------------------
+
+/// Read a FASTA/FASTQ into a `GenomeSeq` of 2-bit base codes (one code per byte),
+/// matching the sketcher's `BYTE_TO_SEQ` mapping. Returns `None` if unreadable.
+fn read_genome_seq_from_fasta(path: &str) -> Option<GenomeSeq> {
+    let reader = needletail::parse_fastx_file(path);
+    let mut reader = match reader {
+        Ok(r) => r,
+        Err(_) => return None,
+    };
+    let mut contigs = Vec::new();
+    while let Some(record) = reader.next() {
+        let record = match record {
+            Ok(r) => r,
+            Err(_) => return None,
+        };
+        let seq = record.seq();
+        let codes: Vec<u8> = seq.iter().map(|&b| BYTE_TO_SEQ[b as usize]).collect();
+        contigs.push(codes);
+    }
+    Some(GenomeSeq { contigs })
+}
+
+/// Serialize a genome's contigs as: contig count, then per contig its base length
+/// followed by the 2-bit-packed bases (4 bases/byte, contig-aligned).
+fn write_genome_seq_block<W: Write>(w: &mut W, seq: &GenomeSeq) -> io::Result<()> {
+    write_uvarint(w, seq.contigs.len() as u64)?;
+    for contig in &seq.contigs {
+        write_uvarint(w, contig.len() as u64)?;
+        let mut byte = 0u8;
+        let mut nfilled = 0u8;
+        for &code in contig {
+            byte |= (code & 3) << (2 * nfilled);
+            nfilled += 1;
+            if nfilled == 4 {
+                w.write_all(&[byte])?;
+                byte = 0;
+                nfilled = 0;
+            }
+        }
+        if nfilled > 0 {
+            w.write_all(&[byte])?;
+        }
+    }
+    Ok(())
+}
+
+/// Materialize a genome source and serialize it into a self-contained block, or
+/// `None` if a `Path` source cannot be read (that genome then simply gets no
+/// stored sequence and falls back to full-price coding).
+fn genome_block_bytes(src: &GenomeSource) -> io::Result<Option<Vec<u8>>> {
+    let seq = match src {
+        GenomeSource::InMemory(s) => Some(s.clone()),
+        GenomeSource::Path(p) => read_genome_seq_from_fasta(p),
+    };
+    match seq {
+        Some(s) => {
+            let mut v = Vec::new();
+            write_genome_seq_block(&mut v, &s)?;
+            Ok(Some(v))
+        }
+        None => Ok(None),
+    }
+}
+
+fn read_genome_seq_block<R: Read>(r: &mut R) -> io::Result<GenomeSeq> {
+    let n_contigs = read_uvarint(r)? as usize;
+    let mut contigs = Vec::with_capacity(n_contigs);
+    for _ in 0..n_contigs {
+        let len = read_uvarint(r)? as usize;
+        let nbytes = (len + 3) / 4;
+        let mut packed = vec![0u8; nbytes];
+        r.read_exact(&mut packed)?;
+        let mut codes = Vec::with_capacity(len);
+        for i in 0..len {
+            let byte = packed[i / 4];
+            codes.push((byte >> (2 * (i % 4))) & 3);
+        }
+        contigs.push(codes);
+    }
+    Ok(GenomeSeq { contigs })
 }
 
 /// A stable fingerprint so a compressed sample can be matched to its reference DB.
@@ -401,6 +567,7 @@ pub fn build_refdb_with_pool_min_genomes(
         genomes,
         distinctive,
         pool,
+        rep_seqs: Vec::new(),
     }
 }
 
@@ -423,50 +590,105 @@ fn species_ids(genomes: &[RefGenome]) -> Vec<u32> {
 /// Write a `.sylref` in the seekable two-stage layout. `sparse_div` controls the
 /// stage-1 subsampling rate (keep 1/`sparse_div` of each genome's distinctive
 /// k-mers); `sparse_div <= 1` keeps all of them.
-pub fn write_refdb<W: Write>(mut w: W, db: &RefDb, sparse_div: u64) -> io::Result<()> {
+pub fn write_refdb<W: Write + Seek>(mut w: W, db: &RefDb, sparse_div: u64) -> io::Result<()> {
     let ng = db.genomes.len();
     let sp_ids = species_ids(&db.genomes);
 
-    // Body: [sparse section][MPHF sparse index][MPHF pool block][dense blocks...]
-    let mut body: Vec<u8> = Vec::new();
+    // Everything is streamed straight to the writer so neither the serialized body
+    // (the sparse/index/pool/dense sections) nor the genome sequences are ever held
+    // in RAM in full — important for references over hundreds of thousands of
+    // genomes, where the body alone is tens of GB. `pos` tracks the absolute file
+    // offset; a small `buf` is reused to serialize one section at a time. The footer
+    // offset is only known at the end, so the header keeps a placeholder that is
+    // patched once everything is written (needs Seek).
+    w.write_all(REFDB_MAGIC)?;
+    w.write_all(&[REFDB_VERSION])?;
+    w.write_all(&0u64.to_le_bytes())?; // placeholder footer offset
+    let mut pos = HEADER_LEN;
+    let mut buf: Vec<u8> = Vec::new();
 
-    let sparse_off = body.len() as u64; // 0
+    // sparse section: 1/sparse_div of each genome's distinctive k-mers, uncompressed.
+    let sparse_off = pos;
     let mut sparse_count = vec![0usize; ng];
     let mut sparse_keys: Vec<u64> = Vec::new();
     let mut sparse_owners: Vec<u32> = Vec::new();
     for g in 0..ng {
+        buf.clear();
         let mut cnt = 0usize;
         for &h in &db.distinctive[g] {
             if sparse_div <= 1 || h % sparse_div == 0 {
-                body.extend_from_slice(&h.to_le_bytes());
+                buf.extend_from_slice(&h.to_le_bytes());
                 sparse_keys.push(h);
                 sparse_owners.push(g as u32);
                 cnt += 1;
             }
         }
+        w.write_all(&buf)?;
+        pos += buf.len() as u64;
         sparse_count[g] = cnt;
     }
 
-    let sparse_index_off = body.len() as u64;
-    write_sparse_index_block(&mut body, &sparse_keys, &sparse_owners)?;
+    let sparse_index_off = pos;
+    buf.clear();
+    write_sparse_index_block(&mut buf, &sparse_keys, &sparse_owners)?;
     drop(sparse_keys);
     drop(sparse_owners);
+    w.write_all(&buf)?;
+    pos += buf.len() as u64;
 
-    let pool_off = body.len() as u64;
-    write_pool_block(&mut body, &db.pool)?;
+    let pool_off = pos;
+    buf.clear();
+    write_pool_block(&mut buf, &db.pool)?;
+    w.write_all(&buf)?;
+    pos += buf.len() as u64;
 
     // Dense blocks store only the *complement* of the stage-1 sparse subset, so a
     // k-mer kept in stage 1 is not also stored here; load merges the two back.
     let mut dense_off = vec![0u64; ng];
     for g in 0..ng {
-        dense_off[g] = body.len() as u64;
+        dense_off[g] = pos;
         let complement: Vec<u64> = db.distinctive[g]
             .iter()
             .copied()
             .filter(|&h| !(sparse_div <= 1 || h % sparse_div == 0))
             .collect();
-        write_hashes(&mut body, &complement)?;
+        buf.clear();
+        write_hashes(&mut buf, &complement)?;
+        w.write_all(&buf)?;
+        pos += buf.len() as u64;
     }
+
+    // Optional per-rep-genome 2-bit nucleotide blocks (loaded on demand for
+    // error-k-mer encoding). `seq_off[g] == 0` means no sequence is stored. Blocks
+    // are decoded/packed in parallel a chunk at a time and written in order.
+    let mut seq_off = vec![0u64; ng];
+    if db.rep_seqs.iter().any(|s| s.is_some()) {
+        const SEQ_CHUNK: usize = 512;
+        let mut g0 = 0usize;
+        while g0 < ng {
+            let g1 = (g0 + SEQ_CHUNK).min(ng);
+            let blocks: Vec<(usize, Option<Vec<u8>>)> = (g0..g1)
+                .into_par_iter()
+                .map(|g| {
+                    let blk = match db.rep_seqs.get(g).and_then(|s| s.as_ref()) {
+                        Some(src) => genome_block_bytes(src).unwrap_or(None),
+                        None => None,
+                    };
+                    (g, blk)
+                })
+                .collect();
+            for (g, blk) in blocks {
+                if let Some(b) = blk {
+                    seq_off[g] = pos;
+                    w.write_all(&b)?;
+                    pos += b.len() as u64;
+                }
+            }
+            g0 = g1;
+        }
+    }
+    let has_seqs = seq_off.iter().any(|&o| o != 0);
+    let footer_offset = pos;
 
     // Footer (zstd-compressed): metadata + absolute offsets into the file.
     let mut footer: Vec<u8> = Vec::new();
@@ -475,29 +697,36 @@ pub fn write_refdb<W: Write>(mut w: W, db: &RefDb, sparse_div: u64) -> io::Resul
     write_uvarint(&mut footer, sparse_div)?;
     footer.extend_from_slice(&fingerprint(db).to_le_bytes());
     write_uvarint(&mut footer, ng as u64)?;
-    write_uvarint(&mut footer, HEADER_LEN + sparse_off)?;
+    write_uvarint(&mut footer, sparse_off)?;
     for g in 0..ng {
         write_uvarint(&mut footer, sparse_count[g] as u64)?;
     }
-    write_uvarint(&mut footer, HEADER_LEN + sparse_index_off)?;
-    write_uvarint(&mut footer, HEADER_LEN + pool_off)?;
+    write_uvarint(&mut footer, sparse_index_off)?;
+    write_uvarint(&mut footer, pool_off)?;
     write_uvarint(&mut footer, db.pool.len() as u64)?;
     for g in 0..ng {
         write_string(&mut footer, &db.genomes[g].file_name)?;
         write_string(&mut footer, &db.genomes[g].species)?;
         footer.push(db.genomes[g].is_rep as u8);
         write_uvarint(&mut footer, sp_ids[g] as u64)?;
-        write_uvarint(&mut footer, HEADER_LEN + dense_off[g])?;
+        write_uvarint(&mut footer, dense_off[g])?;
         write_uvarint(&mut footer, db.distinctive[g].len() as u64)?;
     }
+    // v5: optional genome-sequence directory (a per-genome offset; 0 = none).
+    footer.push(has_seqs as u8);
+    if has_seqs {
+        for g in 0..ng {
+            write_uvarint(&mut footer, seq_off[g])?;
+        }
+    }
     let footer_comp = zstd::stream::encode_all(&footer[..], 9)?;
-    let footer_offset = HEADER_LEN + body.len() as u64;
-
-    w.write_all(REFDB_MAGIC)?;
-    w.write_all(&[REFDB_VERSION])?;
-    w.write_all(&footer_offset.to_le_bytes())?;
-    w.write_all(&body)?;
     w.write_all(&footer_comp)?;
+
+    // Patch the header's footer offset now that the genome section length is known.
+    w.flush()?;
+    w.seek(SeekFrom::Start(5))?;
+    w.write_all(&footer_offset.to_le_bytes())?;
+    w.flush()?;
     Ok(())
 }
 
@@ -513,6 +742,8 @@ pub struct RefGenomeMeta {
     sparse_count: u32,
     dense_offset: u64,
     dense_domain: u32,
+    /// Absolute offset of this genome's 2-bit sequence block, or 0 if not stored.
+    seq_offset: u64,
 }
 
 /// Any source we can both stream and seek (a file or an in-memory cursor).
@@ -537,7 +768,17 @@ pub struct RefIndex {
     pool_mphf: Mphf<u64>,
     reader: Mutex<Box<dyn ReadSeek>>,
     cache: Mutex<FxHashMap<u32, Arc<Vec<u64>>>>,
+    /// decoded 2-bit genome sequences, loaded on demand and cached.
+    seq_cache: Mutex<FxHashMap<u32, Arc<GenomeSeq>>>,
     compression_only: bool,
+}
+
+impl RefIndex {
+    /// Whether this reference stores genome sequences (i.e. supports error-k-mer
+    /// encoding). True if any genome has a non-zero sequence offset.
+    pub fn has_genome_seqs(&self) -> bool {
+        self.genomes.iter().any(|g| g.seq_offset != 0)
+    }
 }
 
 enum RefOpenMode {
@@ -566,7 +807,8 @@ fn open_ref_index_with_mode<R: Read + Seek + Send + 'static>(
             "not a sylph reference DB",
         ));
     }
-    if hdr[4] != REFDB_VERSION {
+    let version = hdr[4];
+    if !(REFDB_MIN_VERSION..=REFDB_VERSION).contains(&version) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "unsupported reference DB version",
@@ -619,7 +861,19 @@ fn open_ref_index_with_mode<R: Read + Seek + Send + 'static>(
             sparse_count: sparse_count[g] as u32,
             dense_offset,
             dense_domain,
+            seq_offset: 0,
         });
+    }
+
+    // v5: optional per-genome sequence-block offset directory.
+    if version >= 5 {
+        let mut has_seqs = [0u8; 1];
+        f.read_exact(&mut has_seqs)?;
+        if has_seqs[0] != 0 {
+            for g in 0..ng {
+                genomes[g].seq_offset = read_uvarint(&mut f)?;
+            }
+        }
     }
 
     let total_sparse: usize = sparse_count.iter().sum();
@@ -645,6 +899,7 @@ fn open_ref_index_with_mode<R: Read + Seek + Send + 'static>(
         pool_mphf,
         reader: Mutex::new(Box::new(r)),
         cache: Mutex::new(FxHashMap::default()),
+        seq_cache: Mutex::new(FxHashMap::default()),
         compression_only: matches!(mode, RefOpenMode::CompressionOnly),
     })
 }
@@ -714,6 +969,27 @@ impl RefIndex {
         let arc = Arc::new(arr);
         self.cache.lock().unwrap().insert(g, arc.clone());
         Ok(arc)
+    }
+
+    /// The 2-bit nucleotide sequence of genome `g`, decoded on demand and cached.
+    /// Returns `None` if no sequence is stored for that genome.
+    fn load_genome_seq(&self, g: u32) -> io::Result<Option<Arc<GenomeSeq>>> {
+        let off = self.genomes[g as usize].seq_offset;
+        if off == 0 {
+            return Ok(None);
+        }
+        if let Some(a) = self.seq_cache.lock().unwrap().get(&g) {
+            return Ok(Some(a.clone()));
+        }
+        let seq = {
+            let mut rd = self.reader.lock().unwrap();
+            rd.seek(SeekFrom::Start(off))?;
+            let mut r: &mut dyn ReadSeek = &mut **rd;
+            read_genome_seq_block(&mut r)?
+        };
+        let arc = Arc::new(seq);
+        self.seq_cache.lock().unwrap().insert(g, arc.clone());
+        Ok(Some(arc))
     }
 
     #[inline]
@@ -833,6 +1109,213 @@ fn decode_subset<R: Read>(r: &mut R, domain: u64) -> io::Result<Vec<u64>> {
 
 // --- compressing / decompressing a read sketch ------------------------------
 
+/// One encoded single-substitution error k-mer: the k-mer starting at global base
+/// index `pos` in a genome, with the base at offset `off` replaced by `base`.
+struct ErrorEntry {
+    pos: u64,
+    off: u8,
+    base: u8,
+}
+
+/// 2-bit reverse complement of the low `k` bases of `kmer`.
+#[inline]
+fn revcomp_kmer(kmer: u64, k: usize) -> u64 {
+    let mut x = kmer;
+    let mut rc = 0u64;
+    for _ in 0..k {
+        rc = (rc << 2) | (3 - (x & 3));
+        x >>= 2;
+    }
+    rc
+}
+
+#[inline]
+fn low_bits_mask(bits: u32) -> u64 {
+    if bits >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << bits) - 1
+    }
+}
+
+/// If `a` and `b` (each `k` 2-bit bases) differ at exactly one base, return that
+/// base offset (0 = highest base); otherwise `None`.
+#[inline]
+fn single_base_diff(a: u64, b: u64, k: usize) -> Option<usize> {
+    let d = a ^ b;
+    // collapse each 2-bit group to one bit that is set iff the group is non-zero
+    let nz = (d | (d >> 1)) & 0x5555_5555_5555_5555;
+    if nz.count_ones() == 1 {
+        let j = (nz.trailing_zeros() / 2) as usize; // group index from the low end
+        Some(k - 1 - j)
+    } else {
+        None
+    }
+}
+
+/// Try to express each `novel` hash as a single-base substitution of a hit
+/// **representative** genome's k-mer (sequencing errors produce exactly such
+/// k-mers). Reconstruction is deterministic and verified by hash equality, so a
+/// match is never a false positive. Returns the matched entries grouped by genome
+/// (already sorted by genomic position) and the set of consumed novel hashes.
+///
+/// Rather than enumerating all 3k substitutions of every genome k-mer, we exploit
+/// two facts: (1) `mm_hash64` is a bijection, so the canonical k-mer behind a novel
+/// hash is recovered exactly by `rev_mm_hash64`; (2) a single substitution leaves
+/// one half of the k-mer untouched, so a genome k-mer at Hamming distance 1 shares
+/// either its first or its second half exactly.
+///
+/// We index the (small) novel set once: each novel hash's k-mer, in both strand
+/// orientations, keyed by each half (a hash map, since it is probed millions of
+/// times — once per genome position — where O(1) lookups beat binary search). Then
+/// each hit representative genome is scanned a single time, probing each genome
+/// k-mer's two halves against the index. This amortizes one index build across all
+/// hit genomes (instead of rebuilding a big per-genome index) and is O(genome)
+/// scanning instead of O(genome × 3k) hashing. The genome sequence is still the
+/// perfect-hash "fingerprint": each candidate is verified by recomputing the hash.
+fn find_error_kmers(
+    idx: &RefIndex,
+    hits: &[u32],
+    novel: &[u64],
+    _c: usize,
+    k: usize,
+) -> io::Result<(Vec<(u32, Vec<ErrorEntry>)>, FxHashSet<u64>)> {
+    let mut by_genome: Vec<(u32, Vec<ErrorEntry>)> = Vec::new();
+    let mut consumed: FxHashSet<u64> = FxHashSet::default();
+    if novel.is_empty() || k == 0 {
+        return Ok((by_genome, consumed));
+    }
+    // each half is at most 16 bases, so a half-key fits in u32.
+    let k2 = k / 2;
+    let shift_hi = 2 * k2 as u32;
+    let mask_full = low_bits_mask(2 * k as u32);
+    let mask_low = low_bits_mask(shift_hi);
+
+    // Index the novel k-mers (both strands) by each half: half-key -> list of
+    // (novel hash, oriented k-mer). A genome k-mer that is one substitution from an
+    // oriented novel k-mer shares one half exactly, so it will hit this index.
+    let mut index: FxHashMap<u32, Vec<(u64, u64)>> = FxHashMap::default();
+    index.reserve(novel.len() * 4);
+    for &h in novel {
+        let kmer = rev_mm_hash64(h) & mask_full;
+        for eo in [kmer, revcomp_kmer(kmer, k)] {
+            index
+                .entry((eo >> shift_hi) as u32)
+                .or_default()
+                .push((h, eo));
+            index
+                .entry((eo & mask_low) as u32)
+                .or_default()
+                .push((h, eo));
+        }
+    }
+
+    let mut sorted_hits = hits.to_vec();
+    sorted_hits.sort_unstable();
+    for &g in &sorted_hits {
+        if !idx.genomes[g as usize].is_rep {
+            continue;
+        }
+        let seq = match idx.load_genome_seq(g)? {
+            Some(s) => s,
+            None => continue,
+        };
+
+        let mut entries: Vec<ErrorEntry> = Vec::new();
+        let mut base_global = 0u64;
+        for contig in &seq.contigs {
+            let clen = contig.len();
+            if clen >= k {
+                let (mut f, _) = window_fr(contig, 0, k);
+                for start in 0..=(clen - k) {
+                    if start > 0 {
+                        f = ((f << 2) | contig[start + k - 1] as u64) & mask_full;
+                    }
+                    for key in [(f >> shift_hi) as u32, (f & mask_low) as u32] {
+                        let Some(cands) = index.get(&key) else {
+                            continue;
+                        };
+                        for &(h, eo) in cands {
+                            if consumed.contains(&h) {
+                                continue;
+                            }
+                            // `eo` is the read error k-mer in this genome's forward
+                            // orientation, so its differing base/offset apply directly.
+                            if let Some(off) = single_base_diff(f, eo, k) {
+                                let j = k - 1 - off;
+                                let base = ((eo >> (2 * j)) & 3) as u8;
+                                let r = revcomp_kmer(f, k);
+                                if substituted_hash(f, r, k, off, base) == h {
+                                    let global = base_global + start as u64;
+                                    entries.push(ErrorEntry {
+                                        pos: global.min(u32::MAX as u64),
+                                        off: off as u8,
+                                        base,
+                                    });
+                                    consumed.insert(h);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            base_global += clen as u64;
+        }
+        if !entries.is_empty() {
+            // a genome k-mer can match several novel hashes at the same position, so
+            // normalize to the (pos, off, base) order the encoder expects.
+            entries.sort_unstable_by_key(|e| (e.pos, e.off, e.base));
+            by_genome.push((g, entries));
+        }
+    }
+    Ok((by_genome, consumed))
+}
+
+/// Encode the per-genome error entries as three grouped arrays (positions,
+/// offsets, bases) so the outer zstd frame sees long runs of similar bytes.
+/// Returns the encoded section and the total number of entries.
+fn encode_error_section(by_genome: &[(u32, Vec<ErrorEntry>)]) -> io::Result<(Vec<u8>, usize)> {
+    let mut out = Vec::new();
+    let total: usize = by_genome.iter().map(|(_, v)| v.len()).sum();
+    write_uvarint(&mut out, by_genome.len() as u64)?;
+    // directory: delta-coded genome id + entry count (already ascending by id)
+    let mut prev = 0u64;
+    for (g, v) in by_genome {
+        write_uvarint(&mut out, *g as u64 - prev)?;
+        prev = *g as u64;
+        write_uvarint(&mut out, v.len() as u64)?;
+    }
+    // array 1: per-genome Golomb-Rice position blocks (entries are pre-sorted)
+    for (_, v) in by_genome {
+        let positions: Vec<u64> = v.iter().map(|e| e.pos).collect();
+        write_hashes(&mut out, &positions)?;
+    }
+    // array 2: one offset byte per entry
+    for (_, v) in by_genome {
+        for e in v {
+            out.push(e.off);
+        }
+    }
+    // array 3: 2-bit-packed replacement bases
+    let mut byte = 0u8;
+    let mut n = 0u8;
+    for (_, v) in by_genome {
+        for e in v {
+            byte |= (e.base & 3) << (2 * n);
+            n += 1;
+            if n == 4 {
+                out.push(byte);
+                byte = 0;
+                n = 0;
+            }
+        }
+    }
+    if n > 0 {
+        out.push(byte);
+    }
+    Ok((out, total))
+}
+
 /// Compress a read sketch against the reference index. Only the sample's hit
 /// genomes' dense blocks are loaded; the pool is already resident in `idx`.
 pub fn compress_seq<W: Write>(
@@ -874,6 +1357,19 @@ pub fn compress_seq_with_meta<W: Write>(
             novel.push(h);
         }
     }
+
+    // Reclassify novel hashes that are single-substitution variants of a hit
+    // representative genome's k-mers into compact (position, offset, base) entries.
+    let error_by_genome = if idx.has_genome_seqs() && !novel.is_empty() {
+        let (by_genome, consumed) = find_error_kmers(idx, &hits, &novel, sketch.c, sketch.k)?;
+        if !consumed.is_empty() {
+            novel.retain(|h| !consumed.contains(h));
+        }
+        by_genome
+    } else {
+        Vec::new()
+    };
+    let (error_section, error_count) = encode_error_section(&error_by_genome)?;
 
     // hit genomes: sorted global ids, delta-coded (strains of a species are
     // contiguous, so a sample's hits cluster into small gaps)
@@ -942,9 +1438,13 @@ pub fn compress_seq_with_meta<W: Write>(
     write_uvarint(&mut payload, pool_section.len() as u64)?;
     write_uvarint(&mut payload, novel_section.len() as u64)?;
     write_uvarint(&mut payload, count_section.len() as u64)?;
+    // v4: single-substitution error-k-mer section
+    write_uvarint(&mut payload, error_count as u64)?;
+    write_uvarint(&mut payload, error_section.len() as u64)?;
     payload.extend_from_slice(&hit_section);
     payload.extend_from_slice(&pool_section);
     payload.extend_from_slice(&novel_section);
+    payload.extend_from_slice(&error_section);
     payload.extend_from_slice(&count_section);
 
     let mut enc = zstd::stream::write::Encoder::new(inner, ZSTD_LEVEL)?;
@@ -1021,6 +1521,12 @@ pub fn decompress_seq_with_meta<R: Read>(
             let _ = read_uvarint(&mut r)?;
         }
     }
+    if ver[0] >= 4 {
+        // error-entry count and error-section length (header metadata only)
+        for _ in 0..2 {
+            let _ = read_uvarint(&mut r)?;
+        }
+    }
 
     let mut hashes: Vec<u64> = Vec::new();
     let nhit = read_uvarint(&mut r)? as usize;
@@ -1043,6 +1549,52 @@ pub fn decompress_seq_with_meta<R: Read>(
     }
     let novel = read_hashes(&mut r)?;
     hashes.extend_from_slice(&novel);
+
+    // error k-mers: reconstruct each (genome, position, offset, base) entry back
+    // to its canonical FracMinHash hash using the stored genome sequence.
+    if ver[0] >= 4 {
+        let n_err_genomes = read_uvarint(&mut r)? as usize;
+        let mut gids = Vec::with_capacity(n_err_genomes);
+        let mut counts_e = Vec::with_capacity(n_err_genomes);
+        let mut gg = 0u64;
+        for _ in 0..n_err_genomes {
+            gg += read_uvarint(&mut r)?;
+            let cnt = read_uvarint(&mut r)? as usize;
+            gids.push(gg as u32);
+            counts_e.push(cnt);
+        }
+        // array 1: per-genome Golomb-Rice position blocks
+        let mut positions: Vec<Vec<u64>> = Vec::with_capacity(n_err_genomes);
+        for _ in 0..n_err_genomes {
+            positions.push(read_hashes(&mut r)?);
+        }
+        let total: usize = counts_e.iter().sum();
+        // array 2: one offset byte per entry
+        let mut offsets = vec![0u8; total];
+        r.read_exact(&mut offsets)?;
+        // array 3: 2-bit-packed replacement bases
+        let mut packed = vec![0u8; (total + 3) / 4];
+        r.read_exact(&mut packed)?;
+
+        let mut e = 0usize;
+        for gi in 0..n_err_genomes {
+            let seq = idx.load_genome_seq(gids[gi])?.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "error k-mers reference a genome with no stored sequence",
+                )
+            })?;
+            let cum = seq.cumulative();
+            for &pos in &positions[gi] {
+                let off = offsets[e] as usize;
+                let base = (packed[e / 4] >> (2 * (e % 4))) & 3;
+                let (ci, local) = seq.locate(&cum, pos);
+                let (f, rr) = window_fr(&seq.contigs[ci], local, k);
+                hashes.push(substituted_hash(f, rr, k, off, base));
+                e += 1;
+            }
+        }
+    }
 
     hashes.sort_unstable();
     let mut kmer_counts = FxHashMap::with_capacity_and_hasher(hashes.len(), Default::default());
@@ -1232,6 +1784,8 @@ struct RefSketchInspect {
     pool_section_bytes: Option<u64>,
     novel_section_bytes: Option<u64>,
     count_section_bytes: Option<u64>,
+    error_kmers: Option<u64>,
+    error_section_bytes: Option<u64>,
 }
 
 fn inspect_ref_sketch(path: &str) -> io::Result<RefSketchInspect> {
@@ -1306,6 +1860,11 @@ fn inspect_ref_sketch(path: &str) -> io::Result<RefSketchInspect> {
     } else {
         (None, None, None, None, None, None, None, None)
     };
+    let (error_kmers, error_section_bytes) = if ver[0] >= 4 {
+        (Some(read_uvarint(&mut r)?), Some(read_uvarint(&mut r)?))
+    } else {
+        (None, None)
+    };
     let header_metadata_bytes = raw.len() - r.len();
 
     Ok(RefSketchInspect {
@@ -1331,6 +1890,8 @@ fn inspect_ref_sketch(path: &str) -> io::Result<RefSketchInspect> {
         pool_section_bytes,
         novel_section_bytes,
         count_section_bytes,
+        error_kmers,
+        error_section_bytes,
     })
 }
 
@@ -1340,16 +1901,17 @@ fn opt_u64(x: Option<u64>) -> String {
 
 fn run_ref_inspect(files: &[String]) {
     println!(
-        "file\tversion\tcompressed_bytes\tpayload_bytes\treference_fingerprint\treference_db\tsample_file\tsample_name\tc\tk\tpaired\tmean_read_length\tnum_reads\theader_metadata_payload_bytes\thit_genomes\tassigned_to_genomes\tshared_pool\tnovel\ttotal_hashes\thit_section_payload_bytes\tpool_section_payload_bytes\tnovel_section_payload_bytes\tcount_section_payload_bytes"
+        "file\tversion\tcompressed_bytes\tpayload_bytes\treference_fingerprint\treference_db\tsample_file\tsample_name\tc\tk\tpaired\tmean_read_length\tnum_reads\theader_metadata_payload_bytes\thit_genomes\tassigned_to_genomes\tshared_pool\tnovel\terror_kmers\ttotal_hashes\thit_section_payload_bytes\tpool_section_payload_bytes\tnovel_section_payload_bytes\terror_section_payload_bytes\tcount_section_payload_bytes"
     );
     for f in files {
         let x = inspect_ref_sketch(f).unwrap_or_else(|e| panic!("Failed to inspect {}: {}", f, e));
+        let err = x.error_kmers.unwrap_or(0);
         let total_hashes = match (x.assigned_to_genomes, x.shared_pool, x.novel) {
-            (Some(a), Some(p), Some(n)) => (a + p + n).to_string(),
+            (Some(a), Some(p), Some(n)) => (a + p + n + err).to_string(),
             _ => "-".to_string(),
         };
         println!(
-            "{}\t{}\t{}\t{}\t{:016x}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{:016x}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             x.path,
             x.version,
             x.compressed_bytes,
@@ -1368,10 +1930,12 @@ fn run_ref_inspect(files: &[String]) {
             opt_u64(x.assigned_to_genomes),
             opt_u64(x.shared_pool),
             opt_u64(x.novel),
+            opt_u64(x.error_kmers),
             total_hashes,
             opt_u64(x.hit_section_bytes),
             opt_u64(x.pool_section_bytes),
             opt_u64(x.novel_section_bytes),
+            opt_u64(x.error_section_bytes),
             opt_u64(x.count_section_bytes),
         );
     }
@@ -1553,6 +2117,32 @@ fn process_shard(path: &Path, remap: &[u32], pool_min_genomes: u32) -> io::Resul
     // step sorts each genome's hashes and the pool once after concatenation.
     let dist: Vec<(u32, Vec<u64>)> = by_gid.into_iter().collect();
     Ok(ShardOut { dist, pool })
+}
+
+/// Mark every species-representative genome for sequence storage, pointing at the
+/// source FASTA the sketch recorded. Strains are skipped (errors are only encoded
+/// against representatives). The FASTAs are not read here — `write_refdb` streams
+/// and 2-bit packs them one genome at a time, so even a 200k-genome reference does
+/// not hold every sequence in RAM. A FASTA that turns out to be unreadable simply
+/// yields no stored sequence (that genome falls back to full-price coding).
+fn set_rep_seq_sources(db: &mut RefDb) {
+    let sources: Vec<Option<GenomeSource>> = db
+        .genomes
+        .iter()
+        .map(|g| {
+            if g.is_rep {
+                Some(GenomeSource::Path(g.file_name.clone()))
+            } else {
+                None
+            }
+        })
+        .collect();
+    let reps = sources.iter().filter(|s| s.is_some()).count();
+    info!(
+        "Will store nucleotide sequences for {} representative genome(s) (streamed + 2-bit packed at write time)",
+        reps
+    );
+    db.rep_seqs = sources;
 }
 
 pub fn run_ref_build(args: RefBuildArgs) {
@@ -1746,13 +2336,17 @@ pub fn run_ref_build(args: RefBuildArgs) {
     distinctive.par_iter_mut().for_each(|d| d.sort_unstable());
     pool.par_sort_unstable();
 
-    let db = RefDb {
+    let mut db = RefDb {
         c,
         k,
         genomes,
         distinctive,
         pool,
+        rep_seqs: Vec::new(),
     };
+    if args.store_genomes {
+        set_rep_seq_sources(&mut db);
+    }
     let n_dist: usize = db.distinctive.iter().map(|d| d.len()).sum();
     let n_sparse: usize = if sparse_div <= 1 {
         n_dist

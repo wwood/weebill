@@ -98,6 +98,11 @@ pub struct RefBuildArgs {
     )]
     pub pool_min_genomes: u32,
     #[clap(
+        long = "store-genomes",
+        help = "Store the nucleotide sequence (2-bit packed) of every species representative in the .sylref. This enables single-substitution error-k-mer encoding in `ref-compress`, which losslessly recodes sequencing-error hashes much more compactly. Adds ~1/4 byte per genome base to the reference."
+    )]
+    pub store_genomes: bool,
+    #[clap(
         long = "max-ram",
         help = "Approximate peak RAM target (GB) for building. Sizes the number of on-disk partitions the build streams through; a soft target, not a hard limit."
     )]
