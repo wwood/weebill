@@ -86,11 +86,17 @@ pub struct RefBuildArgs {
     )]
     pub output: String,
     #[clap(
-        long = "sparse-subsample",
-        default_value_t = 16,
-        help = "Stage-1 sparse index subsampling divisor: 1/N of each genome's distinctive k-mers are kept uncompressed for fast hit detection. Larger N gives a smaller/faster stage-1 index but coarser detection (1 keeps all)."
+        long = "sparse-c",
+        default_value_t = REF_SPARSE_C_DEFAULT,
+        help = "FracMinHash -c used for the stage-1 sparse MPHF index. Defaults to c=3000; larger values make the sparse index smaller but coarser. Values denser than the input DB -c are clamped to the DB -c."
     )]
-    pub sparse_div: u64,
+    pub sparse_c: usize,
+    #[clap(
+        long = "sparse-subsample",
+        hide = true,
+        help = "Deprecated compatibility alias for the old modulo sparse selector; ignored by the c-scaled sparse MPHF reference format."
+    )]
+    pub sparse_div_compat: Option<u64>,
     #[clap(
         long = "pool-min-genomes",
         default_value_t = 3,
@@ -155,6 +161,12 @@ pub struct RefCompressArgs {
     pub output_dir: String,
     #[clap(short, default_value_t = 3, help = "Number of threads")]
     pub threads: usize,
+    #[clap(
+        long = "ref-screen-ani",
+        default_value_t = REF_SCREEN_ANI_DEFAULT,
+        help = "Minimum sparse-stage naive ANI (0-100) for a reference genome to be decoded during compression. Lower values improve compression for distant/low-signal samples at higher CPU cost."
+    )]
+    pub ref_screen_ani: f64,
     #[clap(long = "trace", help = "Trace output")]
     pub trace: bool,
     #[clap(long = "debug", help = "Debug output")]

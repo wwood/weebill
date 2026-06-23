@@ -1,11 +1,11 @@
 use clap::Parser;
-use sylph::cmdline::*;
-use sylph::contain;
-use sylph::inspect;
-use sylph::merge;
-use sylph::refdelta;
-use sylph::sketch;
-use sylph::twostage_db;
+use weebill::cmdline::*;
+use weebill::contain;
+use weebill::inspect;
+use weebill::merge;
+use weebill::refdelta;
+use weebill::sketch;
+use weebill::twostage_db;
 //use std::panic::set_hook;
 
 //Use this allocator when statically compiling

@@ -421,6 +421,24 @@ fn write_sparse_index_block<W: Write>(w: &mut W, keys: &[u64], owners: &[u32]) -
     Ok(())
 }
 
+#[inline]
+fn sparse_threshold(sparse_c: usize) -> u64 {
+    u64::MAX / sparse_c.max(1) as u64
+}
+
+#[inline]
+fn keep_sparse_hash(h: u64, sparse_c: usize) -> bool {
+    h < sparse_threshold(sparse_c)
+}
+
+#[inline]
+fn sparse_naive_ani(matches: u32, domain: u32, k: usize) -> f64 {
+    if matches == 0 || domain == 0 || k == 0 {
+        return 0.0;
+    }
+    f64::powf(matches as f64 / domain as f64, 1.0 / k as f64) * 100.0
+}
+
 fn read_sparse_index_block<R: Read>(
     r: &mut R,
     sparse_len: usize,
@@ -587,12 +605,12 @@ fn species_ids(genomes: &[RefGenome]) -> Vec<u32> {
     ids
 }
 
-/// Write a `.sylref` in the seekable two-stage layout. `sparse_div` controls the
-/// stage-1 subsampling rate (keep 1/`sparse_div` of each genome's distinctive
-/// k-mers); `sparse_div <= 1` keeps all of them.
-pub fn write_refdb<W: Write + Seek>(mut w: W, db: &RefDb, sparse_div: u64) -> io::Result<()> {
+/// Write a `.sylref` in the seekable two-stage layout. `sparse_c` controls the
+/// stage-1 sparse FracMinHash rate; hashes below `u64::MAX / sparse_c` are kept.
+pub fn write_refdb<W: Write + Seek>(mut w: W, db: &RefDb, sparse_c: usize) -> io::Result<()> {
     let ng = db.genomes.len();
     let sp_ids = species_ids(&db.genomes);
+    let sparse_c = sparse_c.max(db.c).max(1);
 
     // Everything is streamed straight to the writer so neither the serialized body
     // (the sparse/index/pool/dense sections) nor the genome sequences are ever held
@@ -607,7 +625,8 @@ pub fn write_refdb<W: Write + Seek>(mut w: W, db: &RefDb, sparse_div: u64) -> io
     let mut pos = HEADER_LEN;
     let mut buf: Vec<u8> = Vec::new();
 
-    // sparse section: 1/sparse_div of each genome's distinctive k-mers, uncompressed.
+    // Sparse section: FracMinHash subset of each genome's distinctive k-mers,
+    // uncompressed. The MPHF below keeps the stage-1 screen RAM-light.
     let sparse_off = pos;
     let mut sparse_count = vec![0usize; ng];
     let mut sparse_keys: Vec<u64> = Vec::new();
@@ -616,7 +635,7 @@ pub fn write_refdb<W: Write + Seek>(mut w: W, db: &RefDb, sparse_div: u64) -> io
         buf.clear();
         let mut cnt = 0usize;
         for &h in &db.distinctive[g] {
-            if sparse_div <= 1 || h % sparse_div == 0 {
+            if keep_sparse_hash(h, sparse_c) {
                 buf.extend_from_slice(&h.to_le_bytes());
                 sparse_keys.push(h);
                 sparse_owners.push(g as u32);
@@ -650,7 +669,7 @@ pub fn write_refdb<W: Write + Seek>(mut w: W, db: &RefDb, sparse_div: u64) -> io
         let complement: Vec<u64> = db.distinctive[g]
             .iter()
             .copied()
-            .filter(|&h| !(sparse_div <= 1 || h % sparse_div == 0))
+            .filter(|&h| !keep_sparse_hash(h, sparse_c))
             .collect();
         buf.clear();
         write_hashes(&mut buf, &complement)?;
@@ -694,7 +713,7 @@ pub fn write_refdb<W: Write + Seek>(mut w: W, db: &RefDb, sparse_div: u64) -> io
     let mut footer: Vec<u8> = Vec::new();
     write_uvarint(&mut footer, db.c as u64)?;
     write_uvarint(&mut footer, db.k as u64)?;
-    write_uvarint(&mut footer, sparse_div)?;
+    write_uvarint(&mut footer, sparse_c as u64)?;
     footer.extend_from_slice(&fingerprint(db).to_le_bytes());
     write_uvarint(&mut footer, ng as u64)?;
     write_uvarint(&mut footer, sparse_off)?;
@@ -756,7 +775,7 @@ impl<T: Read + Seek + Send> ReadSeek for T {}
 pub struct RefIndex {
     pub c: usize,
     pub k: usize,
-    sparse_div: u64,
+    sparse_c: usize,
     fingerprint: u64,
     pub genomes: Vec<RefGenomeMeta>,
     /// stage-1: sparse distinctive hash -> owning genome id via MPHF slot arrays.
@@ -824,7 +843,7 @@ fn open_ref_index_with_mode<R: Read + Seek + Send + 'static>(
     let mut f = &fbytes[..];
     let c = read_uvarint(&mut f)? as usize;
     let k = read_uvarint(&mut f)? as usize;
-    let sparse_div = read_uvarint(&mut f)?;
+    let sparse_c = read_uvarint(&mut f)? as usize;
     let mut fpb = [0u8; 8];
     f.read_exact(&mut fpb)?;
     let fingerprint = u64::from_le_bytes(fpb);
@@ -889,7 +908,7 @@ fn open_ref_index_with_mode<R: Read + Seek + Send + 'static>(
     Ok(RefIndex {
         c,
         k,
-        sparse_div,
+        sparse_c,
         fingerprint,
         genomes,
         sparse_mphf,
@@ -905,11 +924,11 @@ fn open_ref_index_with_mode<R: Read + Seek + Send + 'static>(
 }
 
 impl RefIndex {
-    /// Stage-1 query: the genomes a sample contains, by sparse-hit count.
-    pub fn hit_genomes(&self, sketch: &SequencesSketch) -> Vec<u32> {
+    /// Stage-1 query: genomes passing the sparse FracMinHash ANI screen.
+    pub fn hit_genomes(&self, sketch: &SequencesSketch, min_ani: f64) -> Vec<u32> {
         let mut counts: FxHashMap<u32, u32> = FxHashMap::default();
         for &h in sketch.kmer_counts.keys() {
-            if self.sparse_div > 1 && h % self.sparse_div != 0 {
+            if !keep_sparse_hash(h, self.sparse_c) {
                 continue;
             }
             if let Some(slot) = self.sparse_mphf.try_hash(&h) {
@@ -924,7 +943,10 @@ impl RefIndex {
         }
         counts
             .into_iter()
-            .filter(|&(_, c)| c >= SPARSE_MIN_HITS)
+            .filter(|&(g, c)| {
+                c >= SPARSE_MIN_HITS
+                    && sparse_naive_ani(c, self.genomes[g as usize].sparse_count, self.k) >= min_ani
+            })
             .map(|(g, _)| g)
             .collect()
     }
@@ -1324,7 +1346,14 @@ pub fn compress_seq<W: Write>(
     idx: &RefIndex,
     ref_db_name: &str,
 ) -> io::Result<()> {
-    compress_seq_with_meta(inner, sketch, idx, ref_db_name, ReadSketchMeta::default())
+    compress_seq_with_screen_ani(
+        inner,
+        sketch,
+        idx,
+        ref_db_name,
+        ReadSketchMeta::default(),
+        REF_SCREEN_ANI_DEFAULT,
+    )
 }
 
 pub fn compress_seq_with_meta<W: Write>(
@@ -1334,9 +1363,27 @@ pub fn compress_seq_with_meta<W: Write>(
     ref_db_name: &str,
     meta: ReadSketchMeta,
 ) -> io::Result<()> {
+    compress_seq_with_screen_ani(
+        inner,
+        sketch,
+        idx,
+        ref_db_name,
+        meta,
+        REF_SCREEN_ANI_DEFAULT,
+    )
+}
+
+pub fn compress_seq_with_screen_ani<W: Write>(
+    inner: W,
+    sketch: &SequencesSketch,
+    idx: &RefIndex,
+    ref_db_name: &str,
+    meta: ReadSketchMeta,
+    ref_screen_ani: f64,
+) -> io::Result<()> {
     // stage 1 -> stage 2: load the distinctive blocks of the hit genomes and
     // build a per-sample hash -> (genome, index) lookup over just those.
-    let hits = idx.hit_genomes(sketch);
+    let hits = idx.hit_genomes(sketch, ref_screen_ani);
     let mut map: FxHashMap<u64, (u32, u32)> = FxHashMap::default();
     for &g in &hits {
         let arr = idx.load_genome(g)?;
@@ -2160,7 +2207,10 @@ pub fn run_ref_build(args: RefBuildArgs) {
         Some(p) => parse_taxonomy(p),
         None => FxHashMap::default(),
     };
-    let sparse_div = args.sparse_div.max(1);
+    if args.sparse_div_compat.is_some() {
+        warn!("--sparse-subsample is deprecated and ignored; use --sparse-c to size the sparse MPHF index");
+    }
+    let sparse_c = args.sparse_c.max(1);
     let pool_min_genomes = args.pool_min_genomes.max(2);
 
     let resolve = |file_name: &str| -> (String, bool) {
@@ -2348,26 +2398,28 @@ pub fn run_ref_build(args: RefBuildArgs) {
         set_rep_seq_sources(&mut db);
     }
     let n_dist: usize = db.distinctive.iter().map(|d| d.len()).sum();
-    let n_sparse: usize = if sparse_div <= 1 {
-        n_dist
-    } else {
-        db.distinctive
-            .iter()
-            .map(|d| d.iter().filter(|&&h| h % sparse_div == 0).count())
-            .sum()
-    };
+    let effective_sparse_c = sparse_c.max(db.c).max(1);
+    let n_sparse: usize = db
+        .distinctive
+        .iter()
+        .map(|d| {
+            d.iter()
+                .filter(|&&h| keep_sparse_hash(h, effective_sparse_c))
+                .count()
+        })
+        .sum();
     info!(
-        "Reference: {} genomes, {} distinctive k-mers, {} shared-pool k-mers, {} stage-1 sparse k-mers (1/{})",
+        "Reference: {} genomes, {} distinctive k-mers, {} shared-pool k-mers, {} stage-1 sparse k-mers (sparse c={})",
         db.genomes.len(),
         n_dist,
         db.pool.len(),
         n_sparse,
-        sparse_div
+        effective_sparse_c
     );
 
     let w =
         BufWriter::new(File::create(&out).unwrap_or_else(|_| panic!("Could not create {}", out)));
-    write_refdb(w, &db, sparse_div).unwrap_or_else(|e| panic!("Failed to write {}: {}", out, e));
+    write_refdb(w, &db, sparse_c).unwrap_or_else(|e| panic!("Failed to write {}: {}", out, e));
     info!("Wrote reference database to {}", out);
 }
 
@@ -2472,8 +2524,15 @@ pub fn run_ref_compress(args: RefCompressArgs) {
             let w = BufWriter::new(
                 File::create(&out).unwrap_or_else(|_| panic!("Could not create {:?}", out)),
             );
-            compress_seq(w, &sketch, &idx, ref_db)
-                .unwrap_or_else(|e| panic!("Failed to compress {}: {}", f, e));
+            compress_seq_with_screen_ani(
+                w,
+                &sketch,
+                &idx,
+                ref_db,
+                ReadSketchMeta::default(),
+                args.ref_screen_ani,
+            )
+            .unwrap_or_else(|e| panic!("Failed to compress {}: {}", f, e));
             let mut c = counter.lock().unwrap();
             *c += 1;
             info!("Compressed {} -> {:?}", f, out);

@@ -1,10 +1,10 @@
 use assert_cmd::prelude::*; // Add methods on commands
 use fxhash::FxHashMap;
-use sylph::compress;
-use sylph::refdelta;
-use sylph::refdelta::{GenomeSeq, GenomeSource};
-use sylph::seeding;
-use sylph::types::{GenomeSketch, SequencesSketch, BYTE_TO_SEQ};
+use weebill::compress;
+use weebill::refdelta;
+use weebill::refdelta::{GenomeSeq, GenomeSource};
+use weebill::seeding;
+use weebill::types::{GenomeSketch, SequencesSketch, BYTE_TO_SEQ};
 
 fn gsketch(file_name: &str, kmers: Vec<u64>) -> GenomeSketch {
     GenomeSketch {
@@ -71,14 +71,14 @@ fn refdelta_pool_min_genomes_assigns_pairs_to_first_owner() {
     assert_eq!(db.pool, vec![20]);
 }
 
-fn write_refdb_to_vec(db: &refdelta::RefDb, sparse_div: u64) -> Vec<u8> {
+fn write_refdb_to_vec(db: &refdelta::RefDb, sparse_c: usize) -> Vec<u8> {
     let mut cur = std::io::Cursor::new(Vec::new());
-    refdelta::write_refdb(&mut cur, db, sparse_div).unwrap();
+    refdelta::write_refdb(&mut cur, db, sparse_c).unwrap();
     cur.into_inner()
 }
 
-fn open_index(db: &refdelta::RefDb, sparse_div: u64) -> refdelta::RefIndex {
-    refdelta::open_ref_index(std::io::Cursor::new(write_refdb_to_vec(db, sparse_div))).unwrap()
+fn open_index(db: &refdelta::RefDb, sparse_c: usize) -> refdelta::RefIndex {
+    refdelta::open_ref_index(std::io::Cursor::new(write_refdb_to_vec(db, sparse_c))).unwrap()
 }
 
 fn refdelta_roundtrip(sketch: &SequencesSketch, idx: &refdelta::RefIndex) {
@@ -104,9 +104,9 @@ fn three_genome_db() -> refdelta::RefDb {
 #[test]
 fn refdelta_compress_decompress_roundtrip() {
     let db = three_genome_db();
-    // sparse_div = 1 keeps every distinctive k-mer in the stage-1 index so every
+    // sparse_c equal to the database c keeps every distinctive k-mer in stage 1 so every
     // genome is detectable; the round trip is lossless regardless either way.
-    let idx = open_index(&db, 1);
+    let idx = open_index(&db, 200);
 
     // distinctive hits + pool hit + novel hashes + counts
     let mut counts: FxHashMap<u64, u32> = FxHashMap::default();
@@ -161,9 +161,9 @@ fn refdelta_compress_decompress_roundtrip() {
         &idx,
     );
 
-    // round trip is also lossless when stage 1 subsamples (some genomes may be
+    // round trip is also lossless when stage 1 is sparser (some genomes may be
     // missed and fall back to novel coding, but the result must be identical)
-    let idx_sparse = open_index(&db, 4);
+    let idx_sparse = open_index(&db, 1_000_000_000_000_000);
     let mut counts2: FxHashMap<u64, u32> = FxHashMap::default();
     for (h, c) in [(1u64, 5u32), (100, 7), (300, 2), (500, 4), (424242, 9)] {
         counts2.insert(h, c);
@@ -367,7 +367,7 @@ fn refdelta_sparse_hit_detection() {
         paired: false,
         mean_read_length: 1.0,
     };
-    assert_eq!(idx.hit_genomes(&sketch), vec![2]);
+    assert_eq!(idx.hit_genomes(&sketch, 87.0), vec![2]);
 }
 
 #[test]
@@ -514,7 +514,7 @@ fn test_hash() {
             let key = key as i64;
             println!("{}", format!("{key:b}"));
             use std::arch::x86_64::*;
-            use sylph::avx2_seeding::*;
+            use weebill::avx2_seeding::*;
             let mut rolling_kmer_f_marker = _mm256_set_epi64x(0, 0, 0, key);
             let hash_256 = mm_hash256(rolling_kmer_f_marker);
             let v1 = _mm256_extract_epi64(hash_256, 0);
