@@ -26,6 +26,7 @@ pub const SCREEN_C_DEFAULT: usize = 3000;
 pub const SCREEN_MIN_ANI_DEFAULT: f64 = 85.;
 pub const REF_SPARSE_C_DEFAULT: usize = 3000;
 pub const REF_SCREEN_ANI_DEFAULT: f64 = 87.;
+pub const MIN_DENSE_KMERS_FOR_ERROR_DEFAULT: usize = 100;
 pub const GENOME_SKETCH_SUFFIX: &str = ".sylgn";
 /// Two-stage seekable database: a small bincoded sparse (screen) index plus
 /// per-genome Golomb-Rice compressed dense blocks loaded on demand.

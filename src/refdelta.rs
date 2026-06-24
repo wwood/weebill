@@ -74,6 +74,7 @@ use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 const REFDB_MAGIC: &[u8; 4] = b"SYLR";
 /// v5 adds an optional per-rep-genome 2-bit nucleotide section (`--store-genomes`)
@@ -147,6 +148,22 @@ pub enum GenomeSource {
 #[derive(Clone, Debug, PartialEq)]
 pub struct GenomeSeq {
     pub contigs: Vec<Vec<u8>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct RefCompressTelemetry {
+    pub sample_name: String,
+    pub ref_db_name: String,
+    pub ref_screen_ani: f64,
+    pub hit_genomes_total: usize,
+    pub genome_id: u32,
+    pub genome_file: String,
+    pub species: String,
+    pub sparse_hits: u32,
+    pub sparse_total: u32,
+    pub sparse_ani: f64,
+    pub assigned_kmers: usize,
+    pub error_kmers: usize,
 }
 
 impl GenomeSeq {
@@ -924,8 +941,8 @@ fn open_ref_index_with_mode<R: Read + Seek + Send + 'static>(
 }
 
 impl RefIndex {
-    /// Stage-1 query: genomes passing the sparse FracMinHash ANI screen.
-    pub fn hit_genomes(&self, sketch: &SequencesSketch, min_ani: f64) -> Vec<u32> {
+    /// Stage-1 query: sparse hit counts for genomes passing the sparse FracMinHash ANI screen.
+    pub fn hit_genome_counts(&self, sketch: &SequencesSketch, min_ani: f64) -> Vec<(u32, u32)> {
         let mut counts: FxHashMap<u32, u32> = FxHashMap::default();
         for &h in sketch.kmer_counts.keys() {
             if !keep_sparse_hash(h, self.sparse_c) {
@@ -947,6 +964,13 @@ impl RefIndex {
                 c >= SPARSE_MIN_HITS
                     && sparse_naive_ani(c, self.genomes[g as usize].sparse_count, self.k) >= min_ani
             })
+            .collect()
+    }
+
+    /// Stage-1 query: genomes passing the sparse FracMinHash ANI screen.
+    pub fn hit_genomes(&self, sketch: &SequencesSketch, min_ani: f64) -> Vec<u32> {
+        self.hit_genome_counts(sketch, min_ani)
+            .into_iter()
             .map(|(g, _)| g)
             .collect()
     }
@@ -1353,6 +1377,7 @@ pub fn compress_seq<W: Write>(
         ref_db_name,
         ReadSketchMeta::default(),
         REF_SCREEN_ANI_DEFAULT,
+        MIN_DENSE_KMERS_FOR_ERROR_DEFAULT,
     )
 }
 
@@ -1370,6 +1395,7 @@ pub fn compress_seq_with_meta<W: Write>(
         ref_db_name,
         meta,
         REF_SCREEN_ANI_DEFAULT,
+        MIN_DENSE_KMERS_FOR_ERROR_DEFAULT,
     )
 }
 
@@ -1380,10 +1406,42 @@ pub fn compress_seq_with_screen_ani<W: Write>(
     ref_db_name: &str,
     meta: ReadSketchMeta,
     ref_screen_ani: f64,
+    min_dense_kmers_for_error: usize,
 ) -> io::Result<()> {
+    compress_seq_with_screen_ani_and_telemetry(
+        inner,
+        sketch,
+        idx,
+        ref_db_name,
+        meta,
+        ref_screen_ani,
+        min_dense_kmers_for_error,
+    )
+    .map(|_| ())
+}
+
+pub fn compress_seq_with_screen_ani_and_telemetry<W: Write>(
+    inner: W,
+    sketch: &SequencesSketch,
+    idx: &RefIndex,
+    ref_db_name: &str,
+    meta: ReadSketchMeta,
+    ref_screen_ani: f64,
+    min_dense_kmers_for_error: usize,
+) -> io::Result<Vec<RefCompressTelemetry>> {
+    let total_start = Instant::now();
     // stage 1 -> stage 2: load the distinctive blocks of the hit genomes and
     // build a per-sample hash -> (genome, index) lookup over just those.
-    let hits = idx.hit_genomes(sketch, ref_screen_ani);
+    let stage1_start = Instant::now();
+    let hit_counts = idx.hit_genome_counts(sketch, ref_screen_ani);
+    let hits: Vec<u32> = hit_counts.iter().map(|&(g, _)| g).collect();
+    info!(
+        "ref-compress stage1 sparse screen: {} hit genomes in {:.3}s",
+        hits.len(),
+        stage1_start.elapsed().as_secs_f64()
+    );
+
+    let dense_load_start = Instant::now();
     let mut map: FxHashMap<u64, (u32, u32)> = FxHashMap::default();
     for &g in &hits {
         let arr = idx.load_genome(g)?;
@@ -1391,7 +1449,14 @@ pub fn compress_seq_with_screen_ani<W: Write>(
             map.insert(h, (g, i as u32));
         }
     }
+    info!(
+        "ref-compress stage2 dense load + dense map build: {} genomes, {} dense hashes in {:.3}s",
+        hits.len(),
+        map.len(),
+        dense_load_start.elapsed().as_secs_f64()
+    );
 
+    let assign_start = Instant::now();
     let mut per_genome: FxHashMap<u32, Vec<u64>> = FxHashMap::default();
     let mut pool_hits: Vec<u64> = Vec::new();
     let mut novel: Vec<u64> = Vec::new();
@@ -1404,11 +1469,26 @@ pub fn compress_seq_with_screen_ani<W: Write>(
             novel.push(h);
         }
     }
+    info!(
+        "ref-compress stage3 sample partition: {} assigned kmers, {} pool hits, {} novel kmers in {:.3}s",
+        per_genome.values().map(|v| v.len()).sum::<usize>(),
+        pool_hits.len(),
+        novel.len(),
+        assign_start.elapsed().as_secs_f64()
+    );
 
     // Reclassify novel hashes that are single-substitution variants of a hit
     // representative genome's k-mers into compact (position, offset, base) entries.
+    let error_start = Instant::now();
     let error_by_genome = if idx.has_genome_seqs() && !novel.is_empty() {
-        let (by_genome, consumed) = find_error_kmers(idx, &hits, &novel, sketch.c, sketch.k)?;
+        let error_hits: Vec<u32> = hits
+            .iter()
+            .copied()
+            .filter(|g| {
+                per_genome.get(g).map(|v| v.len()).unwrap_or(0) >= min_dense_kmers_for_error
+            })
+            .collect();
+        let (by_genome, consumed) = find_error_kmers(idx, &error_hits, &novel, sketch.c, sketch.k)?;
         if !consumed.is_empty() {
             novel.retain(|h| !consumed.contains(h));
         }
@@ -1416,7 +1496,20 @@ pub fn compress_seq_with_screen_ani<W: Write>(
     } else {
         Vec::new()
     };
+    info!(
+        "ref-compress stage4 error-kmer scan: {} eligible genomes, {} error genomes, {} error kmers in {:.3}s",
+        hits
+            .iter()
+            .filter(|g| per_genome.get(g).map(|v| v.len()).unwrap_or(0) >= min_dense_kmers_for_error)
+            .count(),
+        error_by_genome.len(),
+        error_by_genome.iter().map(|(_, v)| v.len()).sum::<usize>(),
+        error_start.elapsed().as_secs_f64()
+    );
+    let encode_start = Instant::now();
     let (error_section, error_count) = encode_error_section(&error_by_genome)?;
+    let error_counts: FxHashMap<u32, usize> =
+        error_by_genome.iter().map(|(g, v)| (*g, v.len())).collect();
 
     // hit genomes: sorted global ids, delta-coded (strains of a species are
     // contiguous, so a sample's hits cluster into small gaps)
@@ -1497,7 +1590,43 @@ pub fn compress_seq_with_screen_ani<W: Write>(
     let mut enc = zstd::stream::write::Encoder::new(inner, ZSTD_LEVEL)?;
     enc.write_all(&payload)?;
     enc.finish()?;
-    Ok(())
+    info!(
+        "ref-compress stage5 payload encode + zstd: payload {} bytes in {:.3}s",
+        payload.len(),
+        encode_start.elapsed().as_secs_f64()
+    );
+
+    let sample_name = sketch
+        .sample_name
+        .clone()
+        .unwrap_or_else(|| sketch.file_name.clone());
+    let hit_genomes_total = hits.len();
+    let telemetry = hit_counts
+        .into_iter()
+        .map(|(g, sparse_hits)| {
+            let meta = &idx.genomes[g as usize];
+            RefCompressTelemetry {
+                sample_name: sample_name.clone(),
+                ref_db_name: ref_db_name.to_string(),
+                ref_screen_ani,
+                hit_genomes_total,
+                genome_id: g,
+                genome_file: meta.file_name.clone(),
+                species: meta.species.clone(),
+                sparse_hits,
+                sparse_total: meta.sparse_count,
+                sparse_ani: sparse_naive_ani(sparse_hits, meta.sparse_count, idx.k),
+                assigned_kmers: per_genome.get(&g).map(|v| v.len()).unwrap_or(0),
+                error_kmers: *error_counts.get(&g).unwrap_or(&0),
+            }
+        })
+        .collect();
+    info!(
+        "ref-compress total for {}: {:.3}s",
+        sample_name,
+        total_start.elapsed().as_secs_f64()
+    );
+    Ok(telemetry)
 }
 
 /// Decompress a reference-delta read sketch. Only the genomes referenced by the
@@ -2445,6 +2574,39 @@ fn open_refdb_file_with_mode(path: &str, compression_only: bool) -> RefIndex {
     }
 }
 
+fn telemetry_field(s: &str) -> String {
+    s.replace(['\t', '\n', '\r'], " ")
+}
+
+fn write_telemetry_header<W: Write>(w: &mut W) -> io::Result<()> {
+    writeln!(
+        w,
+        "sample\tref_db\tref_screen_ani\thit_genomes_total\tgenome_id\tgenome_file\tspecies\tsparse_hits\tsparse_total\tsparse_ani\tassigned_kmers\terror_kmers"
+    )
+}
+
+fn write_telemetry_rows<W: Write>(w: &mut W, rows: &[RefCompressTelemetry]) -> io::Result<()> {
+    for row in rows {
+        writeln!(
+            w,
+            "{}\t{}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.6}\t{}\t{}",
+            telemetry_field(&row.sample_name),
+            telemetry_field(&row.ref_db_name),
+            row.ref_screen_ani,
+            row.hit_genomes_total,
+            row.genome_id,
+            telemetry_field(&row.genome_file),
+            telemetry_field(&row.species),
+            row.sparse_hits,
+            row.sparse_total,
+            row.sparse_ani,
+            row.assigned_kmers,
+            row.error_kmers
+        )?;
+    }
+    Ok(())
+}
+
 pub fn run_ref_compress(args: RefCompressArgs) {
     init_logger(args.trace);
     rayon::ThreadPoolBuilder::new()
@@ -2470,6 +2632,10 @@ pub fn run_ref_compress(args: RefCompressArgs) {
         error!("--verify expects existing *.sylspr inputs and cannot be combined with --decompress; exiting");
         std::process::exit(1);
     }
+    if args.telemetry.is_some() && (args.decompress || args.verify) {
+        error!("--telemetry is only supported while compressing; exiting");
+        std::process::exit(1);
+    }
     let idx = if args.decompress || args.verify {
         info!("Loading reference database {} (full mode)", ref_db);
         open_refdb_file(ref_db)
@@ -2491,6 +2657,15 @@ pub fn run_ref_compress(args: RefCompressArgs) {
 
     let outdir = Path::new(&args.output_dir);
     let counter = Mutex::new(0usize);
+    let telemetry_writer = args.telemetry.as_ref().map(|path| {
+        let mut w = BufWriter::new(
+            File::create(path)
+                .unwrap_or_else(|_| panic!("Could not create telemetry file {}", path)),
+        );
+        write_telemetry_header(&mut w)
+            .unwrap_or_else(|e| panic!("Could not write telemetry header to {}: {}", path, e));
+        Mutex::new(w)
+    });
     if args.decompress {
         args.files.par_iter().for_each(|f| {
             let r = BufReader::with_capacity(
@@ -2524,15 +2699,21 @@ pub fn run_ref_compress(args: RefCompressArgs) {
             let w = BufWriter::new(
                 File::create(&out).unwrap_or_else(|_| panic!("Could not create {:?}", out)),
             );
-            compress_seq_with_screen_ani(
+            let telemetry = compress_seq_with_screen_ani_and_telemetry(
                 w,
                 &sketch,
                 &idx,
                 ref_db,
                 ReadSketchMeta::default(),
                 args.ref_screen_ani,
+                args.min_dense_kmers_for_error,
             )
             .unwrap_or_else(|e| panic!("Failed to compress {}: {}", f, e));
+            if let Some(writer) = &telemetry_writer {
+                let mut writer = writer.lock().unwrap();
+                write_telemetry_rows(&mut *writer, &telemetry)
+                    .unwrap_or_else(|e| panic!("Failed to write telemetry for {}: {}", f, e));
+            }
             let mut c = counter.lock().unwrap();
             *c += 1;
             info!("Compressed {} -> {:?}", f, out);

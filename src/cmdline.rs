@@ -167,6 +167,17 @@ pub struct RefCompressArgs {
         help = "Minimum sparse-stage naive ANI (0-100) for a reference genome to be decoded during compression. Lower values improve compression for distant/low-signal samples at higher CPU cost."
     )]
     pub ref_screen_ani: f64,
+    #[clap(
+        long = "min-dense-kmers-for-error",
+        default_value_t = MIN_DENSE_KMERS_FOR_ERROR_DEFAULT,
+        help = "Minimum dense exact k-mer hits a hit genome must have before it is scanned for single-substitution error k-mers."
+    )]
+    pub min_dense_kmers_for_error: usize,
+    #[clap(
+        long = "telemetry",
+        help = "Write ref-compress screening telemetry TSV to this path. Reports sparse hit counts, assigned exact k-mers, and error k-mers per hit genome."
+    )]
+    pub telemetry: Option<String>,
     #[clap(long = "trace", help = "Trace output")]
     pub trace: bool,
     #[clap(long = "debug", help = "Debug output")]
