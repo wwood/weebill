@@ -1256,64 +1256,114 @@ fn find_error_kmers(
         }
     }
 
+    // Bloom filter over the half-keys present in `index`: two cheap multiplicative
+    // hash functions into a compact bitset. The inner k-mer scan hits this bitset
+    // first; only the ~1% of positions that pass both bits proceed to the L3-cache-
+    // unfriendly FxHashMap probe, dramatically reducing cache-miss pressure on large
+    // novel sets.
+    let bloom_bits = (index.len() * 8).next_power_of_two().max(64);
+    let bloom_mask = bloom_bits - 1;
+    let mut bloom = vec![0u64; bloom_bits / 64];
+    for &key in index.keys() {
+        let p1 = (key as usize).wrapping_mul(0x9e37_79b9) & bloom_mask;
+        let p2 = (key as usize).wrapping_mul(0x517c_c1b7) & bloom_mask;
+        bloom[p1 / 64] |= 1u64 << (p1 % 64);
+        bloom[p2 / 64] |= 1u64 << (p2 % 64);
+    }
+
     let mut sorted_hits = hits.to_vec();
     sorted_hits.sort_unstable();
-    for &g in &sorted_hits {
-        if !idx.genomes[g as usize].is_rep {
-            continue;
-        }
-        let seq = match idx.load_genome_seq(g)? {
-            Some(s) => s,
-            None => continue,
-        };
+    let eligible: Vec<u32> = sorted_hits
+        .into_iter()
+        .filter(|&g| idx.genomes[g as usize].is_rep)
+        .collect();
 
-        let mut entries: Vec<ErrorEntry> = Vec::new();
-        let mut base_global = 0u64;
-        for contig in &seq.contigs {
-            let clen = contig.len();
-            if clen >= k {
-                let (mut f, _) = window_fr(contig, 0, k);
-                for start in 0..=(clen - k) {
-                    if start > 0 {
-                        f = ((f << 2) | contig[start + k - 1] as u64) & mask_full;
+    // Producer-consumer: a background thread loads genome sequences (each needing a
+    // seek + read under the shared reader mutex) while the main thread scans the
+    // previously loaded genome, hiding I/O latency behind the CPU-intensive k-mer
+    // scan.
+    //
+    // `tx` is declared inside the scope so the spawned thread owns it via `move ||`
+    // and drops it when it finishes — that's what signals `rx.recv()` to return Err
+    // and break the consumer loop. If `tx` were declared outside the scope it would
+    // only be borrowed, never dropped, and the consumer would block forever.
+    let eligible_slice: &[u32] = &eligible;
+    std::thread::scope(|s| -> io::Result<()> {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<io::Result<(u32, Arc<GenomeSeq>)>>(4);
+        s.spawn(move || {
+            for &g in eligible_slice {
+                match idx.load_genome_seq(g) {
+                    Ok(Some(seq)) => {
+                        if tx.send(Ok((g, seq))).is_err() {
+                            return;
+                        }
                     }
-                    for key in [(f >> shift_hi) as u32, (f & mask_low) as u32] {
-                        let Some(cands) = index.get(&key) else {
-                            continue;
-                        };
-                        for &(h, eo) in cands {
-                            if consumed.contains(&h) {
+                    Ok(None) => {}
+                    Err(e) => {
+                        let _ = tx.send(Err(e));
+                        return;
+                    }
+                }
+            }
+        });
+
+        while let Ok(item) = rx.recv() {
+            let (g, seq) = item?;
+            let mut entries: Vec<ErrorEntry> = Vec::new();
+            let mut base_global = 0u64;
+            for contig in &seq.contigs {
+                let clen = contig.len();
+                if clen >= k {
+                    let (mut f, _) = window_fr(contig, 0, k);
+                    for start in 0..=(clen - k) {
+                        if start > 0 {
+                            f = ((f << 2) | contig[start + k - 1] as u64) & mask_full;
+                        }
+                        for key in [(f >> shift_hi) as u32, (f & mask_low) as u32] {
+                            // Bloom pre-filter: skip if key is definitely absent from index
+                            let p1 = (key as usize).wrapping_mul(0x9e37_79b9) & bloom_mask;
+                            let p2 = (key as usize).wrapping_mul(0x517c_c1b7) & bloom_mask;
+                            if bloom[p1 / 64] & (1u64 << (p1 % 64)) == 0
+                                || bloom[p2 / 64] & (1u64 << (p2 % 64)) == 0
+                            {
                                 continue;
                             }
-                            // `eo` is the read error k-mer in this genome's forward
-                            // orientation, so its differing base/offset apply directly.
-                            if let Some(off) = single_base_diff(f, eo, k) {
-                                let j = k - 1 - off;
-                                let base = ((eo >> (2 * j)) & 3) as u8;
-                                let r = revcomp_kmer(f, k);
-                                if substituted_hash(f, r, k, off, base) == h {
-                                    let global = base_global + start as u64;
-                                    entries.push(ErrorEntry {
-                                        pos: global.min(u32::MAX as u64),
-                                        off: off as u8,
-                                        base,
-                                    });
-                                    consumed.insert(h);
+                            let Some(cands) = index.get(&key) else {
+                                continue;
+                            };
+                            for &(h, eo) in cands {
+                                if consumed.contains(&h) {
+                                    continue;
+                                }
+                                // `eo` is the read error k-mer in this genome's forward
+                                // orientation, so its differing base/offset apply directly.
+                                if let Some(off) = single_base_diff(f, eo, k) {
+                                    let j = k - 1 - off;
+                                    let base = ((eo >> (2 * j)) & 3) as u8;
+                                    let r = revcomp_kmer(f, k);
+                                    if substituted_hash(f, r, k, off, base) == h {
+                                        let global = base_global + start as u64;
+                                        entries.push(ErrorEntry {
+                                            pos: global.min(u32::MAX as u64),
+                                            off: off as u8,
+                                            base,
+                                        });
+                                        consumed.insert(h);
+                                    }
                                 }
                             }
                         }
                     }
                 }
+                base_global += clen as u64;
             }
-            base_global += clen as u64;
+            if !entries.is_empty() {
+                entries.sort_unstable_by_key(|e| (e.pos, e.off, e.base));
+                by_genome.push((g, entries));
+            }
         }
-        if !entries.is_empty() {
-            // a genome k-mer can match several novel hashes at the same position, so
-            // normalize to the (pos, off, base) order the encoder expects.
-            entries.sort_unstable_by_key(|e| (e.pos, e.off, e.base));
-            by_genome.push((g, entries));
-        }
-    }
+        Ok(())
+    })?;
     Ok((by_genome, consumed))
 }
 
