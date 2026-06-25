@@ -23,7 +23,10 @@ Start here when reading the code:
 | `contain.rs` | Query and profile modes; two-stage workflow | `contain`, `subsample_view`, `densify_genome` |
 | `inference.rs` | Coverage estimation from k-mer multiplicity distributions | `mme_lambda`, `mle_zip`, `binary_search_lambda` |
 | `compress.rs` | Compressed sketch I/O (`SYLZ` format, Golomb-Rice + zstd) | `peek_is_compressed`, `write_genome_sketch_compressed`, `read_seq_sketch_compressed` |
-| `refdelta.rs` | Reference-delta compression of sample sketches (`.sylref` / `.sylspr`) | `RefDb`, `RefIndex`, `run_ref_build`, `run_ref_compress` |
+| `refdelta/mod.rs` | Module root: shared constants, `window_fr`/`substituted_hash` utilities, public re-exports | `SKETCH_MAGIC`, `SKETCH_VERSION`, `SCHEME_*`, `ZSTD_LEVEL` |
+| `refdelta/ref_build.rs` | Building and writing `.sylref`; reading via `RefIndex` | `RefDb`, `RefIndex`, `build_refdb`, `write_refdb`, `open_ref_index`, `run_ref_build` |
+| `refdelta/sketch_compress.rs` | Compression of sample sketches into `.sylspr` | `RefCompressTelemetry`, `compress_seq`, `encode_subset`, `find_error_kmers`, `run_ref_compress` |
+| `refdelta/sketch_decompress.rs` | Decompression of `.sylspr` back to sample sketches | `decompress_seq`, `decompress_seq_with_meta`, `decode_subset` |
 | `twostage_db.rs` | Two-stage seekable genome database (`.syl2db`) | `TwoStageDb`, `run_db_convert` |
 | `merge.rs` | Merge multiple sample sketches into one | `merge` |
 | `inspect.rs` | YAML metadata inspection of sketch files | `inspect` |
@@ -32,9 +35,11 @@ Start here when reading the code:
 | `main.rs` | Entry point; dispatches to modules by subcommand | — |
 
 `contain.rs` depends on `inference`, `sketch`, `types`, and both database
-formats. `refdelta.rs` and `twostage_db.rs` depend on `compress` and `seeding`
-but are otherwise independent of each other. Everything else is roughly
-leaf-level.
+formats. `refdelta` (the module) and `twostage_db.rs` depend on `compress` and
+`seeding` but are otherwise independent of each other. Within `refdelta`,
+`ref_build` owns the database types and I/O; `sketch_compress` and
+`sketch_decompress` are siblings that access `ref_build` internals via
+`pub(crate)` visibility. Everything else is roughly leaf-level.
 
 ## Key Types & Data Flow
 
@@ -56,9 +61,10 @@ compressed).
 adjusted ANI, coverage (`final_est_cov`), confidence intervals, containment
 index, and optional relative abundance. Borrows the source `GenomeSketch`.
 
-**`RefIndex`** (in `refdelta`) — the seekable query-time form of a `.sylref`
-file. Stage-1 sparse MPHF (boomphf) maps k-mer hashes to genome ids, loaded
-fully. Dense per-genome Golomb-Rice blocks are loaded on demand by file seek.
+**`RefIndex`** (in `refdelta/ref_build.rs`) — the seekable query-time form of a
+`.sylref` file. Stage-1 sparse MPHF (boomphf) maps k-mer hashes to genome ids,
+loaded fully. Dense per-genome Golomb-Rice blocks are loaded on demand by file
+seek.
 
 **`TwoStageDb`** (in `twostage_db`) — the seekable query-time form of a
 `.syl2db` file. Footer holds bincoded sparse `GenomeSketch` subsets; body
@@ -155,8 +161,8 @@ varint-delta encoding of genome ids efficient in `.sylspr`.
 | Coverage/ANI statistics | `inference.rs::mme_lambda`, `estimate_lambda` |
 | k-mer extraction kernel | `seeding.rs::fmh_seeds` (scalar) or `avx2_seeding.rs::extract_markers_avx2` (SIMD) |
 | Compressed I/O (SYLZ format) | `compress.rs` |
-| Reference-delta build | `refdelta.rs::run_ref_build` |
-| Reference-delta compress/decompress | `refdelta.rs::run_ref_compress` |
+| Reference-delta build | `refdelta/ref_build.rs::run_ref_build` |
+| Reference-delta compress/decompress | `refdelta/sketch_compress.rs::run_ref_compress` |
 | Two-stage DB conversion | `twostage_db.rs::run_db_convert` |
 | Adding a new output format | Follow the pattern in `compress.rs` (magic, version byte, zstd frame) |
 
