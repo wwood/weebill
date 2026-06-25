@@ -174,6 +174,11 @@ pub struct RefCompressArgs {
     )]
     pub min_dense_kmers_for_error: usize,
     #[clap(
+        long = "no-error-kmer",
+        help = "Disable single-substitution error-k-mer encoding during compression. Stops after dense k-mer partitioning and stores remaining hashes as novel k-mers."
+    )]
+    pub no_error_kmer: bool,
+    #[clap(
         long = "telemetry",
         help = "Write ref-compress screening telemetry TSV to this path. Reports sparse hit counts, assigned exact k-mers, and error k-mers per hit genome."
     )]

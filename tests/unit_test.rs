@@ -4,7 +4,7 @@ use weebill::compress;
 use weebill::refdelta;
 use weebill::refdelta::{GenomeSeq, GenomeSource};
 use weebill::seeding;
-use weebill::types::{GenomeSketch, SequencesSketch, BYTE_TO_SEQ};
+use weebill::types::{GenomeSketch, ReadSketchMeta, SequencesSketch, BYTE_TO_SEQ};
 
 fn gsketch(file_name: &str, kmers: Vec<u64>) -> GenomeSketch {
     GenomeSketch {
@@ -322,6 +322,27 @@ fn refdelta_error_kmer_roundtrip_and_savings() {
     refdelta::compress_seq(&mut buf, &sketch, &idx, "ref.sylref").unwrap();
     let decoded = refdelta::decompress_seq(&buf[..], &idx).unwrap();
     assert_eq!(sketch, decoded, "error-k-mer sketch must roundtrip exactly");
+
+    let mut buf_no_error_kmer = Vec::new();
+    refdelta::compress_seq_with_screen_ani_and_error_kmers(
+        &mut buf_no_error_kmer,
+        &sketch,
+        &idx,
+        "ref.sylref",
+        ReadSketchMeta::default(),
+        0.0,
+        0,
+        false,
+    )
+    .unwrap();
+    let decoded_no_error_kmer = refdelta::decompress_seq(&buf_no_error_kmer[..], &idx).unwrap();
+    assert_eq!(sketch, decoded_no_error_kmer);
+    assert!(
+        buf.len() < buf_no_error_kmer.len(),
+        "disabling error-k-mer encoding should store error k-mers as larger novel hashes: enabled={} disabled={}",
+        buf.len(),
+        buf_no_error_kmer.len()
+    );
 
     // compressing against a reference WITHOUT stored genomes (no error encoding)
     // must be larger: the error k-mers fall back to full-price novel coding.

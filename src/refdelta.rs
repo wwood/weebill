@@ -1490,6 +1490,28 @@ pub fn compress_seq_with_screen_ani<W: Write>(
     ref_screen_ani: f64,
     min_dense_kmers_for_error: usize,
 ) -> io::Result<()> {
+    compress_seq_with_screen_ani_and_error_kmers(
+        inner,
+        sketch,
+        idx,
+        ref_db_name,
+        meta,
+        ref_screen_ani,
+        min_dense_kmers_for_error,
+        true,
+    )
+}
+
+pub fn compress_seq_with_screen_ani_and_error_kmers<W: Write>(
+    inner: W,
+    sketch: &SequencesSketch,
+    idx: &RefIndex,
+    ref_db_name: &str,
+    meta: ReadSketchMeta,
+    ref_screen_ani: f64,
+    min_dense_kmers_for_error: usize,
+    enable_error_kmers: bool,
+) -> io::Result<()> {
     compress_seq_with_screen_ani_and_telemetry(
         inner,
         sketch,
@@ -1498,6 +1520,7 @@ pub fn compress_seq_with_screen_ani<W: Write>(
         meta,
         ref_screen_ani,
         min_dense_kmers_for_error,
+        enable_error_kmers,
     )
     .map(|_| ())
 }
@@ -1510,6 +1533,7 @@ pub fn compress_seq_with_screen_ani_and_telemetry<W: Write>(
     meta: ReadSketchMeta,
     ref_screen_ani: f64,
     min_dense_kmers_for_error: usize,
+    enable_error_kmers: bool,
 ) -> io::Result<Vec<RefCompressTelemetry>> {
     let total_start = Instant::now();
     // stage 1 -> stage 2: load the distinctive blocks of the hit genomes and
@@ -1564,7 +1588,7 @@ pub fn compress_seq_with_screen_ani_and_telemetry<W: Write>(
     // Reclassify novel hashes that are single-substitution variants of a hit
     // representative genome's k-mers into compact (position, offset, base) entries.
     let error_start = Instant::now();
-    let error_by_genome = if idx.has_genome_seqs() && !novel.is_empty() {
+    let error_by_genome = if enable_error_kmers && idx.has_genome_seqs() && !novel.is_empty() {
         let error_hits: Vec<u32> = hits
             .iter()
             .copied()
@@ -1596,6 +1620,9 @@ pub fn compress_seq_with_screen_ani_and_telemetry<W: Write>(
             by_genome
         }
     } else {
+        if !enable_error_kmers {
+            info!("ref-compress stage4 skip: error-kmer encoding disabled");
+        }
         Vec::new()
     };
     info!(
@@ -2809,6 +2836,7 @@ pub fn run_ref_compress(args: RefCompressArgs) {
                 ReadSketchMeta::default(),
                 args.ref_screen_ani,
                 args.min_dense_kmers_for_error,
+                !args.no_error_kmer,
             )
             .unwrap_or_else(|e| panic!("Failed to compress {}: {}", f, e));
             if let Some(writer) = &telemetry_writer {
