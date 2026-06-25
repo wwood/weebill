@@ -184,12 +184,7 @@ impl<'a, R: Read> BitReader<'a, R> {
         let mut q = 0u64;
         while self.read_bit()? == 1 {
             q += 1;
-            if q > 4096 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "unary code too long; corrupt sketch",
-                ));
-            }
+            // For very large "genomes", it is possible this legitimately goes beyond 4096 (e.g. 4097 on SRR20217209 logan contigs), so have no guard based on unary code length here (other than u64 overflow).
         }
         Ok(q)
     }

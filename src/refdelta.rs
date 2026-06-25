@@ -142,12 +142,12 @@ pub enum GenomeSource {
     Path(String),
 }
 
-/// A genome's nucleotide sequence, one `Vec` of 2-bit base codes (0=A,1=C,2=G,
-/// 3=T; any non-ACGT base maps to 0, exactly as the sketcher does) per contig.
-/// K-mers never span contigs.
+/// A genome's nucleotide sequence in 2-bit-packed form (4 bases per byte,
+/// same layout as the on-disk format). Each contig is `(length_in_bases,
+/// packed_data)`. K-mers never span contigs.
 #[derive(Clone, Debug, PartialEq)]
 pub struct GenomeSeq {
-    pub contigs: Vec<Vec<u8>>,
+    pub contigs: Vec<(usize, Vec<u8>)>,
 }
 
 #[derive(Clone, Debug)]
@@ -174,8 +174,8 @@ impl GenomeSeq {
         let mut cum = Vec::with_capacity(self.contigs.len() + 1);
         let mut acc = 0u64;
         cum.push(0);
-        for c in &self.contigs {
-            acc += c.len() as u64;
+        for (len, _) in &self.contigs {
+            acc += *len as u64;
             cum.push(acc);
         }
         cum
@@ -192,15 +192,17 @@ impl GenomeSeq {
     }
 }
 
-/// Forward and reverse-complement 2-bit packings of the k-mer at `codes[start..start+k]`,
-/// matching `seeding::fmh_seeds` exactly: the forward k-mer has base 0 in the high
-/// bits, the reverse complement is built from the per-base complements.
+/// Forward and reverse-complement 2-bit packings of the k-mer starting at base
+/// `start` in a 2-bit-packed contig (`data[i/4] >> (2*(i%4)) & 3`).
+/// Matches `seeding::fmh_seeds`: forward k-mer has base 0 in the high bits,
+/// reverse complement is built from per-base complements.
 #[inline]
-fn window_fr(codes: &[u8], start: usize, k: usize) -> (u64, u64) {
+fn window_fr(data: &[u8], start: usize, k: usize) -> (u64, u64) {
     let mut f = 0u64;
     let mut r = 0u64;
     for j in 0..k {
-        let nuc_f = codes[start + j] as u64;
+        let pos = start + j;
+        let nuc_f = ((data[pos / 4] >> (2 * (pos % 4))) & 3) as u64;
         let nuc_r = 3 - nuc_f;
         f = (f << 2) | nuc_f;
         r |= nuc_r << (2 * j);
@@ -222,8 +224,9 @@ fn substituted_hash(f: u64, r: u64, k: usize, off: usize, base: u8) -> u64 {
 
 // --- genome sequence (de)serialization (2-bit packed) -----------------------
 
-/// Read a FASTA/FASTQ into a `GenomeSeq` of 2-bit base codes (one code per byte),
-/// matching the sketcher's `BYTE_TO_SEQ` mapping. Returns `None` if unreadable.
+/// Read a FASTA/FASTQ into a packed `GenomeSeq` (4 bases per byte, same layout
+/// as the on-disk format), using the sketcher's `BYTE_TO_SEQ` mapping.
+/// Returns `None` if unreadable.
 fn read_genome_seq_from_fasta(path: &str) -> Option<GenomeSeq> {
     let reader = needletail::parse_fastx_file(path);
     let mut reader = match reader {
@@ -237,8 +240,13 @@ fn read_genome_seq_from_fasta(path: &str) -> Option<GenomeSeq> {
             Err(_) => return None,
         };
         let seq = record.seq();
-        let codes: Vec<u8> = seq.iter().map(|&b| BYTE_TO_SEQ[b as usize]).collect();
-        contigs.push(codes);
+        let len = seq.len();
+        let mut packed = vec![0u8; (len + 3) / 4];
+        for (i, &b) in seq.iter().enumerate() {
+            let code = BYTE_TO_SEQ[b as usize];
+            packed[i / 4] |= (code & 3) << (2 * (i % 4));
+        }
+        contigs.push((len, packed));
     }
     Some(GenomeSeq { contigs })
 }
@@ -247,22 +255,9 @@ fn read_genome_seq_from_fasta(path: &str) -> Option<GenomeSeq> {
 /// followed by the 2-bit-packed bases (4 bases/byte, contig-aligned).
 fn write_genome_seq_block<W: Write>(w: &mut W, seq: &GenomeSeq) -> io::Result<()> {
     write_uvarint(w, seq.contigs.len() as u64)?;
-    for contig in &seq.contigs {
-        write_uvarint(w, contig.len() as u64)?;
-        let mut byte = 0u8;
-        let mut nfilled = 0u8;
-        for &code in contig {
-            byte |= (code & 3) << (2 * nfilled);
-            nfilled += 1;
-            if nfilled == 4 {
-                w.write_all(&[byte])?;
-                byte = 0;
-                nfilled = 0;
-            }
-        }
-        if nfilled > 0 {
-            w.write_all(&[byte])?;
-        }
+    for (len, data) in &seq.contigs {
+        write_uvarint(w, *len as u64)?;
+        w.write_all(data)?;
     }
     Ok(())
 }
@@ -293,12 +288,7 @@ fn read_genome_seq_block<R: Read>(r: &mut R) -> io::Result<GenomeSeq> {
         let nbytes = (len + 3) / 4;
         let mut packed = vec![0u8; nbytes];
         r.read_exact(&mut packed)?;
-        let mut codes = Vec::with_capacity(len);
-        for i in 0..len {
-            let byte = packed[i / 4];
-            codes.push((byte >> (2 * (i % 4))) & 3);
-        }
-        contigs.push(codes);
+        contigs.push((len, packed));
     }
     Ok(GenomeSeq { contigs })
 }
@@ -1199,6 +1189,17 @@ fn single_base_diff(a: u64, b: u64, k: usize) -> Option<usize> {
     }
 }
 
+/// Novel k-mers are processed in chunks of this size in `find_error_kmers`.
+/// Exposed at module level so the caller can estimate work before invoking.
+const NOVEL_CHUNK: usize = 8_000_000;
+
+/// Max chunk-genome scan pairs before skipping error-kmer classification.
+/// Each pair costs ~0.7 CPU-s (3.5 Mbp × 2 probes × 100 ns); 40 000 pairs ≈
+/// 30 min at 4 threads.  Samples with very large novel sets (e.g. 292 M novel
+/// k-mers × 6642 genomes) gain negligible compression from error reclassification
+/// and should just skip it.
+const MAX_ERROR_SCAN_PAIRS: usize = 40_000;
+
 /// Try to express each `novel` hash as a single-base substitution of a hit
 /// **representative** genome's k-mer (sequencing errors produce exactly such
 /// k-mers). Reconstruction is deterministic and verified by hash equality, so a
@@ -1237,44 +1238,6 @@ fn find_error_kmers(
     let mask_full = low_bits_mask(2 * k as u32);
     let mask_low = low_bits_mask(shift_hi);
 
-    // Index the novel k-mers (both strands) by each half: half-key -> list of
-    // (novel hash, oriented k-mer). A genome k-mer that is one substitution from an
-    // oriented novel k-mer shares one half exactly, so it will hit this index.
-    let mut index: FxHashMap<u32, Vec<(u64, u64)>> = FxHashMap::default();
-    index.reserve(novel.len() * 4);
-    for &h in novel {
-        let kmer = rev_mm_hash64(h) & mask_full;
-        for eo in [kmer, revcomp_kmer(kmer, k)] {
-            index
-                .entry((eo >> shift_hi) as u32)
-                .or_default()
-                .push((h, eo));
-            index
-                .entry((eo & mask_low) as u32)
-                .or_default()
-                .push((h, eo));
-        }
-    }
-
-    // Blocked Bloom filter: both bits for a key live in the SAME u64 word, so each
-    // probe costs exactly one cache miss instead of two. The block (u64 word) is
-    // chosen by the upper bits of hash1; the two bit positions within the block come
-    // from the lower bits of hash1 and hash2. Capped at 64 MB so the filter always
-    // fits in L3 regardless of sketch density; above the cap FPR rises but the
-    // filter remains fast (L3 hits beat RAM misses from an uncapped filter).
-    let n_blocks = (index.len() / 8 + 1)
-        .next_power_of_two()
-        .min(64 * 1024 * 1024 / 8);
-    let n_block_mask = n_blocks - 1;
-    let mut bloom = vec![0u64; n_blocks];
-    for &key in index.keys() {
-        let h1 = (key as usize).wrapping_mul(0x9e37_79b9);
-        let block = (h1 >> 6) & n_block_mask;
-        let bit1 = h1 & 63;
-        let bit2 = (key as usize).wrapping_mul(0x517c_c1b7) & 63;
-        bloom[block] |= (1u64 << bit1) | (1u64 << bit2);
-    }
-
     let mut sorted_hits = hits.to_vec();
     sorted_hits.sort_unstable();
     let eligible: Vec<u32> = sorted_hits
@@ -1282,8 +1245,8 @@ fn find_error_kmers(
         .filter(|&g| idx.genomes[g as usize].is_rep)
         .collect();
 
-    // Phase 1 (I/O): load all eligible genome sequences into memory with the
-    // producer-consumer approach so the parallel scan below has no mutex contention.
+    // Phase 1 (I/O): load all eligible genome sequences once so they can be
+    // reused across every novel-k-mer chunk below without re-seeking.
     let mut genome_seqs: Vec<(u32, Arc<GenomeSeq>)> = Vec::with_capacity(eligible.len());
     let eligible_slice: &[u32] = &eligible;
     std::thread::scope(|s| -> io::Result<()> {
@@ -1310,77 +1273,119 @@ fn find_error_kmers(
         Ok(())
     })?;
 
-    // Phase 2 (CPU): parallel k-mer scan over all loaded genomes. `index` and `bloom`
-    // are read-only so they are safe to share across Rayon threads. Each task keeps a
-    // per-genome `local_consumed` set so the same novel hash is not attributed to
-    // multiple positions within the same genome. Cross-genome dedup is handled by the
-    // sequential pass below.
+    // Phase 2 (CPU): scan in chunks of NOVEL_CHUNK novel k-mers. Each chunk builds
+    // its own half-key index and Bloom filter so peak RSS stays bounded (~1.4 GB
+    // per chunk) and the Bloom filter remains unsaturated (~1.6% FPR at the 64MB
+    // cap) even for very large metagenomes. Genome sequences are loaded once and
+    // reused across all chunks; each genome is scanned once per chunk in parallel.
     //
-    // par_iter() on a Vec is an IndexedParallelIterator, so collect() preserves
-    // genome order (same as the sorted eligible order), which the dedup pass requires.
-    let per_genome: Vec<(u32, Vec<(u64, ErrorEntry)>)> = genome_seqs
-        .par_iter()
-        .map(|(g, seq)| {
-            let mut matches: Vec<(u64, ErrorEntry)> = Vec::new();
-            let mut local_consumed: FxHashSet<u64> = FxHashSet::default();
-            let mut base_global = 0u64;
-            for contig in &seq.contigs {
-                let clen = contig.len();
-                if clen >= k {
-                    let (mut f, _) = window_fr(contig, 0, k);
-                    for start in 0..=(clen - k) {
-                        if start > 0 {
-                            f = ((f << 2) | contig[start + k - 1] as u64) & mask_full;
-                        }
-                        for key in [(f >> shift_hi) as u32, (f & mask_low) as u32] {
-                            // Blocked Bloom pre-filter: one cache miss loads the block,
-                            // then a pure bitmask check rejects ~97% of probes.
-                            let h1 = (key as usize).wrapping_mul(0x9e37_79b9);
-                            let block = (h1 >> 6) & n_block_mask;
-                            let bit1 = h1 & 63;
-                            let bit2 = (key as usize).wrapping_mul(0x517c_c1b7) & 63;
-                            let bmask = (1u64 << bit1) | (1u64 << bit2);
-                            if bloom[block] & bmask != bmask {
-                                continue;
+    // Correctness: novel.chunks() partitions the array so each hash h appears in
+    // exactly one chunk's index — no cross-chunk h conflicts, and local_consumed
+    // (per genome per chunk) is sufficient for within-genome dedup.
+    let mut per_genome_matches: FxHashMap<u32, Vec<(u64, ErrorEntry)>> = FxHashMap::default();
+
+    for chunk in novel.chunks(NOVEL_CHUNK) {
+        let mut index: FxHashMap<u32, Vec<(u64, u64)>> = FxHashMap::default();
+        index.reserve(chunk.len() * 4);
+        for &h in chunk {
+            let kmer = rev_mm_hash64(h) & mask_full;
+            for eo in [kmer, revcomp_kmer(kmer, k)] {
+                index
+                    .entry((eo >> shift_hi) as u32)
+                    .or_default()
+                    .push((h, eo));
+                index
+                    .entry((eo & mask_low) as u32)
+                    .or_default()
+                    .push((h, eo));
+            }
+        }
+
+        let n_blocks = (index.len() / 8 + 1)
+            .next_power_of_two()
+            .min(64 * 1024 * 1024 / 8);
+        let n_block_mask = n_blocks - 1;
+        let mut bloom = vec![0u64; n_blocks];
+        for &key in index.keys() {
+            let h1 = (key as usize).wrapping_mul(0x9e37_79b9);
+            let block = (h1 >> 6) & n_block_mask;
+            let bit1 = h1 & 63;
+            let bit2 = (key as usize).wrapping_mul(0x517c_c1b7) & 63;
+            bloom[block] |= (1u64 << bit1) | (1u64 << bit2);
+        }
+
+        let chunk_results: Vec<(u32, Vec<(u64, ErrorEntry)>)> = genome_seqs
+            .par_iter()
+            .map(|(g, seq)| {
+                let mut matches: Vec<(u64, ErrorEntry)> = Vec::new();
+                let mut local_consumed: FxHashSet<u64> = FxHashSet::default();
+                let mut base_global = 0u64;
+                for (clen, contig) in &seq.contigs {
+                    let clen = *clen;
+                    if clen >= k {
+                        let (mut f, _) = window_fr(contig, 0, k);
+                        for start in 0..=(clen - k) {
+                            if start > 0 {
+                                let pos = start + k - 1;
+                                let base = (contig[pos / 4] >> (2 * (pos % 4))) & 3;
+                                f = ((f << 2) | base as u64) & mask_full;
                             }
-                            let Some(cands) = index.get(&key) else {
-                                continue;
-                            };
-                            for &(h, eo) in cands {
-                                if local_consumed.contains(&h) {
+                            for key in [(f >> shift_hi) as u32, (f & mask_low) as u32] {
+                                let h1 = (key as usize).wrapping_mul(0x9e37_79b9);
+                                let block = (h1 >> 6) & n_block_mask;
+                                let bit1 = h1 & 63;
+                                let bit2 = (key as usize).wrapping_mul(0x517c_c1b7) & 63;
+                                let bmask = (1u64 << bit1) | (1u64 << bit2);
+                                if bloom[block] & bmask != bmask {
                                     continue;
                                 }
-                                if let Some(off) = single_base_diff(f, eo, k) {
-                                    let j = k - 1 - off;
-                                    let base = ((eo >> (2 * j)) & 3) as u8;
-                                    let r = revcomp_kmer(f, k);
-                                    if substituted_hash(f, r, k, off, base) == h {
-                                        let global = base_global + start as u64;
-                                        matches.push((
-                                            h,
-                                            ErrorEntry {
-                                                pos: global.min(u32::MAX as u64),
-                                                off: off as u8,
-                                                base,
-                                            },
-                                        ));
-                                        local_consumed.insert(h);
+                                let Some(cands) = index.get(&key) else {
+                                    continue;
+                                };
+                                for &(h, eo) in cands {
+                                    if local_consumed.contains(&h) {
+                                        continue;
+                                    }
+                                    if let Some(off) = single_base_diff(f, eo, k) {
+                                        let j = k - 1 - off;
+                                        let base = ((eo >> (2 * j)) & 3) as u8;
+                                        let r = revcomp_kmer(f, k);
+                                        if substituted_hash(f, r, k, off, base) == h {
+                                            let global = base_global + start as u64;
+                                            matches.push((
+                                                h,
+                                                ErrorEntry {
+                                                    pos: global.min(u32::MAX as u64),
+                                                    off: off as u8,
+                                                    base,
+                                                },
+                                            ));
+                                            local_consumed.insert(h);
+                                        }
                                     }
                                 }
                             }
                         }
                     }
+                    base_global += clen as u64;
                 }
-                base_global += clen as u64;
-            }
-            (*g, matches)
-        })
-        .collect();
+                (*g, matches)
+            })
+            .collect();
 
-    // Phase 3 (sequential): cross-genome dedup. Genomes are in sorted order; the
-    // first genome to claim a novel hash wins; later genomes' entries for the same
-    // hash are discarded.
-    for (g, matches) in per_genome {
+        for (g, matches) in chunk_results {
+            if !matches.is_empty() {
+                per_genome_matches.entry(g).or_default().extend(matches);
+            }
+        }
+    }
+
+    // Phase 3 (sequential): cross-genome dedup in sorted eligible order.
+    // First genome to claim a novel hash wins; later genomes' entries are discarded.
+    for &g in &eligible {
+        let Some(matches) = per_genome_matches.remove(&g) else {
+            continue;
+        };
         let mut entries: Vec<ErrorEntry> = matches
             .into_iter()
             .filter_map(|(h, entry)| consumed.insert(h).then_some(entry))
@@ -1553,6 +1558,8 @@ pub fn compress_seq_with_screen_ani_and_telemetry<W: Write>(
         novel.len(),
         assign_start.elapsed().as_secs_f64()
     );
+    drop(map); // ~4GB freed: no longer needed after stage 3
+    novel.shrink_to_fit(); // release Vec doubling headroom (~2 GB for large samples)
 
     // Reclassify novel hashes that are single-substitution variants of a hit
     // representative genome's k-mers into compact (position, offset, base) entries.
@@ -1565,11 +1572,29 @@ pub fn compress_seq_with_screen_ani_and_telemetry<W: Write>(
                 per_genome.get(g).map(|v| v.len()).unwrap_or(0) >= min_dense_kmers_for_error
             })
             .collect();
-        let (by_genome, consumed) = find_error_kmers(idx, &error_hits, &novel, sketch.c, sketch.k)?;
-        if !consumed.is_empty() {
-            novel.retain(|h| !consumed.contains(h));
+        // Guard: skip error scan when chunk-genome work exceeds the runtime budget.
+        // Each pair costs ~0.7 CPU-s; MAX_ERROR_SCAN_PAIRS ≈ 30 min at 4 threads.
+        // For samples with very large novel sets the error fraction is negligible.
+        let n_novel_chunks = (novel.len() + NOVEL_CHUNK - 1) / NOVEL_CHUNK;
+        let work_pairs = n_novel_chunks.saturating_mul(error_hits.len());
+        if work_pairs > MAX_ERROR_SCAN_PAIRS {
+            info!(
+                "ref-compress stage4 skip: {} novel chunks × {} eligible genomes = {} pairs \
+                 exceeds limit {}; error-kmer scan skipped",
+                n_novel_chunks,
+                error_hits.len(),
+                work_pairs,
+                MAX_ERROR_SCAN_PAIRS
+            );
+            Vec::new()
+        } else {
+            let (by_genome, consumed) =
+                find_error_kmers(idx, &error_hits, &novel, sketch.c, sketch.k)?;
+            if !consumed.is_empty() {
+                novel.retain(|h| !consumed.contains(h));
+            }
+            by_genome
         }
-        by_genome
     } else {
         Vec::new()
     };
@@ -1842,7 +1867,7 @@ pub fn decompress_seq_with_meta<R: Read>(
                 let off = offsets[e] as usize;
                 let base = (packed[e / 4] >> (2 * (e % 4))) & 3;
                 let (ci, local) = seq.locate(&cum, pos);
-                let (f, rr) = window_fr(&seq.contigs[ci], local, k);
+                let (f, rr) = window_fr(&seq.contigs[ci].1, local, k);
                 hashes.push(substituted_hash(f, rr, k, off, base));
                 e += 1;
             }

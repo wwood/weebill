@@ -218,10 +218,15 @@ fn error_kmer_fixture(
     };
     let tax: FxHashMap<String, (String, bool)> = FxHashMap::default();
     let mut db = refdelta::build_refdb(&[gsketch], &tax);
-    // store the genome sequence (codes) for the single representative (id 0)
-    let codes: Vec<u8> = genome.iter().map(|&b| BYTE_TO_SEQ[b as usize]).collect();
+    // store the genome sequence packed 4 bases per byte (same format as on disk)
+    let seq_len = genome.len();
+    let mut packed = vec![0u8; (seq_len + 3) / 4];
+    for (i, &b) in genome.iter().enumerate() {
+        let code = BYTE_TO_SEQ[b as usize];
+        packed[i / 4] |= (code & 3) << (2 * (i % 4));
+    }
     db.rep_seqs = vec![Some(GenomeSource::InMemory(GenomeSeq {
-        contigs: vec![codes],
+        contigs: vec![(seq_len, packed)],
     }))];
 
     let idx = refdelta::open_ref_index(std::io::Cursor::new(write_refdb_to_vec(&db, 1))).unwrap();
