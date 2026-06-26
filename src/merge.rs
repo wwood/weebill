@@ -8,11 +8,9 @@ use std::io::{BufReader, BufWriter};
 use std::path::Path;
 
 fn open_reference(path: &str) -> refdelta::RefIndex {
-    let r = BufReader::with_capacity(
-        10_000_000,
-        File::open(path).unwrap_or_else(|_| panic!("Could not open reference database {}", path)),
-    );
-    refdelta::open_ref_index(r)
+    let file =
+        File::open(path).unwrap_or_else(|_| panic!("Could not open reference database {}", path));
+    refdelta::open_ref_index_file(file)
         .unwrap_or_else(|e| panic!("{} is not a valid reference database: {}", path, e))
 }
 
@@ -175,7 +173,14 @@ pub fn merge_sketches(
 
     for (sketch, meta) in sketches[1..].iter() {
         for (kmer, count) in sketch.kmer_counts.iter() {
-            *merged_counts.entry(*kmer).or_insert(0) += count;
+            let slot = merged_counts.entry(*kmer).or_insert(0);
+            *slot = slot.checked_add(*count).unwrap_or_else(|| {
+                error!(
+                    "k-mer count overflowed u32 while merging (a k-mer's summed count exceeds {}). Exiting.",
+                    u32::MAX
+                );
+                std::process::exit(1);
+            });
         }
         total_reads += meta.num_reads;
         weighted_length += sketch.mean_read_length * meta.num_reads as f64;

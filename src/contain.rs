@@ -451,6 +451,9 @@ pub fn contain(mut args: ContainArgs, pseudotax_in: bool) {
         read_files.push(vec![read]);
     }
 
+    // Interleaved inputs are encoded as a 3-element group (the path repeated) so
+    // get_seq_sketch can distinguish them by length from single (1) and paired (2)
+    // inputs; only the first element is actually used when sketching.
     for read in args.interleaved.iter() {
         read_files.push(vec![read, read, read]);
     }
@@ -475,13 +478,10 @@ pub fn contain(mut args: ContainArgs, pseudotax_in: bool) {
                 "Loading reference database {} for .sylspr decoding...",
                 path
             );
-            let r = BufReader::with_capacity(
-                10_000_000,
-                File::open(path)
-                    .unwrap_or_else(|_| panic!("Could not open reference database {}", path)),
-            );
+            let file = File::open(path)
+                .unwrap_or_else(|_| panic!("Could not open reference database {}", path));
             Some(
-                crate::refdelta::open_ref_index(r).unwrap_or_else(|e| {
+                crate::refdelta::open_ref_index_file(file).unwrap_or_else(|e| {
                     panic!("{} is not a valid reference database: {}", path, e)
                 }),
             )

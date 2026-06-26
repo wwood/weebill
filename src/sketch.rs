@@ -352,11 +352,8 @@ pub fn sketch(args: SketchArgs) {
     parse_paired_end_reads(&args, &mut first_pairs, &mut second_pairs);
     let interleaved_inputs = args.interleaved.clone();
     let ref_index = args.reference.as_ref().map(|path| {
-        let r = BufReader::with_capacity(
-            10_000_000,
-            File::open(path).unwrap_or_else(|_| panic!("Could not open {}", path)),
-        );
-        refdelta::open_ref_index_for_compress(r)
+        let file = File::open(path).unwrap_or_else(|_| panic!("Could not open {}", path));
+        refdelta::open_ref_index_file_for_compress(file)
             .unwrap_or_else(|e| panic!("{} is not a valid reference DB: {}", path, e))
     });
 

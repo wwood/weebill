@@ -258,6 +258,12 @@ fn find_error_kmers(
         let n_blocks = (index.len() / 4 + 1)
             .next_power_of_two()
             .min(128 * 1024 * 1024 / 8);
+        // `n_block_mask` is used as an AND-mask in `bloom_locate`, so the block
+        // count must stay a power of two; the `.min()` cap above is itself 2^24.
+        debug_assert!(
+            n_blocks.is_power_of_two(),
+            "bloom block count must remain a power of two for masking"
+        );
         let n_block_mask = n_blocks - 1;
         let mut bloom = vec![0u64; n_blocks];
         for &key in index.keys() {
@@ -298,11 +304,18 @@ fn find_error_kmers(
                                         let base = ((eo >> (2 * j)) & 3) as u8;
                                         let r = revcomp_kmer(f, k);
                                         if substituted_hash(f, r, k, off, base) == h {
+                                            // Full genome-relative base offset. The
+                                            // reference build (`--store-genomes`)
+                                            // rejects any stored genome longer than
+                                            // u32::MAX bases, so this is bounded and
+                                            // never needs clamping here (clamping
+                                            // would silently corrupt the decoded
+                                            // position).
                                             let global = base_global + start as u64;
                                             matches.push((
                                                 h,
                                                 ErrorEntry {
-                                                    pos: global.min(u32::MAX as u64),
+                                                    pos: global,
                                                     off: off as u8,
                                                     base,
                                                 },
@@ -392,25 +405,46 @@ fn encode_error_section(by_genome: &[(u32, Vec<ErrorEntry>)]) -> io::Result<(Vec
 
 // --- compress_seq* entry points ----------------------------------------------
 
-/// Compress a read sketch against the reference index. Only the sample's hit
-/// genomes' dense blocks are loaded; the pool is already resident in `idx`.
+/// Tunables for reference-delta compression. Use `CompressOpts::default()` for the
+/// standard settings and override only the fields you need (e.g. `meta`, or
+/// `enable_error_kmers: false`).
+#[derive(Clone)]
+pub struct CompressOpts {
+    /// Sketch-merge metadata (read count, etc.) to embed in the output.
+    pub meta: ReadSketchMeta,
+    /// Stage-1 sparse-screen ANI threshold for selecting hit genomes.
+    pub ref_screen_ani: f64,
+    /// Minimum assigned dense k-mers a genome needs before it is scanned for
+    /// single-substitution error k-mers.
+    pub min_dense_kmers_for_error: usize,
+    /// Whether to reclassify novel hashes as single-substitution error k-mers.
+    pub enable_error_kmers: bool,
+}
+
+impl Default for CompressOpts {
+    fn default() -> Self {
+        CompressOpts {
+            meta: ReadSketchMeta::default(),
+            ref_screen_ani: REF_SCREEN_ANI_DEFAULT,
+            min_dense_kmers_for_error: MIN_DENSE_KMERS_FOR_ERROR_DEFAULT,
+            enable_error_kmers: true,
+        }
+    }
+}
+
+/// Compress a read sketch against the reference index with default options. Only
+/// the sample's hit genomes' dense blocks are loaded; the pool is already resident
+/// in `idx`.
 pub fn compress_seq<W: Write>(
     inner: W,
     sketch: &SequencesSketch,
     idx: &RefIndex,
     ref_db_name: &str,
 ) -> io::Result<()> {
-    compress_seq_with_screen_ani(
-        inner,
-        sketch,
-        idx,
-        ref_db_name,
-        ReadSketchMeta::default(),
-        REF_SCREEN_ANI_DEFAULT,
-        MIN_DENSE_KMERS_FOR_ERROR_DEFAULT,
-    )
+    compress_seq_with_opts(inner, sketch, idx, ref_db_name, CompressOpts::default()).map(|_| ())
 }
 
+/// As [`compress_seq`], but carrying sketch-merge metadata (read count, etc.).
 pub fn compress_seq_with_meta<W: Write>(
     inner: W,
     sketch: &SequencesSketch,
@@ -418,72 +452,35 @@ pub fn compress_seq_with_meta<W: Write>(
     ref_db_name: &str,
     meta: ReadSketchMeta,
 ) -> io::Result<()> {
-    compress_seq_with_screen_ani(
+    compress_seq_with_opts(
         inner,
         sketch,
         idx,
         ref_db_name,
-        meta,
-        REF_SCREEN_ANI_DEFAULT,
-        MIN_DENSE_KMERS_FOR_ERROR_DEFAULT,
-    )
-}
-
-pub fn compress_seq_with_screen_ani<W: Write>(
-    inner: W,
-    sketch: &SequencesSketch,
-    idx: &RefIndex,
-    ref_db_name: &str,
-    meta: ReadSketchMeta,
-    ref_screen_ani: f64,
-    min_dense_kmers_for_error: usize,
-) -> io::Result<()> {
-    compress_seq_with_screen_ani_and_error_kmers(
-        inner,
-        sketch,
-        idx,
-        ref_db_name,
-        meta,
-        ref_screen_ani,
-        min_dense_kmers_for_error,
-        true,
-    )
-}
-
-pub fn compress_seq_with_screen_ani_and_error_kmers<W: Write>(
-    inner: W,
-    sketch: &SequencesSketch,
-    idx: &RefIndex,
-    ref_db_name: &str,
-    meta: ReadSketchMeta,
-    ref_screen_ani: f64,
-    min_dense_kmers_for_error: usize,
-    enable_error_kmers: bool,
-) -> io::Result<()> {
-    compress_seq_with_screen_ani_and_telemetry(
-        inner,
-        sketch,
-        idx,
-        ref_db_name,
-        meta,
-        ref_screen_ani,
-        min_dense_kmers_for_error,
-        enable_error_kmers,
+        CompressOpts {
+            meta,
+            ..CompressOpts::default()
+        },
     )
     .map(|_| ())
 }
 
-pub fn compress_seq_with_screen_ani_and_telemetry<W: Write>(
+/// Full compression entry point: honours every field of `opts` and returns the
+/// per-hit-genome telemetry rows (callers that don't need them can ignore the vec).
+pub fn compress_seq_with_opts<W: Write>(
     inner: W,
     sketch: &SequencesSketch,
     idx: &RefIndex,
     ref_db_name: &str,
-    meta: ReadSketchMeta,
-    ref_screen_ani: f64,
-    min_dense_kmers_for_error: usize,
-    enable_error_kmers: bool,
+    opts: CompressOpts,
 ) -> io::Result<Vec<RefCompressTelemetry>> {
     use super::ref_build::sparse_naive_ani;
+    let CompressOpts {
+        meta,
+        ref_screen_ani,
+        min_dense_kmers_for_error,
+        enable_error_kmers,
+    } = opts;
 
     let total_start = Instant::now();
     let stage1_start = Instant::now();
@@ -675,18 +672,18 @@ pub fn compress_seq_with_screen_ani_and_telemetry<W: Write>(
     let telemetry = hit_counts
         .into_iter()
         .map(|(g, sparse_hits)| {
-            let meta = &idx.genomes[g as usize];
+            let gmeta = &idx.genomes[g as usize];
             RefCompressTelemetry {
                 sample_name: sample_name.clone(),
                 ref_db_name: ref_db_name.to_string(),
                 ref_screen_ani,
                 hit_genomes_total,
                 genome_id: g,
-                genome_file: meta.file_name.clone(),
-                species: meta.species.clone(),
+                genome_file: gmeta.file_name.clone(),
+                species: gmeta.species.clone(),
                 sparse_hits,
-                sparse_total: meta.sparse_count,
-                sparse_ani: sparse_naive_ani(sparse_hits, meta.sparse_count, idx.k),
+                sparse_total: gmeta.sparse_count,
+                sparse_ani: sparse_naive_ani(sparse_hits, gmeta.sparse_count, idx.k),
                 assigned_kmers: per_genome.get(&g).map(|v| v.len()).unwrap_or(0),
                 error_kmers: *error_counts.get(&g).unwrap_or(&0),
             }
@@ -1169,15 +1166,17 @@ pub fn run_ref_compress(args: RefCompressArgs) {
             let w = BufWriter::new(
                 File::create(&out).unwrap_or_else(|_| panic!("Could not create {:?}", out)),
             );
-            let telemetry = compress_seq_with_screen_ani_and_telemetry(
+            let telemetry = compress_seq_with_opts(
                 w,
                 &sketch,
                 &idx,
                 ref_db,
-                ReadSketchMeta::default(),
-                args.ref_screen_ani,
-                args.min_dense_kmers_for_error,
-                !args.no_error_kmer,
+                CompressOpts {
+                    meta: ReadSketchMeta::default(),
+                    ref_screen_ani: args.ref_screen_ani,
+                    min_dense_kmers_for_error: args.min_dense_kmers_for_error,
+                    enable_error_kmers: !args.no_error_kmer,
+                },
             )
             .unwrap_or_else(|e| panic!("Failed to compress {}: {}", f, e));
             if let Some(writer) = &telemetry_writer {

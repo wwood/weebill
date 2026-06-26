@@ -12,6 +12,7 @@ use log::*;
 use rayon::prelude::*;
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -141,22 +142,43 @@ fn write_genome_seq_block<W: Write>(w: &mut W, seq: &GenomeSeq) -> io::Result<()
     Ok(())
 }
 
-/// Materialize a genome source and serialize it into a self-contained block, or
-/// `None` if a `Path` source cannot be read (that genome then simply gets no
-/// stored sequence and falls back to full-price coding).
-fn genome_block_bytes(src: &GenomeSource) -> io::Result<Option<Vec<u8>>> {
+/// Materialize a genome source and serialize it into a self-contained block.
+/// Under `--store-genomes` an unreadable FASTA or an over-long genome is a hard
+/// error that aborts the build (rather than silently dropping the sequence).
+fn genome_block_bytes(src: &GenomeSource, name: &str) -> io::Result<Vec<u8>> {
     let seq = match src {
-        GenomeSource::InMemory(s) => Some(s.clone()),
-        GenomeSource::Path(p) => read_genome_seq_from_fasta(p),
+        GenomeSource::InMemory(s) => s.clone(),
+        GenomeSource::Path(p) => read_genome_seq_from_fasta(p).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "--store-genomes: could not read genome FASTA {} (for {}). \
+                     Fix/remove the file or rebuild without --store-genomes.",
+                    p, name
+                ),
+            )
+        })?,
     };
-    match seq {
-        Some(s) => {
-            let mut v = Vec::new();
-            write_genome_seq_block(&mut v, &s)?;
-            Ok(Some(v))
-        }
-        None => Ok(None),
+    // Error-k-mer encoding records each error k-mer by its base offset within the
+    // genome; sylph bounds those offsets to the u32 range. A stored genome longer
+    // than u32::MAX bases would overflow that, so reject it at build time rather
+    // than silently corrupting positions when samples are later compressed.
+    let total: u64 = seq.contigs.iter().map(|(len, _)| *len as u64).sum();
+    if total > u32::MAX as u64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "--store-genomes: genome {} is {} bases, exceeding the {}-base limit \
+                 for error-k-mer encoding. Rebuild without --store-genomes.",
+                name,
+                total,
+                u32::MAX
+            ),
+        ));
     }
+    let mut v = Vec::new();
+    write_genome_seq_block(&mut v, &seq)?;
+    Ok(v)
 }
 
 pub(crate) fn read_genome_seq_block<R: Read>(r: &mut R) -> io::Result<GenomeSeq> {
@@ -570,14 +592,17 @@ pub fn write_refdb<W: Write + Seek>(mut w: W, db: &RefDb, sparse_c: usize) -> io
             let g1 = (g0 + SEQ_CHUNK).min(ng);
             let blocks: Vec<(usize, Option<Vec<u8>>)> = (g0..g1)
                 .into_par_iter()
-                .map(|g| {
+                .map(|g| -> io::Result<(usize, Option<Vec<u8>>)> {
+                    // A genome with no source (a strain) stores no sequence; for a
+                    // representative an unreadable or over-long FASTA is a hard
+                    // error that aborts the build.
                     let blk = match db.rep_seqs.get(g).and_then(|s| s.as_ref()) {
-                        Some(src) => genome_block_bytes(src).unwrap_or(None),
+                        Some(src) => Some(genome_block_bytes(src, &db.genomes[g].file_name)?),
                         None => None,
                     };
-                    (g, blk)
+                    Ok((g, blk))
                 })
-                .collect();
+                .collect::<io::Result<Vec<_>>>()?;
             for (g, blk) in blocks {
                 if let Some(b) = blk {
                     seq_off[g] = pos;
@@ -647,9 +672,58 @@ pub struct RefGenomeMeta {
     seq_offset: u64,
 }
 
-/// Any source we can both stream and seek (a file or an in-memory cursor).
-pub trait ReadSeek: Read + Seek + Send {}
-impl<T: Read + Seek + Send> ReadSeek for T {}
+/// Backing store for on-demand block reads. `File` uses positional `read_at`
+/// (pread) with no shared cursor, so concurrent dense-block / sequence loads from
+/// any number of threads need no lock; `Owned` holds the whole file in memory
+/// (for in-memory readers / tests). This mirrors `twostage_db::DenseData`.
+enum RefStore {
+    File(File),
+    Owned(Vec<u8>),
+}
+
+/// A `Read` positioned at a byte offset into a `RefStore`. For the `File` backing
+/// each cursor reads positionally (`read_at`), so any number can be alive on
+/// different threads at once; for `Owned` it is a zero-copy slice.
+enum RefCursor<'a> {
+    File { file: &'a File, pos: u64 },
+    Slice(&'a [u8]),
+}
+
+impl Read for RefCursor<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            RefCursor::File { file, pos } => {
+                let n = file.read_at(buf, *pos)?;
+                *pos += n as u64;
+                Ok(n)
+            }
+            RefCursor::Slice(s) => {
+                let n = s.len().min(buf.len());
+                buf[..n].copy_from_slice(&s[..n]);
+                *s = &s[n..];
+                Ok(n)
+            }
+        }
+    }
+}
+
+impl RefStore {
+    /// A fresh reader starting at byte `off`. Wrap in a `BufReader` for blocks read
+    /// byte-by-byte (Golomb-Rice / per-element loops) so the `File` backing doesn't
+    /// issue a syscall per byte.
+    fn cursor(&self, off: u64) -> RefCursor<'_> {
+        match self {
+            RefStore::File(file) => RefCursor::File { file, pos: off },
+            RefStore::Owned(v) => RefCursor::Slice(&v[off as usize..]),
+        }
+    }
+    fn len(&self) -> io::Result<u64> {
+        match self {
+            RefStore::File(file) => Ok(file.metadata()?.len()),
+            RefStore::Owned(v) => Ok(v.len() as u64),
+        }
+    }
+}
 
 /// An opened two-stage reference. Constructing it loads only the stage-1 sparse
 /// index and the shared pool; per-genome dense blocks are decoded lazily (and
@@ -667,7 +741,7 @@ pub struct RefIndex {
     /// shared pool, loaded once.
     pub(crate) pool: Vec<u64>,
     pool_mphf: Mphf<u64>,
-    reader: Mutex<Box<dyn ReadSeek>>,
+    store: RefStore,
     cache: Mutex<FxHashMap<u32, Arc<Vec<u64>>>>,
     /// decoded 2-bit genome sequences, loaded on demand and cached.
     seq_cache: Mutex<FxHashMap<u32, Arc<GenomeSeq>>>,
@@ -687,21 +761,30 @@ enum RefOpenMode {
     CompressionOnly,
 }
 
-/// Open a `.sylref`, loading stage 1 (sparse index) and the shared pool.
-pub fn open_ref_index<R: Read + Seek + Send + 'static>(r: R) -> io::Result<RefIndex> {
-    open_ref_index_with_mode(r, RefOpenMode::Full)
+/// Open a `.sylref` file with positional (lock-free) block reads, loading stage 1
+/// (sparse index) and the shared pool. This is the path used in production.
+pub fn open_ref_index_file(file: File) -> io::Result<RefIndex> {
+    open_ref_index_from_store(RefStore::File(file), RefOpenMode::Full)
 }
 
-pub fn open_ref_index_for_compress<R: Read + Seek + Send + 'static>(r: R) -> io::Result<RefIndex> {
-    open_ref_index_with_mode(r, RefOpenMode::CompressionOnly)
+/// As [`open_ref_index_file`], but compression-only (skips the decode-side checks).
+pub fn open_ref_index_file_for_compress(file: File) -> io::Result<RefIndex> {
+    open_ref_index_from_store(RefStore::File(file), RefOpenMode::CompressionOnly)
 }
 
-fn open_ref_index_with_mode<R: Read + Seek + Send + 'static>(
-    mut r: R,
-    mode: RefOpenMode,
-) -> io::Result<RefIndex> {
+/// Open a `.sylref` from an arbitrary reader by buffering it fully into memory.
+/// Convenient for tests / in-memory cursors; prefer [`open_ref_index_file`] for
+/// real files so blocks are read on demand rather than all held in RAM.
+pub fn open_ref_index<R: Read>(mut r: R) -> io::Result<RefIndex> {
+    let mut v = Vec::new();
+    r.read_to_end(&mut v)?;
+    open_ref_index_from_store(RefStore::Owned(v), RefOpenMode::Full)
+}
+
+fn open_ref_index_from_store(store: RefStore, mode: RefOpenMode) -> io::Result<RefIndex> {
+    let total_len = store.len()?;
     let mut hdr = [0u8; HEADER_LEN as usize];
-    r.read_exact(&mut hdr)?;
+    store.cursor(0).read_exact(&mut hdr)?;
     if &hdr[0..4] != REFDB_MAGIC {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -716,11 +799,16 @@ fn open_ref_index_with_mode<R: Read + Seek + Send + 'static>(
         ));
     }
     let footer_offset = u64::from_le_bytes(hdr[5..13].try_into().unwrap());
+    if footer_offset > total_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "reference DB footer offset out of range",
+        ));
+    }
 
-    // footer
-    r.seek(SeekFrom::Start(footer_offset))?;
+    // footer: from footer_offset to EOF
     let mut comp = Vec::new();
-    r.read_to_end(&mut comp)?;
+    store.cursor(footer_offset).read_to_end(&mut comp)?;
     let fbytes = zstd::stream::decode_all(&comp[..])?;
     let mut f = &fbytes[..];
     let c = read_uvarint(&mut f)? as usize;
@@ -778,14 +866,18 @@ fn open_ref_index_with_mode<R: Read + Seek + Send + 'static>(
     }
 
     let total_sparse: usize = sparse_count.iter().sum();
-    r.seek(SeekFrom::Start(sparse_index_offset))?;
-    let (sparse_mphf, sparse_fingerprints, sparse_owners) =
-        read_sparse_index_block(&mut r, total_sparse)?;
+    // Buffered: these blocks are parsed via per-element reads.
+    let (sparse_mphf, sparse_fingerprints, sparse_owners) = {
+        let mut br = BufReader::with_capacity(1 << 20, store.cursor(sparse_index_offset));
+        read_sparse_index_block(&mut br, total_sparse)?
+    };
 
     // shared pool (loaded once). Hashes are stored in MPHF slot order, so
     // compression can compute a candidate slot and verify it without a HashMap.
-    r.seek(SeekFrom::Start(pool_offset))?;
-    let (pool_mphf, pool) = read_pool_block(&mut r, pool_domain)?;
+    let (pool_mphf, pool) = {
+        let mut br = BufReader::with_capacity(1 << 20, store.cursor(pool_offset));
+        read_pool_block(&mut br, pool_domain)?
+    };
 
     Ok(RefIndex {
         c,
@@ -798,7 +890,7 @@ fn open_ref_index_with_mode<R: Read + Seek + Send + 'static>(
         sparse_owners,
         pool,
         pool_mphf,
-        reader: Mutex::new(Box::new(r)),
+        store,
         cache: Mutex::new(FxHashMap::default()),
         seq_cache: Mutex::new(FxHashMap::default()),
         compression_only: matches!(mode, RefOpenMode::CompressionOnly),
@@ -848,20 +940,18 @@ impl RefIndex {
             return Ok(a.clone());
         }
         let meta = &self.genomes[g as usize];
-        let (complement, sparse) = {
-            let mut rd = self.reader.lock().unwrap();
-            rd.seek(SeekFrom::Start(meta.dense_offset))?;
-            let mut r: &mut dyn ReadSeek = &mut **rd;
-            let complement = read_hashes(&mut r)?;
-
-            rd.seek(SeekFrom::Start(meta.sparse_offset))?;
-            let mut sparse = Vec::with_capacity(meta.sparse_count as usize);
-            for _ in 0..meta.sparse_count {
-                let mut buf = [0u8; 8];
-                rd.read_exact(&mut buf)?;
-                sparse.push(u64::from_le_bytes(buf));
-            }
-            (complement, sparse)
+        // Two independent positional reads (no shared cursor, no lock): the
+        // Golomb-Rice dense block and the genome's contiguous sparse run.
+        let complement = {
+            let mut br = BufReader::with_capacity(1 << 16, self.store.cursor(meta.dense_offset));
+            read_hashes(&mut br)?
+        };
+        let sparse = {
+            let mut raw = vec![0u8; meta.sparse_count as usize * 8];
+            self.store.cursor(meta.sparse_offset).read_exact(&mut raw)?;
+            raw.chunks_exact(8)
+                .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
+                .collect::<Vec<u64>>()
         };
         // merge two sorted, disjoint ascending runs into the full distinctive array
         let mut arr = Vec::with_capacity(complement.len() + sparse.len());
@@ -893,10 +983,8 @@ impl RefIndex {
             return Ok(Some(a.clone()));
         }
         let seq = {
-            let mut rd = self.reader.lock().unwrap();
-            rd.seek(SeekFrom::Start(off))?;
-            let mut r: &mut dyn ReadSeek = &mut **rd;
-            read_genome_seq_block(&mut r)?
+            let mut br = BufReader::with_capacity(1 << 16, self.store.cursor(off));
+            read_genome_seq_block(&mut br)?
         };
         let arc = Arc::new(seq);
         self.seq_cache.lock().unwrap().insert(g, arc.clone());
@@ -1047,8 +1135,8 @@ fn process_shard(path: &Path, remap: &[u32], pool_min_genomes: u32) -> io::Resul
 /// source FASTA the sketch recorded. Strains are skipped (errors are only encoded
 /// against representatives). The FASTAs are not read here — `write_refdb` streams
 /// and 2-bit packs them one genome at a time, so even a 200k-genome reference does
-/// not hold every sequence in RAM. A FASTA that turns out to be unreadable simply
-/// yields no stored sequence (that genome falls back to full-price coding).
+/// not hold every sequence in RAM. A representative FASTA that turns out to be
+/// unreadable (or longer than the u32 base-offset limit) aborts the build.
 fn set_rep_seq_sources(db: &mut RefDb) {
     let sources: Vec<Option<GenomeSource>> = db
         .genomes
@@ -1116,15 +1204,13 @@ pub(super) fn open_refdb_file_for_compress(path: &str) -> RefIndex {
 }
 
 fn open_refdb_file_with_mode(path: &str, compression_only: bool) -> RefIndex {
-    let r = BufReader::with_capacity(
-        10_000_000,
-        File::open(path).unwrap_or_else(|_| panic!("Could not open {}", path)),
-    );
+    let file = File::open(path).unwrap_or_else(|_| panic!("Could not open {}", path));
     if compression_only {
-        open_ref_index_for_compress(r)
+        open_ref_index_file_for_compress(file)
             .unwrap_or_else(|e| panic!("{} is not a valid reference DB: {}", path, e))
     } else {
-        open_ref_index(r).unwrap_or_else(|e| panic!("{} is not a valid reference DB: {}", path, e))
+        open_ref_index_file(file)
+            .unwrap_or_else(|e| panic!("{} is not a valid reference DB: {}", path, e))
     }
 }
 

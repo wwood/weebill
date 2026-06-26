@@ -4,7 +4,7 @@ use weebill::compress;
 use weebill::refdelta;
 use weebill::refdelta::{GenomeSeq, GenomeSource};
 use weebill::seeding;
-use weebill::types::{GenomeSketch, ReadSketchMeta, SequencesSketch, BYTE_TO_SEQ};
+use weebill::types::{GenomeSketch, SequencesSketch, BYTE_TO_SEQ};
 
 fn gsketch(file_name: &str, kmers: Vec<u64>) -> GenomeSketch {
     GenomeSketch {
@@ -324,15 +324,17 @@ fn refdelta_error_kmer_roundtrip_and_savings() {
     assert_eq!(sketch, decoded, "error-k-mer sketch must roundtrip exactly");
 
     let mut buf_no_error_kmer = Vec::new();
-    refdelta::compress_seq_with_screen_ani_and_error_kmers(
+    refdelta::compress_seq_with_opts(
         &mut buf_no_error_kmer,
         &sketch,
         &idx,
         "ref.sylref",
-        ReadSketchMeta::default(),
-        0.0,
-        0,
-        false,
+        refdelta::CompressOpts {
+            ref_screen_ani: 0.0,
+            min_dense_kmers_for_error: 0,
+            enable_error_kmers: false,
+            ..Default::default()
+        },
     )
     .unwrap();
     let decoded_no_error_kmer = refdelta::decompress_seq(&buf_no_error_kmer[..], &idx).unwrap();

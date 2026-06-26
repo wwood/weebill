@@ -32,7 +32,7 @@ pub(crate) fn decode_subset<R: Read>(r: &mut R, domain: u64) -> io::Result<Vec<u
             Ok(present)
         }
         SCHEME_BITMASK => {
-            let bm_len = ((domain + 7) / 8) as usize;
+            let bm_len = domain.div_ceil(8) as usize;
             let mut bm = vec![0u8; bm_len];
             r.read_exact(&mut bm)?;
             let mut present = Vec::new();

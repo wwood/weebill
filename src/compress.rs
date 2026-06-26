@@ -179,12 +179,17 @@ impl<'a, R: Read> BitReader<'a, R> {
         Ok(v)
     }
 
+    /// Read a unary-coded quotient (count of one-bits before the terminating
+    /// zero). Decoding trusts the input: there is deliberately no length guard, so
+    /// legitimately large quotients are fine (e.g. 4097 on SRR20217209 logan
+    /// contigs). A corrupt/truncated stream can only loop until the underlying
+    /// reader hits EOF — which errors — so there is no DoS, but the format is not
+    /// hardened against deliberately malformed bitstreams.
     #[inline]
     fn read_unary(&mut self) -> io::Result<u64> {
         let mut q = 0u64;
         while self.read_bit()? == 1 {
             q += 1;
-            // For very large "genomes", it is possible this legitimately goes beyond 4096 (e.g. 4097 on SRR20217209 logan contigs), so have no guard based on unary code length here (other than u64 overflow).
         }
         Ok(q)
     }

@@ -118,13 +118,12 @@ fn init_logger(trace: bool) {
 // Public re-exports — everything callers outside `refdelta` need.
 
 pub use ref_build::{
-    build_refdb, build_refdb_with_pool_min_genomes, open_ref_index, open_ref_index_for_compress,
-    run_ref_build, write_refdb, GenomeSeq, GenomeSource, ReadSeek, RefDb, RefGenome, RefGenomeMeta,
-    RefIndex,
+    build_refdb, build_refdb_with_pool_min_genomes, open_ref_index, open_ref_index_file,
+    open_ref_index_file_for_compress, run_ref_build, write_refdb, GenomeSeq, GenomeSource, RefDb,
+    RefGenome, RefGenomeMeta, RefIndex,
 };
 pub use sketch_compress::{
-    compress_seq, compress_seq_with_meta, compress_seq_with_screen_ani,
-    compress_seq_with_screen_ani_and_error_kmers, compress_seq_with_screen_ani_and_telemetry,
-    run_ref_compress, RefCompressTelemetry,
+    compress_seq, compress_seq_with_meta, compress_seq_with_opts, run_ref_compress, CompressOpts,
+    RefCompressTelemetry,
 };
 pub use sketch_decompress::{decompress_seq, decompress_seq_with_meta};
