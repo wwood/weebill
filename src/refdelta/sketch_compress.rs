@@ -47,7 +47,7 @@ pub(crate) fn encode_subset(out: &mut Vec<u8>, present: &[u64], domain: u64) -> 
     // present-Rice (cheap: O(present))
     let mut p_rice = Vec::new();
     write_hashes(&mut p_rice, present)?;
-    let bm_len = ((domain + 7) / 8) as usize;
+    let bm_len = domain.div_ceil(8) as usize;
 
     let mut best = (SCHEME_BITMASK, bm_len);
     if p_rice.len() < best.1 {
@@ -150,6 +150,29 @@ const NOVEL_CHUNK: usize = 8_000_000;
 /// and should just skip it.
 const MAX_ERROR_SCAN_PAIRS: usize = 40_000;
 
+/// Locate `key`'s block and the bit mask to set/test within the blocked bloom
+/// that prefilters the per-chunk novel-k-mer index. Build and query MUST derive
+/// bits identically, so both go through here.
+///
+/// Four bits/key (vs the classic two) cuts the false-positive rate several-fold
+/// at no extra memory access: every bit lives in the single 64-bit block that is
+/// already loaded, so it costs only a couple of ALU ops. Two multiplicative
+/// hashes supply four well-separated 6-bit fields. The block index and bit count
+/// together give ~16 bits/key (see `build` below), for a false-positive rate
+/// under ~0.5% instead of the prior ~5%. A false positive only wastes one
+/// `index` lookup, so the lower rate trims that cache-miss tail.
+#[inline]
+fn bloom_locate(key: u32, n_block_mask: usize) -> (usize, u64) {
+    let h1 = (key as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    let h2 = (key as u64).wrapping_mul(0xc2b2_ae3d_27d4_eb4f);
+    let block = (h1 >> 6) as usize & n_block_mask;
+    let bmask = (1u64 << (h1 & 63))
+        | (1u64 << ((h1 >> 32) & 63))
+        | (1u64 << (h2 & 63))
+        | (1u64 << ((h2 >> 32) & 63));
+    (block, bmask)
+}
+
 /// Try to express each `novel` hash as a single-base substitution of a hit
 /// **representative** genome's k-mer (sequencing errors produce exactly such
 /// k-mers). Reconstruction is deterministic and verified by hash equality, so a
@@ -211,6 +234,9 @@ fn find_error_kmers(
     let mut per_genome_matches: FxHashMap<u32, Vec<(u64, ErrorEntry)>> = FxHashMap::default();
 
     for chunk in novel.chunks(NOVEL_CHUNK) {
+        // Index each novel hash under both half-k-mer keys: a single-base
+        // substitution preserves at least one half, so the true genome
+        // neighbour is guaranteed to share a key.
         let mut index: FxHashMap<u32, Vec<(u64, u64)>> = FxHashMap::default();
         index.reserve(chunk.len() * 4);
         for &h in chunk {
@@ -227,17 +253,16 @@ fn find_error_kmers(
             }
         }
 
-        let n_blocks = (index.len() / 8 + 1)
+        // Blocked bloom prefilter over the index keys: ~4 keys per 64-bit block
+        // (16 bits/key) with 4 bits set per key (see `bloom_locate`).
+        let n_blocks = (index.len() / 4 + 1)
             .next_power_of_two()
-            .min(64 * 1024 * 1024 / 8);
+            .min(128 * 1024 * 1024 / 8);
         let n_block_mask = n_blocks - 1;
         let mut bloom = vec![0u64; n_blocks];
         for &key in index.keys() {
-            let h1 = (key as usize).wrapping_mul(0x9e37_79b9);
-            let block = (h1 >> 6) & n_block_mask;
-            let bit1 = h1 & 63;
-            let bit2 = (key as usize).wrapping_mul(0x517c_c1b7) & 63;
-            bloom[block] |= (1u64 << bit1) | (1u64 << bit2);
+            let (block, bmask) = bloom_locate(key, n_block_mask);
+            bloom[block] |= bmask;
         }
 
         let chunk_results: Vec<(u32, Vec<(u64, ErrorEntry)>)> = genome_seqs
@@ -257,11 +282,7 @@ fn find_error_kmers(
                                 f = ((f << 2) | base as u64) & mask_full;
                             }
                             for key in [(f >> shift_hi) as u32, (f & mask_low) as u32] {
-                                let h1 = (key as usize).wrapping_mul(0x9e37_79b9);
-                                let block = (h1 >> 6) & n_block_mask;
-                                let bit1 = h1 & 63;
-                                let bit2 = (key as usize).wrapping_mul(0x517c_c1b7) & 63;
-                                let bmask = (1u64 << bit1) | (1u64 << bit2);
+                                let (block, bmask) = bloom_locate(key, n_block_mask);
                                 if bloom[block] & bmask != bmask {
                                     continue;
                                 }
@@ -521,7 +542,7 @@ pub fn compress_seq_with_screen_ani_and_telemetry<W: Write>(
                 per_genome.get(g).map(|v| v.len()).unwrap_or(0) >= min_dense_kmers_for_error
             })
             .collect();
-        let n_novel_chunks = (novel.len() + NOVEL_CHUNK - 1) / NOVEL_CHUNK;
+        let n_novel_chunks = novel.len().div_ceil(NOVEL_CHUNK);
         let work_pairs = n_novel_chunks.saturating_mul(error_hits.len());
         if work_pairs > MAX_ERROR_SCAN_PAIRS {
             info!(
