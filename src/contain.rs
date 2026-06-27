@@ -2,7 +2,7 @@ use crate::cmdline::*;
 use crate::constants::*;
 use crate::inference::*;
 use crate::sketch::*;
-use crate::twostage_db::TwoStageDb;
+use crate::twostage_db::{ScreenIndex, TwoStageDb};
 use crate::types::*;
 use fxhash::FxHashMap;
 use log::*;
@@ -22,9 +22,9 @@ fn print_ani_result(ani_result: &AniResult, pseudotax: bool, writer: &mut Box<dy
     if let AdjustStatus::Lambda(lambda) = ani_result.lambda {
         lambda_print = format!("{:.3}", lambda);
     } else if ani_result.lambda == AdjustStatus::High {
-        lambda_print = format!("HIGH");
+        lambda_print = "HIGH".to_string();
     } else {
-        lambda_print = format!("LOW");
+        lambda_print = "LOW".to_string();
     }
     let low_ani = ani_result.ani_ci.0;
     let high_ani = ani_result.ani_ci.1;
@@ -205,13 +205,16 @@ fn densify_genome(
     Some(sketched)
 }
 
-/// Two-stage stage 1 + 2: screen `sequence_sketch` against all `genome_sketches`
-/// at the sparse `screen_c`, then return *dense* (`dense_c`) sketches for only
-/// the genomes that pass. The returned set replaces the full database for the
-/// (expensive) dense profiling that follows.
+/// Two-stage stage 1 + 2: screen `sequence_sketch` against the pooled
+/// `screen_index` (a single inverted pass over the sample at the sparse
+/// `screen_c`), then return *dense* (`dense_c`) sketches for only the genomes
+/// that pass. `plain_genome_sketches` is `Some` only for the non-`.syl2db`
+/// (densify) path; a `.syl2db` decodes survivors by index instead. The returned
+/// set replaces the full database for the (expensive) dense profiling that follows.
 fn compute_dense_survivors(
     args: &ContainArgs,
-    genome_sketches: &Vec<GenomeSketch>,
+    screen_index: &ScreenIndex,
+    plain_genome_sketches: Option<&Vec<GenomeSketch>>,
     sequence_sketch: &SequencesSketch,
     screen_c: usize,
     dense_c: usize,
@@ -240,7 +243,7 @@ fn compute_dense_survivors(
     // file name, which collapses `--individual-records` databases (many records
     // share a file name) into a single whole-file sketch. Reject that up front;
     // `db-convert` to a .syl2db preserves individual records and works fine.
-    if two_stage_db.is_none() {
+    if let Some(genome_sketches) = plain_genome_sketches {
         let mut seen = std::collections::HashSet::with_capacity(genome_sketches.len());
         for gs in genome_sketches.iter() {
             if !seen.insert(gs.file_name.as_str()) {
@@ -254,34 +257,56 @@ fn compute_dense_survivors(
         }
     }
 
-    let survivors: Mutex<Vec<usize>> = Mutex::new(vec![]);
+    // Stage 1 = "Path B": one inverted pass over the sample produces, per genome,
+    // the same matched-coverage multiset the per-genome `get_stats` loop would
+    // collect; feeding it to the same `finalize_stats` + `--screen-min-matches` +
+    // `min_number_kmers` checks reproduces the survivor set exactly, in O(sample)
+    // rather than O(reference) work. (See experiments/7_mphf_screen_again.)
+    let name_of = |g: usize| -> String {
+        match two_stage_db {
+            Some(db) => db.genome_file_name(g as u32).to_string(),
+            None => plain_genome_sketches.unwrap()[g].file_name.clone(),
+        }
+    };
+    let hits: Vec<(u32, Vec<u32>)> = screen_index
+        .gather_hits(sequence_sketch)
+        .into_iter()
+        .collect();
     // Optional per-survivor dump: (genome, matched k-mers, total screen k-mers,
     // naive ANI, adjusted ANI, median coverage).
     let dump: Mutex<Vec<(String, usize, usize, f64, f64, f64)>> = Mutex::new(vec![]);
-    (0..genome_sketches.len()).into_par_iter().for_each(|i| {
-        let sv = subsample_view(&genome_sketches[i], screen_c);
-        if let Some(res) = get_stats(&screen_args, &sv, sequence_sketch, None, false) {
+    let mut survivors: Vec<usize> = hits
+        .into_par_iter()
+        .filter_map(|(g, covs)| {
+            let g = g as usize;
+            let n_kmers = screen_index.sparse_count[g] as usize;
+            // Mirror get_stats: reject genomes below the (scaled) k-mer floor.
+            if (n_kmers as f64) < screen_args.min_number_kmers {
+                return None;
+            }
+            let contain_count = covs.len();
+            // finalize_stats applies the screen min-ANI gate (returns None below it).
+            let fin = finalize_stats(&screen_args, k, n_kmers, contain_count, covs, None)?;
             // Require at least `--screen-min-matches` matched screen k-mers; this
             // cheaply drops genomes that clear the (permissive) screen ANI on only
             // a few chance-shared k-mers, before they cost a dense decode. Default
             // 1 == current behaviour (get_stats already needs >= 1 match).
-            if res.containment_index.0 < args.screen_min_matches {
-                return;
+            if contain_count < args.screen_min_matches {
+                return None;
             }
             if args.screen_dump.is_some() {
                 dump.lock().unwrap().push((
-                    res.gn_name.to_string(),
-                    res.containment_index.0,
-                    res.containment_index.1,
-                    res.naive_ani * 100.,
-                    res.final_est_ani * 100.,
-                    res.median_cov,
+                    name_of(g),
+                    contain_count,
+                    n_kmers,
+                    fin.naive_ani * 100.,
+                    fin.final_est_ani * 100.,
+                    fin.median_cov,
                 ));
             }
-            survivors.lock().unwrap().push(i);
-        }
-    });
-    let mut survivors = survivors.into_inner().unwrap();
+            Some(g)
+        })
+        .collect();
     survivors.sort_unstable();
     log::info!(
         "{}: stage-1 screen (c={}, min-ANI {}) kept {} / {} candidate genomes",
@@ -289,7 +314,7 @@ fn compute_dense_survivors(
         screen_c,
         args.screen_ani,
         survivors.len(),
-        genome_sketches.len()
+        screen_index.num_genomes()
     );
     if let Some(path) = &args.screen_dump {
         let mut f =
@@ -319,7 +344,7 @@ fn compute_dense_survivors(
                 }
             },
             None => densify_genome(
-                &genome_sketches[*i],
+                &plain_genome_sketches.unwrap()[*i],
                 dense_c,
                 k,
                 min_spacing,
@@ -371,7 +396,7 @@ pub fn contain(mut args: ContainArgs, pseudotax_in: bool) {
     let out_writer = match args.out_file_name {
         Some(ref x) => {
             let path = Path::new(&x);
-            Box::new(BufWriter::new(File::create(&path).unwrap())) as Box<dyn Write + Send>
+            Box::new(BufWriter::new(File::create(path).unwrap())) as Box<dyn Write + Send>
         }
         None => Box::new(BufWriter::new(io::stdout())) as Box<dyn Write + Send>,
     };
@@ -425,9 +450,9 @@ pub fn contain(mut args: ContainArgs, pseudotax_in: bool) {
             genome_sketch_files.push(file);
         } else if sample_sketch_good_suffix {
             read_sketch_files.push(file);
-        } else if is_fasta(&file) {
+        } else if is_fasta(file) {
             genome_files.push(file);
-        } else if is_fastq(&file) {
+        } else if is_fastq(file) {
             read_files.push(vec![file]);
         } else {
             warn!(
@@ -529,26 +554,40 @@ pub fn contain(mut args: ContainArgs, pseudotax_in: bool) {
         None
     };
 
+    // A .syl2db screens via its pooled stage-1 index and decodes dense blocks by
+    // index for stage 2, so it carries no in-memory `GenomeSketch` list. Only the
+    // plain-database path materializes one here.
     let genome_sketches = match &two_stage_db {
-        Some(db) => db.screen_sketches.clone(),
+        Some(_) => Vec::new(),
         None => get_genome_sketches(&args, &genome_sketch_files, &genome_files),
     };
     log::info!("Finished obtaining genome sketches.");
 
-    if genome_sketches.is_empty() {
-        log::error!("No genome sketches found; see sylph query/profile -h for help. Exiting");
-        std::process::exit(1);
-    }
-
-    if genome_sketches
-        .first()
-        .unwrap()
-        .pseudotax_tracked_nonused_kmers
-        .is_none()
-        && args.pseudotax
-    {
-        log::error!("Attempting profiling, but *.syldb was sketched with the --disable-profiling option. Exiting");
-        std::process::exit(1);
+    match &two_stage_db {
+        Some(db) => {
+            if db.is_empty() {
+                log::error!("Two-stage database contains no genomes. Exiting");
+                std::process::exit(1);
+            }
+        }
+        None => {
+            if genome_sketches.is_empty() {
+                log::error!(
+                    "No genome sketches found; see sylph query/profile -h for help. Exiting"
+                );
+                std::process::exit(1);
+            }
+            if genome_sketches
+                .first()
+                .unwrap()
+                .pseudotax_tracked_nonused_kmers
+                .is_none()
+                && args.pseudotax
+            {
+                log::error!("Attempting profiling, but *.syldb was sketched with the --disable-profiling option. Exiting");
+                std::process::exit(1);
+            }
+        }
     }
 
     // ---- Two-stage profiling setup ----------------------------------------
@@ -605,6 +644,20 @@ pub fn contain(mut args: ContainArgs, pseudotax_in: bool) {
     // against: the full DB rate normally, or the dense rate under two-stage.
     let effective_genome_c = if args.two_stage { dense_c } else { db_c };
 
+    // Stage-1 screen index. A .syl2db carries its own (loaded from file); the
+    // plain-database two-stage path builds one in memory once, from each genome
+    // subsampled to `screen_c`.
+    let inmem_screen_index: Option<ScreenIndex> = if args.two_stage && two_stage_db.is_none() {
+        log::info!("Building in-memory stage-1 screen index (c={}).", screen_c);
+        let sparse_per_genome: Vec<Vec<u64>> = genome_sketches
+            .par_iter()
+            .map(|gs| subsample_view(gs, screen_c).genome_kmers)
+            .collect();
+        Some(ScreenIndex::build(&sparse_per_genome, screen_c, db_k))
+    } else {
+        None
+    };
+
     let num_raw_read_files = read_files.len();
     let step;
     if let Some(sample_threads) = args.sample_threads {
@@ -637,7 +690,7 @@ pub fn contain(mut args: ContainArgs, pseudotax_in: bool) {
 
     print_header(
         args.pseudotax,
-        &mut *out_writer.lock().unwrap(),
+        &mut out_writer.lock().unwrap(),
         args.estimate_unknown,
     );
     chunks.into_iter().for_each(|chunk| {
@@ -649,7 +702,7 @@ pub fn contain(mut args: ContainArgs, pseudotax_in: bool) {
                 is_sketch,
                 ref_db.as_ref(),
                 effective_genome_c,
-                genome_sketches[0].k,
+                db_k,
             );
             if sequence_sketch.is_some() {
                 let first_read_file = read_files[j][0];
@@ -672,9 +725,15 @@ pub fn contain(mut args: ContainArgs, pseudotax_in: bool) {
                 // with dense sketches of only the genomes that pass.
                 let dense_local: Vec<GenomeSketch>;
                 let active_sketches: &Vec<GenomeSketch> = if args.two_stage {
+                    let screen_index = match &two_stage_db {
+                        Some(db) => &db.screen_index,
+                        None => inmem_screen_index.as_ref().unwrap(),
+                    };
+                    let plain_genome_sketches = two_stage_db.is_none().then_some(&genome_sketches);
                     dense_local = compute_dense_survivors(
                         &args,
-                        &genome_sketches,
+                        screen_index,
+                        plain_genome_sketches,
                         &sequence_sketch,
                         screen_c,
                         dense_c,
@@ -695,7 +754,7 @@ pub fn contain(mut args: ContainArgs, pseudotax_in: bool) {
                     let genome_sketch = &active_sketches[*i];
                     let res = get_stats(
                         &args,
-                        &genome_sketch,
+                        genome_sketch,
                         &sequence_sketch,
                         None,
                         args.log_reassignments,
@@ -730,7 +789,7 @@ pub fn contain(mut args: ContainArgs, pseudotax_in: bool) {
                     remaining_genomes.into_par_iter().for_each(|genome_sketch| {
                         let res = get_stats(
                             &args,
-                            &genome_sketch,
+                            genome_sketch,
                             &sequence_sketch,
                             Some(&winner_map),
                             args.log_reassignments,
@@ -815,7 +874,7 @@ pub fn contain(mut args: ContainArgs, pseudotax_in: bool) {
 
                 let mut out_writer = out_writer.lock().unwrap();
                 for res in stats_vec_seq {
-                    print_ani_result(&res, args.pseudotax, &mut *out_writer);
+                    print_ani_result(&res, args.pseudotax, &mut out_writer);
                 }
             }
             if read_files[j].len() > 1 {
@@ -859,7 +918,7 @@ fn derep_if_reassign_threshold<'a>(
             );
         }
     }
-    return return_vec;
+    return_vec
 }
 
 fn estimate_true_cov(
@@ -902,7 +961,7 @@ fn estimate_covered_bases(
     if num_tentative_bases == 0. {
         return 0.;
     }
-    return f64::min(num_covered_bases as f64 / num_tentative_bases, 1.);
+    f64::min(num_covered_bases / num_tentative_bases, 1.)
 }
 
 fn winner_table<'a>(
@@ -976,7 +1035,7 @@ fn winner_table<'a>(
         });
     }
 
-    return kmer_to_genome_map;
+    kmer_to_genome_map
 }
 
 fn print_header(pseudotax: bool, writer: &mut Box<dyn Write + Send>, estimate_unknown: bool) {
@@ -1009,10 +1068,12 @@ fn get_genome_sketches(
     let genome_sketches = Mutex::new(vec![]);
 
     for genome_sketch_file in genome_sketch_files {
-        let file = File::open(genome_sketch_file).expect(&format!(
-            "The sketch `{}` could not be opened. Exiting",
-            genome_sketch_file
-        ));
+        let file = File::open(genome_sketch_file).unwrap_or_else(|_| {
+            panic!(
+                "The sketch `{}` could not be opened. Exiting",
+                genome_sketch_file
+            )
+        });
         let mut genome_reader = BufReader::with_capacity(10_000_000, file);
         let genome_sketches_vec: Vec<GenomeSketch> = if crate::compress::peek_is_compressed(
             &mut genome_reader,
@@ -1020,16 +1081,12 @@ fn get_genome_sketches(
         .unwrap_or(false)
         {
             crate::compress::read_genome_sketches_compressed(&mut genome_reader)
-                .expect(&format!(
-                    "The sketch `{}` is not a valid sketch. Perhaps it is an older, incompatible version ",
-                    &genome_sketch_file
-                ))
+                .unwrap_or_else(|_| panic!("The sketch `{}` is not a valid sketch. Perhaps it is an older, incompatible version ",
+                    &genome_sketch_file))
         } else {
             bincode::deserialize_from(&mut genome_reader)
-                .expect(&format!(
-                    "The sketch `{}` is not a valid sketch. Perhaps it is an older, incompatible version ",
-                    &genome_sketch_file
-                ))
+                .unwrap_or_else(|_| panic!("The sketch `{}` is not a valid sketch. Perhaps it is an older, incompatible version ",
+                    &genome_sketch_file))
         };
         if genome_sketches_vec.is_empty() {
             continue;
@@ -1064,7 +1121,7 @@ fn get_genome_sketches(
 
             }
             else{
-                let genome_sketch_opt = sketch_genome(args.c, args.k, &genome_file, args.min_spacing_kmer, args.pseudotax);
+                let genome_sketch_opt = sketch_genome(args.c, args.k, genome_file, args.min_spacing_kmer, args.pseudotax);
                 if genome_sketch_opt.is_some() {
                     genome_sketches.lock().unwrap().push(genome_sketch_opt.unwrap());
                 }
@@ -1072,7 +1129,7 @@ fn get_genome_sketches(
         }
     });
 
-    return genome_sketches.into_inner().unwrap();
+    genome_sketches.into_inner().unwrap()
 }
 
 fn get_seq_sketch(
@@ -1091,10 +1148,9 @@ fn get_seq_sketch(
                 "`{}` is a reference-delta compressed sample (*.sylspr) but no --reference was provided",
                 read_sketch_file
             ));
-            let file = File::open(read_sketch_file).expect(&format!(
-                "The sketch `{}` could not be opened",
-                &read_sketch_file
-            ));
+            let file = File::open(read_sketch_file).unwrap_or_else(|_| {
+                panic!("The sketch `{}` could not be opened", &read_sketch_file)
+            });
             let read_reader = BufReader::with_capacity(10_000_000, file);
             crate::refdelta::decompress_seq(read_reader, db).unwrap_or_else(|e| {
                 panic!(
@@ -1103,19 +1159,14 @@ fn get_seq_sketch(
                 )
             })
         } else {
-            let file = File::open(read_sketch_file).expect(&format!(
-                "The sketch `{}` could not be opened",
-                &read_sketch_file
-            ));
+            let file = File::open(read_sketch_file).unwrap_or_else(|_| {
+                panic!("The sketch `{}` could not be opened", &read_sketch_file)
+            });
             let mut read_reader = BufReader::with_capacity(10_000_000, file);
             if crate::compress::peek_is_compressed(&mut read_reader).unwrap_or(false) {
-                crate::compress::read_seq_sketch_compressed(&mut read_reader).expect(
-                    &format!("The sketch `{}` is not a valid sketch. Perhaps it is an older incompatible version ", read_sketch_file),
-                )
+                crate::compress::read_seq_sketch_compressed(&mut read_reader).unwrap_or_else(|_| panic!("The sketch `{}` is not a valid sketch. Perhaps it is an older incompatible version ", read_sketch_file))
             } else {
-                bincode::deserialize_from(&mut read_reader).expect(
-                    &format!("The sketch `{}` is not a valid sketch. Perhaps it is an older incompatible version ", read_sketch_file),
-                )
+                bincode::deserialize_from(&mut read_reader).unwrap_or_else(|_| panic!("The sketch `{}` is not a valid sketch. Perhaps it is an older incompatible version ", read_sketch_file))
             }
         };
         if read_sketch.c > genome_c {
@@ -1125,46 +1176,46 @@ fn get_seq_sketch(
             info!("{} value of -c for reads is {}; this is smaller than the -c for a genome sketch. Using the larger -c {} instead.", read_file, read_sketch.c,  genome_c);
         }
 
-        return Some(read_sketch);
+        Some(read_sketch)
     } else {
         if args.c > genome_c {
             info!("{} value of -c for reads is {}; this is smaller than the -c for a genome sketch. Using the larger -c {} instead.", read_file[0], args.c,  genome_c);
         }
         if genome_c < args.c {
             error!("{} error: value of -c for contain = {} -- greater than the smallest value of -c for a genome sketch = {}. Continuing without sketching.", read_file[0], args.c, genome_c);
-            return None;
+            None
         } else if genome_k != args.k {
             error!(
                 "{} -k {} is not equal to -k {} found in sketches. Continuing without sketching.",
                 read_file[0], args.k, genome_k
             );
-            return None;
+            None
         } else {
             if read_file.len() == 1 {
                 let read_sketch_opt =
-                    sketch_sequences_needle(&read_file[0], args.c, args.k, None, false);
-                return read_sketch_opt.map(|(sketch, _)| sketch);
+                    sketch_sequences_needle(read_file[0], args.c, args.k, None, false);
+                read_sketch_opt.map(|(sketch, _)| sketch)
             } else if read_file.len() == 2 {
                 let read_sketch_opt = sketch_pair_sequences(
-                    &read_file[0],
-                    &read_file[1],
+                    read_file[0],
+                    read_file[1],
                     args.c,
                     args.k,
                     None,
                     false,
                     DEFAULT_FPR,
                 );
-                return read_sketch_opt.map(|(sketch, _)| sketch);
+                read_sketch_opt.map(|(sketch, _)| sketch)
             } else if read_file.len() == 3 {
                 let read_sketch_opt = sketch_interleaved_sequences(
-                    &read_file[0],
+                    read_file[0],
                     args.c,
                     args.k,
                     None,
                     false,
                     DEFAULT_FPR,
                 );
-                return read_sketch_opt.map(|(sketch, _)| sketch);
+                read_sketch_opt.map(|(sketch, _)| sketch)
             } else {
                 panic!(
                     "Internal Error: read_file has length {}. Something went wrong...",
@@ -1418,9 +1469,7 @@ fn finalize_stats(
 }
 
 fn ani_from_lambda(lambda: Option<f64>, _mean: f64, k: f64, full_cov: &[u32]) -> Option<f64> {
-    if lambda.is_none() {
-        return None;
-    }
+    lambda?;
     let mut contain_count = 0;
     let mut _zero_count = 0;
     for x in full_cov {
@@ -1445,7 +1494,7 @@ fn ani_from_lambda(lambda: Option<f64>, _mean: f64, k: f64, full_cov: &[u32]) ->
             ret_ani = Some(ani);
         }
     }
-    return ret_ani;
+    ret_ani
 }
 
 fn bootstrap_interval(
@@ -1477,12 +1526,11 @@ fn bootstrap_interval(
         } else {
             lambda = ratio_lambda(&rand_vec, args.min_count_correct);
         }
-        let ani = ani_from_lambda(lambda, mean(&rand_vec).unwrap().into(), k, &rand_vec);
-        if ani.is_some() && lambda.is_some() {
-            if !ani.unwrap().is_nan() && !lambda.unwrap().is_nan() {
-                res_ani.push(ani);
-                res_lambda.push(lambda);
-            }
+        let ani = ani_from_lambda(lambda, mean(&rand_vec).unwrap(), k, &rand_vec);
+        if ani.is_some() && lambda.is_some() && !ani.unwrap().is_nan() && !lambda.unwrap().is_nan()
+        {
+            res_ani.push(ani);
+            res_lambda.push(lambda);
         }
     }
     res_ani.sort_by(|x, y| x.partial_cmp(y).unwrap());
@@ -1496,7 +1544,7 @@ fn bootstrap_interval(
     let low_lambda = res_lambda[suc * 5 / 100 - 1];
     let high_lambda = res_lambda[suc * 95 / 100 - 1];
 
-    return (low_ani, high_ani, low_lambda, high_lambda);
+    (low_ani, high_ani, low_lambda, high_lambda)
 }
 
 fn get_kmer_identity(seq_sketch: &SequencesSketch, estimate_unknown: bool) -> Option<f64> {
@@ -1545,8 +1593,8 @@ fn get_kmer_identity(seq_sketch: &SequencesSketch, estimate_unknown: bool) -> Op
     }
 
     if eps < 1. {
-        return Some(eps);
+        Some(eps)
     } else {
-        return Some(1.);
+        Some(1.)
     }
 }
