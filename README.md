@@ -1,4 +1,6 @@
-# Weebill - a sylph fork with compressed and reference-delta sketches
+<p align="center">
+  <img src="https://raw.githubusercontent.com/wwood/weebill/main/weebill.png" alt="weebill logo" width="50%" />
+</p>
 
 **Weebill** is a fork of [sylph](https://github.com/bluenote-1577/sylph), the fast and precise
 species-level metagenomic profiler (ANI querying + taxonomic profiling). See the
@@ -13,6 +15,7 @@ The binary is installed as `weebill` (the underlying method and the rest of the
 sub-commands are sylph's). This fork adds smaller-on-disk sketch formats while keeping
 `query`/`profile`/`inspect` output identical:
 
+- **Lighter weight profiling** - the `profile` command can use a "2 stage" profiling approach that first filters the database to only the genomes that are present in the sample, and then re-runs the profiling on just those genomes. This is substantially faster and uses less memory for large databases with many genomes. See https://github.com/bluenote-1577/sylph/pull/79 for details.
 - **Compressed sketches** — `weebill sketch --compressed-output`/`--compressed-database` write
   `.sylspc` samples and `.syldbc` databases (~55% smaller samples, ~30%+ smaller databases). Hashes
   are sorted, delta-encoded and Golomb–Rice coded, then wrapped in a zstd frame. `query`, `profile`,
