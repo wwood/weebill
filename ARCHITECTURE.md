@@ -18,7 +18,8 @@ Start here when reading the code:
 |---|---|---|
 | `types.rs` | Shared data types and hash utilities | `SequencesSketch`, `GenomeSketch`, `AniResult`, `Kmer = u64`, `mm_hash` |
 | `seeding.rs` | Rolling FracMinHash k-mer extraction | `fmh_seeds`, `mm_hash64`, `rev_mm_hash64`, `rev_hash_64` |
-| `avx2_seeding.rs` | AVX2 SIMD path for k-mer hashing (x86_64 only) | `mm_hash256`, `extract_markers_avx2` |
+| `avx2_seeding.rs` | AVX2 SIMD path for k-mer hashing (x86_64 only), 4×64-bit lanes | `mm_hash256`, `extract_markers_avx2` |
+| `avx512_seeding.rs` | AVX-512 SIMD path (x86_64 only), 8×64-bit lanes + `vpcompressq` threshold compaction | `mm_hash512`, `extract_markers_avx512` |
 | `sketch.rs` | Sketching pipeline for reads and genomes | `sketch`, `write_read_sketch_file`, `sketch_genome` |
 | `contain.rs` | Query and profile modes; two-stage workflow | `contain`, `subsample_view`, `densify_genome` |
 | `inference.rs` | Coverage estimation from k-mer multiplicity distributions | `mme_lambda`, `mle_zip`, `binary_search_lambda` |
@@ -159,7 +160,7 @@ varint-delta encoding of genome ids efficient in `.sylspr`.
 | Querying / profiling | `contain.rs::contain` |
 | Two-stage profiling path | `contain.rs::contain` → `TwoStageDb` or `RefIndex` screen then dense decode |
 | Coverage/ANI statistics | `inference.rs::mme_lambda`, `estimate_lambda` |
-| k-mer extraction kernel | `seeding.rs::fmh_seeds` (scalar) or `avx2_seeding.rs::extract_markers_avx2` (SIMD) |
+| k-mer extraction kernel | `seeding.rs::fmh_seeds` (scalar), `avx2_seeding.rs::extract_markers_avx2` (AVX2) or `avx512_seeding.rs::extract_markers_avx512` (AVX-512); dispatched at runtime in `sketch.rs::extract_markers` |
 | Compressed I/O (SYLZ format) | `compress.rs` |
 | Reference-delta build | `refdelta/ref_build.rs::run_ref_build` |
 | Reference-delta compress/decompress | `refdelta/sketch_compress.rs::run_ref_compress` |

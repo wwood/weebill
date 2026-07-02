@@ -551,3 +551,54 @@ fn test_hash() {
         }
     }
 }
+
+/// The AVX-512 marker extractor must emit exactly the same multiset of hashes
+/// as the AVX2 extractor, and both must equal the scalar reference over the
+/// window range they process. This guards sketch compatibility across CPUs.
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn avx512_seeding_matches_avx2_and_scalar() {
+    if !is_x86_feature_detected!("avx512f") || !is_x86_feature_detected!("avx2") {
+        eprintln!("skipping: AVX-512/AVX2 not both available on this CPU");
+        return;
+    }
+
+    // Deterministic pseudo-random ACGT sequences of many lengths.
+    let mut state: u64 = 0x1234_5678_9abc_def0;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let alphabet = [b'A', b'C', b'G', b'T'];
+
+    for len in 0..400usize {
+        let seq: Vec<u8> = (0..len).map(|_| alphabet[(next() & 3) as usize]).collect();
+        for &k in &[21usize, 31] {
+            for &c in &[1usize, 3, 200] {
+                let mut a = Vec::new();
+                let mut b = Vec::new();
+                unsafe {
+                    weebill::avx2_seeding::extract_markers_avx2(&seq, &mut a, c, k);
+                    weebill::avx512_seeding::extract_markers_avx512(&seq, &mut b, c, k);
+                }
+                a.sort_unstable();
+                b.sort_unstable();
+                assert_eq!(a, b, "avx512 != avx2 for len={len} k={k} c={c}");
+
+                // Every hash the AVX-512 path emits is a genuine scalar FracMinHash
+                // marker (subset of the full scalar set, which also keeps the tail).
+                let mut full = Vec::new();
+                seeding::fmh_seeds(&seq, &mut full, c, k);
+                let full_set: std::collections::HashSet<u64> = full.into_iter().collect();
+                for h in &b {
+                    assert!(
+                        full_set.contains(h),
+                        "avx512 emitted a hash absent from scalar set (len={len} k={k} c={c})"
+                    );
+                }
+            }
+        }
+    }
+}

@@ -13,3 +13,6 @@ pub mod types;
 
 #[cfg(target_arch = "x86_64")]
 pub mod avx2_seeding;
+
+#[cfg(target_arch = "x86_64")]
+pub mod avx512_seeding;
