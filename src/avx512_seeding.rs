@@ -229,6 +229,13 @@ pub unsafe fn extract_markers_avx512_positions(
     k: usize,
     contig_number: usize,
 ) {
+    // Mirror `extract_markers_avx2_positions`: it returns for short contigs so
+    // that genome sketches stay identical across CPUs. `fmh_seeds_positions`
+    // (scalar) has no such guard, but the AVX2 path is the one that runs on the
+    // x86 build hosts we must stay bit-compatible with.
+    if string.len() < 2 * k {
+        return;
+    }
     let total_windows = avx2_compatible_window_count(string.len(), k);
     if total_windows == 0 {
         return;
@@ -300,10 +307,14 @@ pub unsafe fn extract_markers_avx512_positions(
             let hash = mm_hash512(canonical);
             _mm512_storeu_si512(hashes.as_mut_ptr() as *mut __m512i, hash);
 
-            let w = i - (k - 1);
+            // Record the k-mer *end* index (`off[j] + i`), matching the AVX2 and
+            // scalar `_positions` paths. `sketch_genome{,_individual}` compares
+            // these positions against `--min-spacing` and uses 0 as a sentinel,
+            // so using the window start (which can be 0) would keep markers that
+            // AVX2/scalar builds drop.
             for (j, &h) in hashes.iter().enumerate() {
                 if h < threshold_marker {
-                    kmer_vec.push((contig_number, off[j] + w, h));
+                    kmer_vec.push((contig_number, off[j] + i, h));
                 }
             }
         }
@@ -330,7 +341,8 @@ pub unsafe fn extract_markers_avx512_positions(
             let canonical = if f < r { f } else { r };
             let hash = crate::seeding::mm_hash64(canonical);
             if hash < threshold_marker {
-                kmer_vec.push((contig_number, w, hash));
+                // End index of the k-mer starting at window `w`.
+                kmer_vec.push((contig_number, w + k - 1, hash));
             }
         }
     }

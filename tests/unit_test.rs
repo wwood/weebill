@@ -598,6 +598,21 @@ fn avx512_seeding_matches_avx2_and_scalar() {
                         "avx512 emitted a hash absent from scalar set (len={len} k={k} c={c})"
                     );
                 }
+
+                // The positions path must match AVX2 exactly as a set of
+                // (contig, end_position, hash) tuples — same coordinate, same
+                // short-contig guard — so genome sketches are CPU-independent.
+                let mut pa = Vec::new();
+                let mut pb = Vec::new();
+                unsafe {
+                    weebill::avx2_seeding::extract_markers_avx2_positions(&seq, &mut pa, c, k, 7);
+                    weebill::avx512_seeding::extract_markers_avx512_positions(
+                        &seq, &mut pb, c, k, 7,
+                    );
+                }
+                pa.sort_unstable();
+                pb.sort_unstable();
+                assert_eq!(pa, pb, "avx512 positions != avx2 for len={len} k={k} c={c}");
             }
         }
     }
