@@ -7,15 +7,14 @@ species-level metagenomic profiler (ANI querying + taxonomic profiling). See the
 [sylph repository](https://github.com/bluenote-1577/sylph) and
 [sylph documentation](https://sylph-docs.github.io/) for the underlying method. Weebill maintains compatibility with sylph's command-line interface and sketch formats where possible. 
 
-Weebill is currently in development and is experimental.
+Weebill is currently in development and is experimental. Efforts are made to contribute improvements back upstream to sylph, but some features are beyond its scope.
 
 ## Changes in the weebill fork
 
-The binary is installed as `weebill` (the underlying method and the rest of the
-sub-commands are sylph's). This fork adds smaller-on-disk sketch formats while keeping
-`query`/`profile`/`inspect` output identical:
+The binary is installed as `weebill`. Weebill changes:
 
-- **Lighter weight profiling** - the `profile` command can use a "2 stage" profiling approach that first filters the database to only the genomes that are present in the sample, and then re-runs the profiling on just those genomes. This is substantially faster and uses less memory for large databases with many genomes. See https://github.com/bluenote-1577/sylph/pull/79 for details.
+- **Lighter weight profiling** - the `profile` command can use a "2 stage" profiling approach which is
+~7–27× faster and uses ~6× less RAM (a flat ~4.4 GB vs the whole ~26 GB database) than standard sylph profiling. The on-disk database is also ~22% smaller. The profiles produced are effectively identical to standard sylph profiling, and the speed/RAM boost means that choosing smaller `c` values is more computationally feasible. To use this mode, see `weebill db-convert` and `weebill profile --two-stage`.
 - **Compressed sketches** — `weebill sketch --compressed-output`/`--compressed-database` write
   `.sylspc` samples and `.syldbc` databases (~55% smaller samples, ~30%+ smaller databases). Hashes
   are sorted, delta-encoded and Golomb–Rice coded, then wrapped in a zstd frame. `query`, `profile`,
