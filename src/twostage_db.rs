@@ -9,8 +9,7 @@
 //! simpler:
 //!
 //!   * **No k-mer dereplication.** Each genome keeps its *own complete* k-mer set;
-//!     a k-mer shared by several genomes is stored in each of them. We do not
-//!     assign each k-mer a single owner.
+//!     a k-mer shared by several genomes is stored in each of them.
 //!   * **No shared/pooled hashes.** There is no conserved-k-mer pool.
 //!
 //! ## Layout
@@ -18,18 +17,25 @@
 //! ```text
 //! [4]  magic  "SY2D"
 //! [1]  version
+//! [8]  index_offset  (u64 LE)
 //! [8]  footer_offset (u64 LE)
 //! ---- body ----
 //! dense block 0, dense block 1, ...      (each: Golomb-Rice compressed)
+//! ---- index ----
+//! ScreenIndex                            (pooled-MPHF stage-1 screen index)
 //! ---- footer ----
-//! bincode(Footer)                        (the sparse stage-1 index + metadata)
+//! bincode(Footer)                        (per-genome metadata)
 //! ```
 //!
-//! **Stage 1 (sparse, bincoded, loaded fully).** The footer is a bincoded
-//! `Footer` holding, per genome, a FracMinHash subsample of its k-mers at a
-//! coarser rate `screen_c` (the same thresholding `subsample_view` uses, so the
-//! sparse set is a genuine sparser sketch). Querying a sample against these tiny
-//! sketches yields the genomes it contains.
+//! **Stage 1 (pooled MPHF, loaded fully).** The `ScreenIndex` is one minimal
+//! perfect hash over the *distinct* sparse (`screen_c`) k-mers of all genomes,
+//! with a multi-owner CSR mapping each sparse k-mer to the list of genomes that
+//! carry it. A sample is screened by a single pass over its k-mers (work ∝
+//! sample, not reference): each sample k-mer is looked up once and its coverage
+//! pushed to every owning genome. The contained genomes are exactly those a
+//! per-genome `get_stats` screen would find -- this is the "Path B" organisation
+//! (see `experiments/7_mphf_screen_again`), but multi-owner because `.syl2db`
+//! keeps shared k-mers.
 //!
 //! **Stage 2 (dense, Golomb-Rice, loaded on demand).** Each genome's *full*
 //! `genome_kmers` and `pseudotax_tracked_nonused_kmers` are an independently
@@ -40,6 +46,7 @@
 use crate::cmdline::DbConvertArgs;
 use crate::constants::*;
 use crate::types::*;
+use boomphf::Mphf;
 use fxhash::FxHashMap;
 use log::*;
 use std::fs::File;
@@ -49,10 +56,13 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 const MAGIC: &[u8; 4] = b"SY2D";
-/// Format version (dense blocks are Golomb-Rice coded).
-const VERSION: u8 = 1;
-/// magic (4) + version (1) + footer offset (8)
-const HEADER_LEN: u64 = 13;
+/// Format version (dense Golomb-Rice blocks + pooled-MPHF stage-1 screen index).
+const VERSION: u8 = 2;
+/// magic (4) + version (1) + index offset (8) + footer offset (8)
+const HEADER_LEN: u64 = 21;
+/// boomphf construction gamma (space/speed trade-off), matching the ref-delta
+/// sparse index.
+const MPHF_GAMMA: f64 = 2.0;
 
 // --- primitive integer / bit coding -----------------------------------------
 
@@ -288,9 +298,9 @@ fn read_hashes<R: Read>(r: &mut R) -> io::Result<Vec<u64>> {
 
 // --- footer (stage-1 sparse index + metadata) -------------------------------
 
-/// Per-genome metadata plus the stage-1 sparse k-mer subsample. Everything here
-/// is loaded into memory when the database is opened; the dense block at
-/// `dense_offset` is decoded lazily.
+/// Per-genome metadata. Everything here is loaded into memory when the database
+/// is opened; the dense block at `dense_offset` is decoded lazily. The stage-1
+/// sparse k-mers live in the pooled `ScreenIndex`, not here.
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
 pub struct GenomeMeta {
     pub file_name: String,
@@ -299,8 +309,6 @@ pub struct GenomeMeta {
     pub min_spacing: usize,
     pub has_pseudotax: bool,
     pub dense_offset: u64,
-    /// FracMinHash subsample of `genome_kmers` at `screen_c` (stage-1 screen).
-    pub sparse_kmers: Vec<u64>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
@@ -311,6 +319,206 @@ pub struct Footer {
     /// Sparse stage-1 screen rate (`screen_c >= c`).
     pub screen_c: usize,
     pub genomes: Vec<GenomeMeta>,
+}
+
+// --- stage-1 pooled-MPHF screen index ---------------------------------------
+
+#[inline]
+fn sparse_fingerprint(h: u64) -> u32 {
+    (h ^ (h >> 32)) as u32
+}
+
+/// FracMinHash threshold for the stage-1 screen: a k-mer is "sparse" iff its
+/// hash is `< u64::MAX / screen_c` (the same rule as `subsample_view` and the
+/// `.syl2db` build).
+#[inline]
+pub(crate) fn screen_threshold(screen_c: usize) -> u64 {
+    u64::MAX / screen_c.max(1) as u64
+}
+
+/// Pooled stage-1 screen index: one MPHF over the distinct sparse k-mers of all
+/// genomes, plus a multi-owner CSR (a k-mer may belong to several genomes).
+/// Owners are a *multiset* -- a genome appears once per occurrence of the k-mer
+/// in its sparse set -- so duplicate k-mers count exactly as the per-genome
+/// `get_stats` loop would.
+pub struct ScreenIndex {
+    pub screen_c: usize,
+    pub k: usize,
+    mphf: Mphf<u64>,
+    /// Per slot: fingerprint of the k-mer, to reject foreign (non-indexed) hashes
+    /// that the MPHF would otherwise map to an arbitrary slot.
+    fingerprints: Vec<u32>,
+    /// CSR row offsets, length `n_slots + 1`.
+    owner_offsets: Vec<u32>,
+    /// CSR owner genome ids (flat); slot `s` owns `owners[off[s]..off[s+1]]`.
+    owners: Vec<u32>,
+    /// Per genome: number of sparse k-mers (the `n_kmers` ANI denominator).
+    pub sparse_count: Vec<u32>,
+}
+
+impl ScreenIndex {
+    /// Build from each genome's sparse (`screen_c`) k-mers. Owners are kept as a
+    /// multiset so the screen reproduces the per-genome `get_stats` counts
+    /// exactly (including any duplicate k-mers within a genome).
+    pub fn build(sparse_per_genome: &[Vec<u64>], screen_c: usize, k: usize) -> ScreenIndex {
+        let sparse_count: Vec<u32> = sparse_per_genome.iter().map(|v| v.len() as u32).collect();
+        let total: usize = sparse_per_genome.iter().map(|v| v.len()).sum();
+
+        // (k-mer, genome) pairs, sorted so equal k-mers form contiguous runs.
+        let mut pairs: Vec<(u64, u32)> = Vec::with_capacity(total);
+        for (g, v) in sparse_per_genome.iter().enumerate() {
+            for &h in v {
+                pairs.push((h, g as u32));
+            }
+        }
+        pairs.sort_unstable();
+
+        // Distinct keys for the MPHF.
+        let mut keys: Vec<u64> = Vec::new();
+        for &(h, _) in &pairs {
+            if keys.last() != Some(&h) {
+                keys.push(h);
+            }
+        }
+        let mphf = Mphf::new_parallel(MPHF_GAMMA, &keys, Some(0));
+        let n_slots = keys.len();
+
+        // Per-slot owner counts -> CSR offsets.
+        let mut fingerprints = vec![0u32; n_slots];
+        let mut owner_offsets = vec![0u32; n_slots + 1];
+        let mut i = 0;
+        while i < pairs.len() {
+            let h = pairs[i].0;
+            let mut j = i;
+            while j < pairs.len() && pairs[j].0 == h {
+                j += 1;
+            }
+            let slot = mphf.hash(&h) as usize;
+            fingerprints[slot] = sparse_fingerprint(h);
+            owner_offsets[slot + 1] = (j - i) as u32; // count, prefix-summed below
+            i = j;
+        }
+        for s in 0..n_slots {
+            owner_offsets[s + 1] += owner_offsets[s];
+        }
+
+        // Fill owners using a per-slot write cursor.
+        let mut owners = vec![0u32; total];
+        let mut cursor: Vec<u32> = owner_offsets[..n_slots].to_vec();
+        let mut i = 0;
+        while i < pairs.len() {
+            let h = pairs[i].0;
+            let slot = mphf.hash(&h) as usize;
+            let mut j = i;
+            while j < pairs.len() && pairs[j].0 == h {
+                owners[cursor[slot] as usize] = pairs[j].1;
+                cursor[slot] += 1;
+                j += 1;
+            }
+            i = j;
+        }
+
+        ScreenIndex {
+            screen_c,
+            k,
+            mphf,
+            fingerprints,
+            owner_offsets,
+            owners,
+            sparse_count,
+        }
+    }
+
+    pub fn num_genomes(&self) -> usize {
+        self.sparse_count.len()
+    }
+
+    /// Single inverted pass over the sample: for each sample k-mer below the
+    /// screen threshold with non-zero count, look it up and push its coverage to
+    /// every owning genome. Returns `genome -> matched coverage counts`, exactly
+    /// the per-genome `covs` a `get_stats(.., None, ..)` screen would collect.
+    pub fn gather_hits(&self, sample: &SequencesSketch) -> FxHashMap<u32, Vec<u32>> {
+        let thresh = screen_threshold(self.screen_c);
+        let mut hits: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
+        for (&h, &cnt) in sample.kmer_counts.iter() {
+            if h >= thresh || cnt == 0 {
+                continue;
+            }
+            if let Some(slot) = self.mphf.try_hash(&h) {
+                let slot = slot as usize;
+                if slot < self.fingerprints.len()
+                    && self.fingerprints[slot] == sparse_fingerprint(h)
+                {
+                    let lo = self.owner_offsets[slot] as usize;
+                    let hi = self.owner_offsets[slot + 1] as usize;
+                    for &g in &self.owners[lo..hi] {
+                        hits.entry(g).or_default().push(cnt);
+                    }
+                }
+            }
+        }
+        hits
+    }
+
+    /// Serialize the index into `out` (raw little-endian blocks).
+    fn write_to_vec(&self, out: &mut Vec<u8>) -> io::Result<()> {
+        let mphf_bytes = bincode::serialize(&self.mphf).map_err(io::Error::other)?;
+        write_uvarint(out, mphf_bytes.len() as u64);
+        out.extend_from_slice(&mphf_bytes);
+        write_uvarint(out, self.fingerprints.len() as u64); // n_slots
+        write_uvarint(out, self.owners.len() as u64);
+        write_uvarint(out, self.sparse_count.len() as u64); // n_genomes
+        for &fp in &self.fingerprints {
+            out.extend_from_slice(&fp.to_le_bytes());
+        }
+        for &o in &self.owner_offsets {
+            out.extend_from_slice(&o.to_le_bytes());
+        }
+        for &o in &self.owners {
+            out.extend_from_slice(&o.to_le_bytes());
+        }
+        for &c in &self.sparse_count {
+            out.extend_from_slice(&c.to_le_bytes());
+        }
+        Ok(())
+    }
+
+    /// Parse an index block produced by `write_to_vec`. `screen_c`/`k` come from
+    /// the footer (not duplicated in the block).
+    fn read(mut r: &[u8], screen_c: usize, k: usize) -> io::Result<ScreenIndex> {
+        let mphf_len = read_uvarint(&mut r)? as usize;
+        let mut mphf_bytes = vec![0u8; mphf_len];
+        r.read_exact(&mut mphf_bytes)?;
+        let mphf: Mphf<u64> = bincode::deserialize(&mphf_bytes)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let n_slots = read_uvarint(&mut r)? as usize;
+        let n_owners = read_uvarint(&mut r)? as usize;
+        let n_genomes = read_uvarint(&mut r)? as usize;
+
+        let read_u32_vec = |r: &mut &[u8], n: usize| -> io::Result<Vec<u32>> {
+            let mut v = Vec::with_capacity(n);
+            for _ in 0..n {
+                let mut buf = [0u8; 4];
+                r.read_exact(&mut buf)?;
+                v.push(u32::from_le_bytes(buf));
+            }
+            Ok(v)
+        };
+        let fingerprints = read_u32_vec(&mut r, n_slots)?;
+        let owner_offsets = read_u32_vec(&mut r, n_slots + 1)?;
+        let owners = read_u32_vec(&mut r, n_owners)?;
+        let sparse_count = read_u32_vec(&mut r, n_genomes)?;
+
+        Ok(ScreenIndex {
+            screen_c,
+            k,
+            mphf,
+            fingerprints,
+            owner_offsets,
+            owners,
+            sparse_count,
+        })
+    }
 }
 
 // --- writing ----------------------------------------------------------------
@@ -334,6 +542,7 @@ pub fn write_two_stage_db<W: Write>(
 
     let mut body: Vec<u8> = Vec::new();
     let mut genomes: Vec<GenomeMeta> = Vec::with_capacity(sketches.len());
+    let mut sparse_per_genome: Vec<Vec<u64>> = Vec::with_capacity(sketches.len());
 
     for gs in sketches {
         let dense_offset = HEADER_LEN + body.len() as u64;
@@ -345,12 +554,13 @@ pub fn write_two_stage_db<W: Write>(
             }
             None => body.push(0),
         }
-        let sparse_kmers: Vec<u64> = gs
-            .genome_kmers
-            .iter()
-            .copied()
-            .filter(|&h| h < thresh)
-            .collect();
+        sparse_per_genome.push(
+            gs.genome_kmers
+                .iter()
+                .copied()
+                .filter(|&h| h < thresh)
+                .collect(),
+        );
         genomes.push(GenomeMeta {
             file_name: gs.file_name.clone(),
             first_contig_name: gs.first_contig_name.clone(),
@@ -358,9 +568,14 @@ pub fn write_two_stage_db<W: Write>(
             min_spacing: gs.min_spacing,
             has_pseudotax: gs.pseudotax_tracked_nonused_kmers.is_some(),
             dense_offset,
-            sparse_kmers,
         });
     }
+
+    // Pooled stage-1 screen index, then footer metadata.
+    let screen_index = ScreenIndex::build(&sparse_per_genome, screen_c, k);
+    drop(sparse_per_genome);
+    let mut index_block: Vec<u8> = Vec::new();
+    screen_index.write_to_vec(&mut index_block)?;
 
     let footer = Footer {
         c,
@@ -369,12 +584,15 @@ pub fn write_two_stage_db<W: Write>(
         genomes,
     };
     let footer_bytes = bincode::serialize(&footer).map_err(io::Error::other)?;
-    let footer_offset = HEADER_LEN + body.len() as u64;
+    let index_offset = HEADER_LEN + body.len() as u64;
+    let footer_offset = index_offset + index_block.len() as u64;
 
     w.write_all(MAGIC)?;
     w.write_all(&[VERSION])?;
+    w.write_all(&index_offset.to_le_bytes())?;
     w.write_all(&footer_offset.to_le_bytes())?;
     w.write_all(&body)?;
+    w.write_all(&index_block)?;
     w.write_all(&footer_bytes)?;
     Ok(())
 }
@@ -412,19 +630,19 @@ pub struct TwoStageDb {
     pub c: usize,
     pub k: usize,
     pub screen_c: usize,
-    /// File offset where the dense-block region ends (start of the footer); used
-    /// to bound the last genome's block for positional reads.
-    footer_offset: u64,
+    /// File offset where the dense-block region ends (start of the screen index);
+    /// used to bound the last genome's block for positional reads.
+    index_offset: u64,
     genomes: Vec<GenomeMeta>,
-    /// Stage-1 sparse sketches, one per genome, in database order. These stand in
-    /// for the full database during the cheap screen.
-    pub screen_sketches: Vec<GenomeSketch>,
+    /// Pooled stage-1 screen index (Path B). Replaces the per-genome sparse
+    /// sketches; querying a sample against it yields the contained genomes.
+    pub screen_index: ScreenIndex,
     data: DenseData,
     cache: Mutex<FxHashMap<u32, Arc<GenomeSketch>>>,
 }
 
-/// Parse the magic + version header; return the footer offset.
-fn parse_header(hdr: &[u8]) -> io::Result<u64> {
+/// Parse the magic + version header; return `(index_offset, footer_offset)`.
+fn parse_header(hdr: &[u8]) -> io::Result<(u64, u64)> {
     if hdr.len() < HEADER_LEN as usize || &hdr[0..4] != MAGIC {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -437,54 +655,48 @@ fn parse_header(hdr: &[u8]) -> io::Result<u64> {
             "unsupported two-stage database version",
         ));
     }
-    Ok(u64::from_le_bytes(hdr[5..13].try_into().unwrap()))
+    let index_offset = u64::from_le_bytes(hdr[5..13].try_into().unwrap());
+    let footer_offset = u64::from_le_bytes(hdr[13..21].try_into().unwrap());
+    Ok((index_offset, footer_offset))
 }
 
-/// Assemble a `TwoStageDb` from its parsed footer + backing store.
-fn build_db(footer: Footer, footer_offset: u64, data: DenseData) -> TwoStageDb {
-    // Build the stage-1 screen sketches from the sparse subsamples. The screen
-    // pass runs with pseudotax disabled, so an empty tracked-kmer set is a safe
-    // placeholder that keeps the `--disable-profiling` guard in `contain` happy;
-    // the true pseudotax k-mers come from the dense blocks.
-    let screen_sketches: Vec<GenomeSketch> = footer
-        .genomes
-        .iter()
-        .map(|m| GenomeSketch {
-            genome_kmers: m.sparse_kmers.clone(),
-            pseudotax_tracked_nonused_kmers: Some(Vec::new()),
-            file_name: m.file_name.clone(),
-            first_contig_name: m.first_contig_name.clone(),
-            c: footer.screen_c,
-            k: footer.k,
-            gn_size: m.gn_size,
-            min_spacing: m.min_spacing,
-        })
-        .collect();
+/// Assemble a `TwoStageDb` from its parsed footer + screen index + backing store.
+fn build_db(
+    footer: Footer,
+    index_offset: u64,
+    screen_index: ScreenIndex,
+    data: DenseData,
+) -> TwoStageDb {
     TwoStageDb {
         c: footer.c,
         k: footer.k,
         screen_c: footer.screen_c,
-        footer_offset,
+        index_offset,
         genomes: footer.genomes,
-        screen_sketches,
+        screen_index,
         data,
         cache: Mutex::new(FxHashMap::default()),
     }
 }
 
-/// Parse the header + footer of a `.syl2db` already resident in `data`.
+/// Parse the header + index + footer of a `.syl2db` already resident in `data`.
 fn from_bytes(data: DenseData) -> io::Result<TwoStageDb> {
     let bytes = data.bytes();
-    let footer_offset = parse_header(bytes)?;
-    if footer_offset as usize > bytes.len() {
+    let (index_offset, footer_offset) = parse_header(bytes)?;
+    if index_offset > footer_offset || footer_offset as usize > bytes.len() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "two-stage database footer offset out of range",
+            "two-stage database offsets out of range",
         ));
     }
     let footer: Footer = bincode::deserialize(&bytes[footer_offset as usize..])
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    Ok(build_db(footer, footer_offset, data))
+    let screen_index = ScreenIndex::read(
+        &bytes[index_offset as usize..footer_offset as usize],
+        footer.screen_c,
+        footer.k,
+    )?;
+    Ok(build_db(footer, index_offset, screen_index, data))
 }
 
 /// Open a `.syl2db` from an in-memory reader (reads it all into memory).
@@ -502,14 +714,20 @@ impl TwoStageDb {
         self.genomes.is_empty()
     }
 
+    /// Source file name of genome `g` (for `--screen-dump` and diagnostics).
+    pub fn genome_file_name(&self, g: u32) -> &str {
+        &self.genomes[g as usize].file_name
+    }
+
     /// End offset of genome `g`'s region (start of the next genome's block, or
-    /// the footer for the last genome). Genomes are stored in ascending offset.
+    /// the screen index for the last genome). Genomes are stored in ascending
+    /// offset, and the index block immediately follows the last dense block.
     fn block_end(&self, g: u32) -> u64 {
         let gi = g as usize;
         if gi + 1 < self.genomes.len() {
             self.genomes[gi + 1].dense_offset
         } else {
-            self.footer_offset
+            self.index_offset
         }
     }
 
@@ -580,19 +798,27 @@ pub fn open_file(path: &str) -> io::Result<TwoStageDb> {
     let file = File::open(path)?;
     let mut hdr = [0u8; HEADER_LEN as usize];
     file.read_exact_at(&mut hdr, 0)?;
-    let footer_offset = parse_header(&hdr)?;
+    let (index_offset, footer_offset) = parse_header(&hdr)?;
     let flen = file.metadata()?.len();
-    if footer_offset > flen {
+    if index_offset > footer_offset || footer_offset > flen {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "two-stage database footer offset out of range",
+            "two-stage database offsets out of range",
         ));
     }
     let mut fbytes = vec![0u8; (flen - footer_offset) as usize];
     file.read_exact_at(&mut fbytes, footer_offset)?;
     let footer: Footer =
         bincode::deserialize(&fbytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    Ok(build_db(footer, footer_offset, DenseData::File(file)))
+    let mut ibytes = vec![0u8; (footer_offset - index_offset) as usize];
+    file.read_exact_at(&mut ibytes, index_offset)?;
+    let screen_index = ScreenIndex::read(&ibytes, footer.screen_c, footer.k)?;
+    Ok(build_db(
+        footer,
+        index_offset,
+        screen_index,
+        DenseData::File(file),
+    ))
 }
 
 // --- CLI handler ------------------------------------------------------------
@@ -754,16 +980,21 @@ mod tests {
         assert_eq!(db.screen_c, 200);
         assert_eq!(db.len(), 2);
 
-        // stage-1 sparse sketch = fracminhash subset at screen_c
+        // stage-1 index: per-genome sparse count = fracminhash subset size at screen_c
         let expect_sparse = |ks: &[u64]| -> Vec<u64> {
             let mut v: Vec<u64> = ks.iter().copied().filter(|&h| h < thresh).collect();
             v.sort_unstable();
             v
         };
-        let mut s0 = db.screen_sketches[0].genome_kmers.clone();
-        s0.sort_unstable();
-        assert_eq!(s0, expect_sparse(&g0_kmers));
-        assert_eq!(db.screen_sketches[0].c, 200);
+        assert_eq!(db.screen_c, 200);
+        assert_eq!(
+            db.screen_index.sparse_count[0] as usize,
+            expect_sparse(&g0_kmers).len()
+        );
+        assert_eq!(
+            db.screen_index.sparse_count[1] as usize,
+            expect_sparse(&g1_kmers).len()
+        );
 
         // stage-2 dense block reconstructs the exact genome k-mers + pseudotax
         let d0 = db.load_dense(0).unwrap();
@@ -792,5 +1023,105 @@ mod tests {
         // second load hits the cache and returns the same data
         let d0b = db.load_dense(0).unwrap();
         assert_eq!(d0b.genome_kmers, d0.genome_kmers);
+    }
+
+    fn sample_from(counts: &[(u64, u32)]) -> SequencesSketch {
+        let mut s = SequencesSketch::new(String::new(), 50, 31, false, None, 0.0);
+        for &(h, c) in counts {
+            s.kmer_counts.insert(h, c);
+        }
+        s
+    }
+
+    /// `gather_hits` must reproduce, per genome, the exact coverage multiset that
+    /// the per-genome `get_stats` loop collects: intersection of the genome's
+    /// sparse k-mers with the sample, with duplicate k-mers counted per
+    /// occurrence and shared k-mers credited to every owner.
+    #[test]
+    fn screen_index_matches_per_genome_intersection() {
+        let screen_c = 100usize;
+        let thresh = screen_threshold(screen_c);
+        // All below threshold so every k-mer is "sparse". g0 has a duplicate (5);
+        // 5 and 9 are shared across genomes.
+        let sparse = vec![
+            vec![5u64, 5, 9, 11],  // g0: duplicate 5
+            vec![9u64, 11, 20],    // g1
+            vec![5u64, 30, 40, 9], // g2
+        ];
+        for v in &sparse {
+            assert!(v.iter().all(|&h| h < thresh));
+        }
+        let idx = ScreenIndex::build(&sparse, screen_c, 31);
+        assert_eq!(idx.sparse_count, vec![4u32, 3, 4]);
+
+        // Sample: some matching k-mers (with counts), a zero-count k-mer (ignored),
+        // a k-mer above threshold (ignored), and a foreign k-mer (no owner).
+        let sample = sample_from(&[
+            (5, 7),
+            (9, 3),
+            (11, 2),
+            (40, 9),
+            (99, 0),         // zero count -> ignored
+            (thresh + 1, 5), // above screen threshold -> ignored
+            (123456, 4),     // foreign -> no owner
+        ]);
+
+        let hits = idx.gather_hits(&sample);
+
+        // Brute-force per-genome reference (mirrors get_stats winner_map=None).
+        let mut expected: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
+        for (g, v) in sparse.iter().enumerate() {
+            for &h in v {
+                if h < thresh {
+                    if let Some(&c) = sample.kmer_counts.get(&h) {
+                        if c != 0 {
+                            expected.entry(g as u32).or_default().push(c);
+                        }
+                    }
+                }
+            }
+        }
+        let norm = |m: &FxHashMap<u32, Vec<u32>>| -> Vec<(u32, Vec<u32>)> {
+            let mut out: Vec<(u32, Vec<u32>)> = m
+                .iter()
+                .map(|(&g, v)| {
+                    let mut v = v.clone();
+                    v.sort_unstable();
+                    (g, v)
+                })
+                .collect();
+            out.sort();
+            out
+        };
+        assert_eq!(norm(&hits), norm(&expected));
+        // g0 sees 5 twice (duplicate) + 9 + 11 -> covs {7,7,3,2}
+        let mut g0 = hits[&0].clone();
+        g0.sort_unstable();
+        assert_eq!(g0, vec![2, 3, 7, 7]);
+    }
+
+    /// The index survives a serialize/parse round-trip through the file format.
+    #[test]
+    fn screen_index_roundtrips_through_db() {
+        let thresh = u64::MAX / 200;
+        let g0 = vec![5u64, 5, thresh - 1, thresh + 9]; // last is above screen thresh
+        let g1 = vec![5u64, 7, thresh - 2];
+        let sketches = vec![
+            gsketch("g0.fa", g0.clone(), Some(vec![1])),
+            gsketch("g1.fa", g1.clone(), Some(vec![2])),
+        ];
+        let mut buf = Vec::new();
+        write_two_stage_db(&mut buf, &sketches, 200).unwrap();
+        let db = open(std::io::Cursor::new(buf)).unwrap();
+
+        let sample = sample_from(&[(5, 4), (7, 6), (thresh - 1, 1), (thresh - 2, 9)]);
+        let hits = db.screen_index.gather_hits(&sample);
+        // g0: 5 twice + (thresh-1) once -> {4,4,1}; g1: 5 + 7 + (thresh-2) -> {4,6,9}
+        let mut g0h = hits[&0].clone();
+        g0h.sort_unstable();
+        assert_eq!(g0h, vec![1, 4, 4]);
+        let mut g1h = hits[&1].clone();
+        g1h.sort_unstable();
+        assert_eq!(g1h, vec![4, 6, 9]);
     }
 }
