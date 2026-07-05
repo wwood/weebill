@@ -14,7 +14,7 @@ Weebill is currently in development and is experimental. Efforts are made to con
 The binary is installed as `weebill`. Weebill changes:
 
 - **Lighter weight profiling** - the `profile` command can use a "2 stage" profiling approach which is
-~7–27× faster and uses ~6× less RAM (a flat ~4.4 GB vs the whole ~26 GB database) than standard sylph profiling. The on-disk database is also ~22% smaller. The profiles produced are effectively identical to standard sylph profiling, and the speed/RAM boost means that choosing smaller `c` values is more computationally feasible. To use this mode, see `weebill db-convert` and `weebill profile --two-stage`.
+~7–27× faster and uses ~6× less RAM (a flat ~4.4 GB vs the whole ~26 GB database) than standard sylph profiling (when input is sketches - FASTA/FASTQ inputs are also faster but more modestly). The on-disk database is also ~22% smaller. The profiles produced are effectively identical to standard sylph profiling, and the speed/RAM boost means that choosing smaller `c` values is more computationally feasible. To use this mode, see `weebill db-convert` and `weebill profile --two-stage`.
 - **Compressed sketches** — `weebill sketch --compressed-output`/`--compressed-database` write
   `.sylspc` samples and `.syldbc` databases (~55% smaller samples, ~30%+ smaller databases). Hashes
   are sorted, delta-encoded and Golomb–Rice coded, then wrapped in a zstd frame. `query`, `profile`,
