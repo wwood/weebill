@@ -13,25 +13,26 @@ name = "weebill"
 path = "src/main.rs"
 
 [dependencies]
-needletail = "0.5.0"
-simple_logger=  { version = "3", features = ["stderr"] }
+needletail = "0.7"
+simple_logger=  { version = "5", features = ["stderr"] }
 log = "0"
 rayon = "1"
 smallvec = { version = "1", features = ["union","serde","write"] }
 serde = { version = "1", features = ["derive"] }
+# https://sr.ht/~stygianentity/bincode/ - Due to a doxxing incident bincode development has officially ceased and will not resume. Version 1.3.3 is considered a complete version of bincode that is not in need of any updates.
 bincode = "1"
 fxhash = "0"
 boomphf = { version = "0.6", features = ["serde"] }
 clap = { version = "3", features = ["derive"] }
 flate2 = { version = "1.0.17", features = ["zlib-ng"], default-features = false }
 zstd = "0.13"
-statrs="0.16"
+statrs="0.18"
 nalgebra="0"
 rand = "0"
 regex = "1"
 fastrand = "2"
 memory-stats = "1"
-scalable_cuckoo_filter = "0.2"
+scalable_cuckoo_filter = "0.5"
 serde_yaml = "0.9"
 
 [target.'cfg(target_env = "musl")'.dependencies]
@@ -39,8 +40,8 @@ tikv-jemallocator = "0"
 
 
 [dev-dependencies]
-assert_cmd = "1.0.1"
-predicates = "1"
+assert_cmd = "2"
+predicates = "3"
 serial_test = "*"
 
 
