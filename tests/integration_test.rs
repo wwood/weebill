@@ -1220,6 +1220,26 @@ fn test_sketch_merge_single_and_paired() {
         .arg(dir)
         .assert()
         .failure();
+
+    // --merge must not write a partial sketch when one input fails to sketch. A valid read
+    // combined with a missing file must fail the whole merge rather than silently sketching
+    // only the good input.
+    let partial_out = format!("{}/partial", dir);
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("sketch")
+        .arg("--merge")
+        .arg("-r")
+        .arg("test_files/o157_reads.fastq.gz")
+        .arg("-r")
+        .arg("test_files/does_not_exist.fq")
+        .arg("--compressed-database")
+        .arg(&partial_out)
+        .assert()
+        .failure();
+    assert!(
+        !Path::new(&format!("{}.sylspc", partial_out)).exists(),
+        "a partial merged sketch was written despite a failed input"
+    );
 }
 
 /// Extract the (single) data row's Sample_file (col 1) and Containment_ind (col 12)

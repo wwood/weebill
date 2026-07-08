@@ -497,6 +497,10 @@ pub fn sketch(args: SketchArgs) {
         }
     }
     let collected_read_sketches: Mutex<Vec<(SequencesSketch, ReadSketchMeta)>> = Mutex::new(vec![]);
+    // Inputs that failed to sketch (missing/invalid file) while merging. A merged sketch that
+    // silently omits an input violates the promise to combine all inputs, so any failure aborts
+    // the whole merge rather than writing a partial sketch. Mirrors the `profile --merge` path.
+    let merge_failed_inputs: Mutex<Vec<String>> = Mutex::new(vec![]);
 
     let mut max_ram = usize::MAX;
     if args.max_ram.is_some() {
@@ -555,6 +559,15 @@ pub fn sketch(args: SketchArgs) {
                         args.no_dedup,
                         args.fpr,
                     );
+                    if read_sketch_opt.is_none() {
+                        if args.merge {
+                            merge_failed_inputs
+                                .lock()
+                                .unwrap()
+                                .push(read_file1.to_string());
+                        }
+                        return;
+                    }
                     if read_sketch_opt.is_some() {
                         if !args.merge {
                             let res = fs::create_dir_all(&args.sample_output_dir);
@@ -635,6 +648,11 @@ pub fn sketch(args: SketchArgs) {
                             ref_index.as_ref(),
                             args.reference.as_deref(),
                         );
+                    } else if args.merge {
+                        merge_failed_inputs
+                            .lock()
+                            .unwrap()
+                            .push(read_file.to_string());
                     }
                 });
             }
@@ -671,6 +689,15 @@ pub fn sketch(args: SketchArgs) {
                     args.no_dedup,
                 );
 
+                if read_sketch_opt.is_none() {
+                    if args.merge {
+                        merge_failed_inputs
+                            .lock()
+                            .unwrap()
+                            .push(read_file.to_string());
+                    }
+                    return;
+                }
                 if read_sketch_opt.is_some() {
                     let (read_sketch, meta) = read_sketch_opt.unwrap();
                     if args.merge {
@@ -701,6 +728,15 @@ pub fn sketch(args: SketchArgs) {
     });
 
     if args.merge {
+        let failed = merge_failed_inputs.into_inner().unwrap();
+        if !failed.is_empty() {
+            error!(
+                "--merge: {} read input(s) could not be sketched ({}); refusing to write a partial merged sketch. Exiting.",
+                failed.len(),
+                failed.join(", ")
+            );
+            std::process::exit(1);
+        }
         let sketches = collected_read_sketches.into_inner().unwrap();
         if sketches.is_empty() {
             error!("--merge was set but no read samples were sketched. Exiting.");
