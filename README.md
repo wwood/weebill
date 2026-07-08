@@ -38,9 +38,10 @@ The binary is installed as `weebill`. Weebill changes:
   (~91% of non-reference hashes are single-error k-mers); the cost is the one-time per-reference
   genome storage, amortised across all samples compressed against it.
 - **`weebill merge`** — a new sub-command that merges several sample sketches into a single sketch
-  (summing per-genome k-mer counts). It reads any mix of legacy (`.sylsp`), compressed (`.sylspc`),
-  and reference-compressed (`.sylspr`, via `--reference`) inputs, and can write the result in any of
-  those formats (`--compressed` or `--ref-compress`).
+  (summing per-genome k-mer counts). It reads any mix of compressed (`.sylspc`) and
+  reference-compressed (`.sylspr`, via `--reference`) inputs, and writes the result as compressed
+  `.sylspc` by default (or `.sylspr` with `--ref-compress`). Legacy uncompressed `.sylsp` samples
+  record no read count and so cannot be merged — re-sketch them with `--compressed-database` first.
 
 ## Installation
 

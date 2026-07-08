@@ -1180,7 +1180,7 @@ fn test_sketch_merge_single_and_paired() {
     let mut cmd = Command::cargo_bin("weebill").unwrap();
     let inspect = cmd
         .arg("inspect")
-        .arg(format!("{}.sylsp", via_sub))
+        .arg(format!("{}.sylspc", via_sub))
         .output()
         .expect("Output failed");
     let inspect = str::from_utf8(&inspect.stdout).expect("Output was not valid UTF-8");
@@ -1289,7 +1289,7 @@ fn test_profile_merge_single_and_paired() {
     let out = cmd
         .arg("profile")
         .arg(&db_file)
-        .arg(format!("{}.sylsp", merged))
+        .arg(format!("{}.sylspc", merged))
         .output()
         .expect("Output failed");
     let out = str::from_utf8(&out.stdout).expect("Output was not valid UTF-8");
@@ -1404,6 +1404,27 @@ fn test_sketch_merge_rejects_conflicting_suffix() {
         .arg("test_files/o157_reads.fastq.gz")
         .arg("--compressed-database")
         .arg(format!("{}/out.sylsp", dir))
+        .assert()
+        .failure();
+
+    // The `merge` subcommand no longer produces legacy *.sylsp, so a *.sylsp output path
+    // is rejected rather than silently downgraded.
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("sketch")
+        .arg("-r")
+        .arg("test_files/o157_reads.fastq.gz")
+        .arg("--compressed-database")
+        .arg(dir)
+        .assert()
+        .success()
+        .code(0);
+    let sample = format!("{}/o157_reads.fastq.gz.sylspc", dir);
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("merge")
+        .arg(&sample)
+        .arg(&sample)
+        .arg("-o")
+        .arg(format!("{}/merged.sylsp", dir))
         .assert()
         .failure();
 }

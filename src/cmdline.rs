@@ -651,14 +651,14 @@ pub struct MergeArgs {
     #[clap(
         multiple = true,
         required = true,
-        help = "Sample sketch files (*.sylsp, *.sylspc, or *.sylspr) to merge"
+        help = "Sample sketch files (*.sylspc or *.sylspr) to merge. Legacy uncompressed *.sylsp samples record no read count and cannot be merged; re-sketch them with --compressed-database first."
     )]
     pub files: Vec<String>,
     #[clap(
         short = 'o',
         long = "output",
         required = true,
-        help = "Output file path for merged sketch"
+        help = "Output file path for merged sketch. Written as compressed *.sylspc by default, or *.sylspr with --ref-compress (suffix appended if missing)."
     )]
     pub output: String,
     #[clap(
@@ -667,11 +667,6 @@ pub struct MergeArgs {
         help = "Sample name for the merged sketch"
     )]
     pub sample_name: Option<String>,
-    #[clap(
-        long = "compressed",
-        help = "Write merged output as compressed *.sylspc instead of legacy *.sylsp"
-    )]
-    pub compressed: bool,
     #[clap(
         short = 'r',
         long = "reference",

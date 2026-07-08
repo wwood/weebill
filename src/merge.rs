@@ -53,24 +53,38 @@ fn read_sample(
 }
 
 fn output_kind(args: &MergeArgs) -> &'static str {
+    // Merge never writes legacy uncompressed *.sylsp: that format carries no read count,
+    // so a merged sample written as *.sylsp could not be re-merged. Default to compressed
+    // *.sylspc, or reference-compressed *.sylspr when requested.
     if args.ref_compress || args.output.ends_with(REF_SAMPLE_SUFFIX) {
         REF_SAMPLE_SUFFIX
-    } else if args.compressed || args.output.ends_with(SAMPLE_COMP_FILE_SUFFIX) {
-        SAMPLE_COMP_FILE_SUFFIX
     } else {
-        SAMPLE_FILE_SUFFIX
+        SAMPLE_COMP_FILE_SUFFIX
     }
 }
 
-fn output_path(path: &str, suffix: &str) -> String {
-    if path.ends_with(SAMPLE_FILE_SUFFIX)
-        || path.ends_with(SAMPLE_COMP_FILE_SUFFIX)
-        || path.ends_with(REF_SAMPLE_SUFFIX)
-    {
-        path.to_string()
-    } else {
-        format!("{}{}", path, suffix)
+fn output_path(path: &str, suffix: &'static str) -> String {
+    // If the user gave an explicit sample suffix it must match the selected encoding,
+    // otherwise we'd write, say, a *.sylspr payload to a *.sylspc path that can't be
+    // decoded back. A legacy *.sylsp path is always rejected here since merge no longer
+    // produces that format.
+    for known in [
+        SAMPLE_FILE_SUFFIX,
+        SAMPLE_COMP_FILE_SUFFIX,
+        REF_SAMPLE_SUFFIX,
+    ] {
+        if path.ends_with(known) {
+            if known != suffix {
+                error!(
+                    "merge output '{}' ends with '{}', but the selected encoding is {}. Use a path ending in '{}' (or drop the suffix so it is added automatically). Exiting.",
+                    path, known, suffix, suffix
+                );
+                std::process::exit(1);
+            }
+            return path.to_string();
+        }
     }
+    format!("{}{}", path, suffix)
 }
 
 pub fn merge(args: MergeArgs) {
