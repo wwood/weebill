@@ -884,24 +884,45 @@ pub fn contain(mut args: ContainArgs, pseudotax_in: bool) {
             .num_threads(args.threads.max(n_raw).max(1))
             .build()
             .expect("Failed to build merge read-sketching thread pool");
-        let mut collected: Vec<(SequencesSketch, ReadSketchMeta)> = merge_pool.install(|| {
-            (0..total)
-                .into_par_iter()
-                .filter_map(|j| {
-                    let is_sketch = j >= total - n_sketch_files;
-                    get_seq_sketch_with_meta(
-                        &args,
-                        &read_files[j],
-                        is_sketch,
-                        ref_db.as_ref(),
-                        effective_genome_c,
-                        db_k,
-                    )
-                })
-                .collect()
-        });
+        let collected_opt: Vec<Option<(SequencesSketch, ReadSketchMeta)>> =
+            merge_pool.install(|| {
+                (0..total)
+                    .into_par_iter()
+                    .map(|j| {
+                        let is_sketch = j >= total - n_sketch_files;
+                        get_seq_sketch_with_meta(
+                            &args,
+                            &read_files[j],
+                            is_sketch,
+                            ref_db.as_ref(),
+                            effective_genome_c,
+                            db_k,
+                        )
+                    })
+                    .collect()
+            });
+        // A `None` means an input could not be sketched or loaded (e.g. incompatible -c/-k,
+        // or a pre-sketched sample whose c exceeds the database's). Dropping it would profile
+        // a merged sample that silently excludes those reads and misreports
+        // containment/coverage, so refuse the whole merge instead of merging a subset.
+        let failed: Vec<&str> = collected_opt
+            .iter()
+            .zip(read_files.iter())
+            .filter(|(opt, _)| opt.is_none())
+            .map(|(_, rf)| rf[0].as_str())
+            .collect();
+        if !failed.is_empty() {
+            log::error!(
+                "--merge: {} read input(s) could not be sketched or loaded ({}); refusing to profile a partial merged sample. Exiting.",
+                failed.len(),
+                failed.join(", ")
+            );
+            std::process::exit(1);
+        }
+        let mut collected: Vec<(SequencesSketch, ReadSketchMeta)> =
+            collected_opt.into_iter().flatten().collect();
         if collected.is_empty() {
-            log::error!("--merge: no read samples could be sketched or loaded. Exiting.");
+            log::error!("--merge: no read samples were provided. Exiting.");
             std::process::exit(1);
         }
         let merged_name = args

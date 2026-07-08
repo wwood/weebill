@@ -1345,6 +1345,30 @@ fn test_profile_merge_single_and_paired() {
         .arg("--merge")
         .assert()
         .failure();
+
+    // --merge must not silently drop an input that fails to load. A pre-sketched sample
+    // whose c (300) exceeds the database's (200) is unusable; mixed with a valid raw read
+    // the whole merge must fail rather than profile a merged sample that excludes it.
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("sketch")
+        .arg("-r")
+        .arg("test_files/o157_reads.fastq.gz")
+        .arg("-c")
+        .arg("300")
+        .arg("--compressed-database")
+        .arg(format!("{}/c300", dir))
+        .assert()
+        .success()
+        .code(0);
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("profile")
+        .arg(&db_file)
+        .arg(format!("{}/c300/o157_reads.fastq.gz.sylspc", dir))
+        .arg("-r")
+        .arg("test_files/k12_R1.fq")
+        .arg("--merge")
+        .assert()
+        .failure();
 }
 
 /// Legacy uncompressed *.sylsp sketches carry no read count, so they cannot be merged
