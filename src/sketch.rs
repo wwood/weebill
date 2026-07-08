@@ -390,136 +390,164 @@ pub fn sketch(args: SketchArgs) {
         );
     }
 
-    if !first_pairs.is_empty() && !second_pairs.is_empty() {
-        info!("Sketching paired sequences...");
-        let iter_vec: Vec<usize> = (0..first_pairs.len()).into_iter().collect();
-        iter_vec.into_par_iter().for_each(|i| {
-            let read_file1 = &first_pairs[i];
-            let read_file2 = &second_pairs[i];
+    // Drain the paired, interleaved, and single-end read passes concurrently. When these
+    // inputs are FIFOs fed by a single upstream writer (e.g. sracat streaming R1/R2 and
+    // orphan reads into split pipes), consuming them in separate sequential passes lets the
+    // not-yet-read pipes fill their kernel buffers and block the writer, stalling the whole
+    // pipeline. Running the passes concurrently keeps every stream drained at once.
+    //
+    // The global rayon pool has `--threads` workers, which may be 1 — the common case for
+    // streaming a single sample. A plain `rayon::scope` there would run the spawned passes
+    // one at a time on that lone worker and re-serialize the streams, so build a dedicated
+    // pool with at least one thread per non-empty read category (paired / interleaved /
+    // single). Each category then gets its own thread to block on I/O, and the per-input
+    // `into_par_iter` work inside a pass runs on this same pool. `--threads` still caps
+    // within-category batch parallelism whenever it exceeds the number of categories.
+    let read_categories = (!first_pairs.is_empty() && !second_pairs.is_empty()) as usize
+        + (!interleaved_inputs.is_empty()) as usize
+        + (!read_inputs.is_empty()) as usize;
+    let read_pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(args.threads.max(read_categories))
+        .build()
+        .expect("Failed to build read-sketching thread pool");
+    read_pool.scope(|scope| {
+        scope.spawn(|_| {
+            if !first_pairs.is_empty() && !second_pairs.is_empty() {
+                info!("Sketching paired sequences...");
+                let iter_vec: Vec<usize> = (0..first_pairs.len()).into_iter().collect();
+                iter_vec.into_par_iter().for_each(|i| {
+                    let read_file1 = &first_pairs[i];
+                    let read_file2 = &second_pairs[i];
 
-            let mut sample_name = None;
-            if let Some(name) = &sample_names {
-                sample_name = Some(name[i].clone());
+                    let mut sample_name = None;
+                    if let Some(name) = &sample_names {
+                        sample_name = Some(name[i].clone());
+                    }
+                    let read_sketch_opt = sketch_pair_sequences(
+                        read_file1,
+                        read_file2,
+                        args.c,
+                        args.k,
+                        sample_name.clone(),
+                        args.no_dedup,
+                        args.fpr,
+                    );
+                    if read_sketch_opt.is_some() {
+                        let res = fs::create_dir_all(&args.sample_output_dir);
+                        if res.is_err() {
+                            error!("Could not create directory at {}", args.sample_output_dir);
+                            std::process::exit(1);
+                        }
+                        let (read_sketch, meta) = read_sketch_opt.unwrap();
+
+                        let sketch_name = if sample_name.is_some() {
+                            read_sketch.sample_name.as_ref().unwrap().clone()
+                        } else {
+                            read_sketch.file_name.clone()
+                        };
+
+                        write_read_sketch_file(
+                            &read_sketch,
+                            meta,
+                            &sketch_name,
+                            true,
+                            &args.sample_output_dir,
+                            &args.compressed_sample_output_dir,
+                            ref_index.as_ref(),
+                            args.reference.as_deref(),
+                        );
+                    }
+                });
             }
-            let read_sketch_opt = sketch_pair_sequences(
-                read_file1,
-                read_file2,
-                args.c,
-                args.k,
-                sample_name.clone(),
-                args.no_dedup,
-                args.fpr,
-            );
-            if read_sketch_opt.is_some() {
-                let res = fs::create_dir_all(&args.sample_output_dir);
-                if res.is_err() {
-                    error!("Could not create directory at {}", args.sample_output_dir);
-                    std::process::exit(1);
+        });
+
+        scope.spawn(|_| {
+            if !interleaved_inputs.is_empty() {
+                info!("Sketching interleaved sequences...");
+                let iter_vec: Vec<usize> = (0..interleaved_inputs.len()).into_iter().collect();
+                iter_vec.into_par_iter().for_each(|i| {
+                    let read_file = &interleaved_inputs[i];
+                    let mut sample_name = None;
+                    if let Some(name) = &sample_names {
+                        sample_name = Some(name[i + first_pairs.len()].clone());
+                    }
+                    let read_sketch_opt = sketch_interleaved_sequences(
+                        read_file,
+                        args.c,
+                        args.k,
+                        sample_name.clone(),
+                        args.no_dedup,
+                        args.fpr,
+                    );
+                    if let Some((read_sketch, meta)) = read_sketch_opt {
+                        let sketch_name = if sample_name.is_some() {
+                            read_sketch.sample_name.as_ref().unwrap().clone()
+                        } else {
+                            read_sketch.file_name.clone()
+                        };
+                        write_read_sketch_file(
+                            &read_sketch,
+                            meta,
+                            &sketch_name,
+                            true,
+                            &args.sample_output_dir,
+                            &args.compressed_sample_output_dir,
+                            ref_index.as_ref(),
+                            args.reference.as_deref(),
+                        );
+                    }
+                });
+            }
+        });
+
+        scope.spawn(|_| {
+            if !read_inputs.is_empty() {
+                info!("Sketching non-paired sequences...");
+            }
+
+            let iter_vec: Vec<usize> = (0..read_inputs.len()).into_iter().collect();
+            iter_vec.into_par_iter().for_each(|i| {
+                let pref = Path::new(&args.sample_output_dir);
+                std::fs::create_dir_all(pref)
+                    .expect("Could not create directory for output sample files (-d). Exiting...");
+
+                let read_file = &read_inputs[i];
+
+                check_vram_and_block(max_ram, read_file);
+                let mut sample_name = None;
+                if let Some(name) = &sample_names {
+                    sample_name =
+                        Some(name[i + first_pairs.len() + interleaved_inputs.len()].clone());
                 }
-                let (read_sketch, meta) = read_sketch_opt.unwrap();
 
-                let sketch_name = if sample_name.is_some() {
-                    read_sketch.sample_name.as_ref().unwrap().clone()
-                } else {
-                    read_sketch.file_name.clone()
-                };
-
-                write_read_sketch_file(
-                    &read_sketch,
-                    meta,
-                    &sketch_name,
-                    true,
-                    &args.sample_output_dir,
-                    &args.compressed_sample_output_dir,
-                    ref_index.as_ref(),
-                    args.reference.as_deref(),
+                let read_sketch_opt = sketch_sequences_needle(
+                    read_file,
+                    args.c,
+                    args.k,
+                    sample_name.clone(),
+                    args.no_dedup,
                 );
-            }
+
+                if read_sketch_opt.is_some() {
+                    let (read_sketch, meta) = read_sketch_opt.unwrap();
+                    let sketch_name = if sample_name.is_some() {
+                        read_sketch.sample_name.as_ref().unwrap().clone()
+                    } else {
+                        read_sketch.file_name.clone()
+                    };
+                    write_read_sketch_file(
+                        &read_sketch,
+                        meta,
+                        &sketch_name,
+                        false,
+                        &args.sample_output_dir,
+                        &args.compressed_sample_output_dir,
+                        ref_index.as_ref(),
+                        args.reference.as_deref(),
+                    );
+                }
+            });
         });
-    }
-
-    if !interleaved_inputs.is_empty() {
-        info!("Sketching interleaved sequences...");
-        let iter_vec: Vec<usize> = (0..interleaved_inputs.len()).into_iter().collect();
-        iter_vec.into_par_iter().for_each(|i| {
-            let read_file = &interleaved_inputs[i];
-            let mut sample_name = None;
-            if let Some(name) = &sample_names {
-                sample_name = Some(name[i + first_pairs.len()].clone());
-            }
-            let read_sketch_opt = sketch_interleaved_sequences(
-                read_file,
-                args.c,
-                args.k,
-                sample_name.clone(),
-                args.no_dedup,
-                args.fpr,
-            );
-            if let Some((read_sketch, meta)) = read_sketch_opt {
-                let sketch_name = if sample_name.is_some() {
-                    read_sketch.sample_name.as_ref().unwrap().clone()
-                } else {
-                    read_sketch.file_name.clone()
-                };
-                write_read_sketch_file(
-                    &read_sketch,
-                    meta,
-                    &sketch_name,
-                    true,
-                    &args.sample_output_dir,
-                    &args.compressed_sample_output_dir,
-                    ref_index.as_ref(),
-                    args.reference.as_deref(),
-                );
-            }
-        });
-    }
-
-    if !read_inputs.is_empty() {
-        info!("Sketching non-paired sequences...");
-    }
-
-    let iter_vec: Vec<usize> = (0..read_inputs.len()).into_iter().collect();
-    iter_vec.into_par_iter().for_each(|i| {
-        let pref = Path::new(&args.sample_output_dir);
-        std::fs::create_dir_all(pref)
-            .expect("Could not create directory for output sample files (-d). Exiting...");
-
-        let read_file = &read_inputs[i];
-
-        check_vram_and_block(max_ram, read_file);
-        let mut sample_name = None;
-        if let Some(name) = &sample_names {
-            sample_name = Some(name[i + first_pairs.len() + interleaved_inputs.len()].clone());
-        }
-
-        let read_sketch_opt;
-        read_sketch_opt = sketch_sequences_needle(
-            read_file,
-            args.c,
-            args.k,
-            sample_name.clone(),
-            args.no_dedup,
-        );
-
-        if read_sketch_opt.is_some() {
-            let (read_sketch, meta) = read_sketch_opt.unwrap();
-            let sketch_name = if sample_name.is_some() {
-                read_sketch.sample_name.as_ref().unwrap().clone()
-            } else {
-                read_sketch.file_name.clone()
-            };
-            write_read_sketch_file(
-                &read_sketch,
-                meta,
-                &sketch_name,
-                false,
-                &args.sample_output_dir,
-                &args.compressed_sample_output_dir,
-                ref_index.as_ref(),
-                args.reference.as_deref(),
-            );
-        }
     });
 
     if !genome_inputs.is_empty() {
