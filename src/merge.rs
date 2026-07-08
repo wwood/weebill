@@ -163,9 +163,24 @@ pub fn merge_sketches(
 ) -> (SequencesSketch, ReadSketchMeta) {
     assert!(sketches.len() >= 2);
 
-    let mut merged_counts = sketches[0].0.kmer_counts.clone();
     let c = sketches[0].0.c;
     let k = sketches[0].0.k;
+    // Sketches subsampled at different rates (c) or built with different k cannot be
+    // summed: their k-mer sets were selected against different thresholds, so a merged
+    // count map would mix sampling rates and corrupt containment/coverage. Reject the
+    // mismatch here so every caller (merge subcommand, sketch --merge, profile --merge)
+    // is protected, not just the ones that pre-check.
+    for (sketch, _) in sketches[1..].iter() {
+        if sketch.c != c || sketch.k != k {
+            error!(
+                "Cannot merge sketches with differing parameters: '{}' has c={}, k={} but expected c={}, k={}. All merged inputs must share the same c and k. Exiting.",
+                sketch.file_name, sketch.c, sketch.k, c, k
+            );
+            std::process::exit(1);
+        }
+    }
+
+    let mut merged_counts = sketches[0].0.kmer_counts.clone();
     let mut total_reads = sketches[0].1.num_reads;
     let mut weighted_length = sketches[0].0.mean_read_length * sketches[0].1.num_reads as f64;
     let mut fallback_length_sum = sketches[0].0.mean_read_length;

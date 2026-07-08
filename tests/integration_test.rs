@@ -1295,4 +1295,28 @@ fn test_profile_merge_single_and_paired() {
         containment_merge, containment_sub,
         "profile --merge disagreed with merge subcommand + profile"
     );
+
+    // --merge must reject inputs whose sampling rates disagree: summing sketches made
+    // at different -c would silently corrupt containment. Here a c=100 pre-sketched
+    // sample is mixed with c=200 raw reads against the c=200 database.
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("sketch")
+        .arg("-r")
+        .arg("test_files/o157_reads.fastq.gz")
+        .arg("-c")
+        .arg("100")
+        .arg("-d")
+        .arg(format!("{}/c100", dir))
+        .assert()
+        .success()
+        .code(0);
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("profile")
+        .arg(&db_file)
+        .arg(format!("{}/c100/o157_reads.fastq.gz.sylsp", dir))
+        .arg("-r")
+        .arg("test_files/k12_R1.fq")
+        .arg("--merge")
+        .assert()
+        .failure();
 }
