@@ -373,6 +373,12 @@ pub struct SketchArgs {
         help = "Interleaved paired-end fasta/fastq reads. Consecutive reads with the same name (before the first space) are treated as pairs"
     )]
     pub interleaved: Vec<String>,
+    #[clap(
+        long = "merge",
+        help_heading = "OUTPUT",
+        help = "Merge all read inputs (single-end, paired-end, and interleaved) into ONE sample sketch. The value given to --compressed-database (or -d) is then treated as the single output FILE path (suffix appended if missing) rather than a directory. Use -S to name the merged sample."
+    )]
+    pub merge: bool,
 }
 
 #[derive(Args, Clone)]
@@ -495,6 +501,19 @@ pub struct ContainArgs {
         help_heading = "SKETCHING"
     )]
     pub interleaved: Vec<String>,
+    #[clap(
+        long = "merge",
+        help_heading = "SKETCHING",
+        help = "Merge all read inputs (pre-sketched *.sylsp/*.sylspc/*.sylspr samples plus any raw single-end, paired-end, and interleaved reads) into ONE sample sketch, and profile/query that single merged sample instead of each input separately. Use -S to name it."
+    )]
+    pub merge: bool,
+    #[clap(
+        short = 'S',
+        long = "sample-name",
+        help_heading = "SKETCHING",
+        help = "Name for the merged sample produced by --merge (shown in the Sample_file column). Default: 'merged'."
+    )]
+    pub sample_name: Option<String>,
 
     #[clap(
         short,
