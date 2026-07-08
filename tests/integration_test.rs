@@ -1198,6 +1198,28 @@ fn test_sketch_merge_single_and_paired() {
         .arg("test_files/o157_reads.fastq.gz")
         .assert()
         .failure();
+
+    // A directory-style value (trailing slash, or an existing directory) is likewise
+    // rejected rather than writing a hidden file like `<dir>/.sylspc`.
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("sketch")
+        .arg("--merge")
+        .arg("-r")
+        .arg("test_files/o157_reads.fastq.gz")
+        .arg("--compressed-database")
+        .arg(format!("{}/", dir))
+        .assert()
+        .failure();
+
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("sketch")
+        .arg("--merge")
+        .arg("-r")
+        .arg("test_files/o157_reads.fastq.gz")
+        .arg("--compressed-database")
+        .arg(dir)
+        .assert()
+        .failure();
 }
 
 /// Extract the (single) data row's Sample_file (col 1) and Containment_ind (col 12)

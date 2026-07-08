@@ -322,15 +322,23 @@ fn check_args_valid(args: &SketchArgs) {
     }
     if args.merge {
         // The merged output path is the value of --compressed-database, or of -d
-        // (also used verbatim for --reference's *.sylspr). Left at the default "./",
-        // that would silently write a hidden file (e.g. ./.sylspr); require an
-        // explicit path regardless of which output mode is in effect.
+        // (also used verbatim for --reference's *.sylspr). It names a single FILE.
+        // A directory-style value -- the default "./", a trailing separator, or an
+        // existing directory -- would get the suffix appended directly and silently
+        // write a hidden file like `results/.sylspc` that downstream commands won't
+        // find, so require an explicit file path regardless of the output mode.
         let effective_base = match &args.compressed_sample_output_dir {
             Some(dir) => dir.as_str(),
             None => args.sample_output_dir.as_str(),
         };
-        if effective_base == "./" || effective_base.is_empty() {
-            error!("--merge writes a single merged sketch; specify its output file path via --compressed-database (compressed), -d (legacy), or -d with --reference (*.sylspr). Exiting.");
+        let ends_with_sep =
+            effective_base.ends_with('/') || effective_base.ends_with(std::path::MAIN_SEPARATOR);
+        if effective_base.is_empty() || ends_with_sep || Path::new(effective_base).is_dir() {
+            error!(
+                "--merge writes the merged sketch to a single FILE, but the output path '{}' is empty or a directory. Give an explicit file path (e.g. '{}/merged') via --compressed-database (compressed), -d with --reference (*.sylspr), or -d (legacy). Exiting.",
+                effective_base,
+                effective_base.trim_end_matches('/').trim_end_matches(std::path::MAIN_SEPARATOR)
+            );
             std::process::exit(1);
         }
     }
