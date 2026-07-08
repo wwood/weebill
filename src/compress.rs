@@ -435,7 +435,7 @@ pub fn write_genome_sketches_compressed<W: Write>(
         write_genome_sketch(&mut w, s)?;
     }
     w.into_inner()
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?
+        .map_err(|e| io::Error::other(e.to_string()))?
         .finish()?;
     Ok(())
 }
@@ -505,7 +505,7 @@ pub fn write_seq_sketch_compressed_with_meta<W: Write>(
     }
 
     w.into_inner()
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?
+        .map_err(|e| io::Error::other(e.to_string()))?
         .finish()?;
     Ok(())
 }

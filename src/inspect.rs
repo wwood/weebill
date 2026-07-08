@@ -149,7 +149,7 @@ pub fn inspect(args: InspectArgs) {
     }
 
     let mut out_writer = match args.out_file_name {
-        Some(ref x) => Box::new(BufWriter::new(File::create(&x).unwrap())) as Box<dyn Write + Send>,
+        Some(ref x) => Box::new(BufWriter::new(File::create(x).unwrap())) as Box<dyn Write + Send>,
         None => Box::new(BufWriter::new(std::io::stdout())) as Box<dyn Write + Send>,
     };
 
@@ -176,20 +176,20 @@ pub fn inspect(args: InspectArgs) {
 }
 
 fn get_db_sketch_inspect(genome_sketch_file: &String) -> DatabaseSketch {
-    let file = File::open(genome_sketch_file).expect(&format!(
-        "The sketch `{}` could not be opened. Exiting",
-        genome_sketch_file
-    ));
+    let file = File::open(genome_sketch_file).unwrap_or_else(|_| {
+        panic!(
+            "The sketch `{}` could not be opened. Exiting",
+            genome_sketch_file
+        )
+    });
     let mut genome_reader = BufReader::with_capacity(10_000_000, file);
 
     let visitor: DatabaseVisitor = if crate::compress::peek_is_compressed(&mut genome_reader)
         .unwrap_or(false)
     {
         let sketches = crate::compress::read_genome_sketches_compressed(&mut genome_reader)
-            .expect(&format!(
-                "The database sketch `{}` is not a valid sketch. Perhaps it is an older, incompatible version ",
-                &genome_sketch_file
-            ));
+            .unwrap_or_else(|_| panic!("The database sketch `{}` is not a valid sketch. Perhaps it is an older, incompatible version ",
+                &genome_sketch_file));
         let mut visitor = DatabaseVisitor::default();
         for sketch in sketches {
             visitor.c.get_or_insert(sketch.c);
@@ -200,10 +200,8 @@ fn get_db_sketch_inspect(genome_sketch_file: &String) -> DatabaseSketch {
         visitor
     } else {
         bincode::deserialize_from(&mut genome_reader)
-            .expect(&format!(
-                "The database sketch `{}` is not a valid sketch. Perhaps it is an older, incompatible version ",
-                &genome_sketch_file
-            ))
+            .unwrap_or_else(|_| panic!("The database sketch `{}` is not a valid sketch. Perhaps it is an older, incompatible version ",
+                &genome_sketch_file))
     };
     if visitor.sketches.is_empty() {
         warn!(
@@ -229,25 +227,19 @@ fn get_db_sketch_inspect(genome_sketch_file: &String) -> DatabaseSketch {
 }
 
 fn get_seq_sketch_inspect(read_file: &String) -> SequencesSketchInspect {
-    let file = File::open(read_file).expect(&format!(
-        "The sketch `{}` could not be opened. Exiting",
-        read_file
-    ));
+    let file = File::open(read_file)
+        .unwrap_or_else(|_| panic!("The sketch `{}` could not be opened. Exiting", read_file));
     let mut seq_reader = BufReader::with_capacity(10_000_000, file);
     let seq_sketch: SequencesSketch = if crate::compress::peek_is_compressed(&mut seq_reader)
         .unwrap_or(false)
     {
         crate::compress::read_seq_sketch_compressed(&mut seq_reader)
-            .expect(&format!(
-                "The sequence sketch `{}` is not a valid sketch. Perhaps it is an older, incompatible version ",
-                &read_file
-            ))
+            .unwrap_or_else(|_| panic!("The sequence sketch `{}` is not a valid sketch. Perhaps it is an older, incompatible version ",
+                &read_file))
     } else {
         bincode::deserialize_from(&mut seq_reader)
-            .expect(&format!(
-                "The sequence sketch `{}` is not a valid sketch. Perhaps it is an older, incompatible version ",
-                &read_file
-            ))
+            .unwrap_or_else(|_| panic!("The sequence sketch `{}` is not a valid sketch. Perhaps it is an older, incompatible version ",
+                &read_file))
     };
     info!("Sequence file {} processed", read_file,);
     seq_sketch.into()

@@ -34,17 +34,12 @@ use smallvec::SmallVec;
 use std::collections::HashSet;
 use std::hash::{BuildHasherDefault, Hasher};
 
-#[derive(Deserialize, Serialize, Debug, PartialEq)]
+#[derive(Deserialize, Serialize, Debug, PartialEq, Default)]
 pub enum AdjustStatus {
     Lambda(f64),
+    #[default]
     Low,
     High,
-}
-
-impl Default for AdjustStatus {
-    fn default() -> Self {
-        AdjustStatus::Low
-    }
 }
 
 pub type Kmer = u64;
@@ -61,7 +56,7 @@ pub const BYTE_TO_SEQ: [u8; 256] = [
 
 #[inline]
 pub fn mm_hash(bytes: &[u8]) -> usize {
-    let mut key = usize::from_ne_bytes(bytes.try_into().unwrap()) as usize;
+    let mut key = usize::from_ne_bytes(bytes.try_into().unwrap());
     key = (!key).wrapping_add(key << 21); // key = (key << 21) - key - 1;
     key = key ^ key >> 24;
     key = (key.wrapping_add(key << 3)).wrapping_add(key << 8); // key * 265
@@ -69,7 +64,7 @@ pub fn mm_hash(bytes: &[u8]) -> usize {
     key = (key.wrapping_add(key << 2)).wrapping_add(key << 4); // key * 21
     key = key ^ key >> 28;
     key = key.wrapping_add(key << 31);
-    return key;
+    key
 }
 
 pub struct MMHasher {
@@ -137,7 +132,7 @@ mod kmer_counts {
     where
         S: Serializer,
     {
-        serializer.collect_seq(kmer_counts.into_iter())
+        serializer.collect_seq(kmer_counts)
     }
 
     pub fn deserialize<'de, D>(deserializer: D) -> Result<FxHashMap<Kmer, u32>, D::Error>
@@ -169,7 +164,7 @@ impl SequencesSketch {
         sample_name: Option<String>,
         mean_read_length: f64,
     ) -> SequencesSketch {
-        return SequencesSketch {
+        SequencesSketch {
             kmer_counts: HashMap::default(),
             file_name,
             c,
@@ -177,7 +172,7 @@ impl SequencesSketch {
             paired,
             sample_name,
             mean_read_length,
-        };
+        }
     }
 }
 

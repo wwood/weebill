@@ -172,7 +172,7 @@ pub fn decompress_seq_with_meta<R: Read>(
         let mut offsets = vec![0u8; total];
         r.read_exact(&mut offsets)?;
         // array 3: 2-bit-packed replacement bases
-        let mut packed = vec![0u8; (total + 3) / 4];
+        let mut packed = vec![0u8; total.div_ceil(4)];
         r.read_exact(&mut packed)?;
 
         let mut e = 0usize;

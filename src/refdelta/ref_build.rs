@@ -121,7 +121,7 @@ fn read_genome_seq_from_fasta(path: &str) -> Option<GenomeSeq> {
         };
         let seq = record.seq();
         let len = seq.len();
-        let mut packed = vec![0u8; (len + 3) / 4];
+        let mut packed = vec![0u8; len.div_ceil(4)];
         for (i, &b) in seq.iter().enumerate() {
             let code = BYTE_TO_SEQ[b as usize];
             packed[i / 4] |= (code & 3) << (2 * (i % 4));
@@ -186,7 +186,7 @@ pub(crate) fn read_genome_seq_block<R: Read>(r: &mut R) -> io::Result<GenomeSeq>
     let mut contigs = Vec::with_capacity(n_contigs);
     for _ in 0..n_contigs {
         let len = read_uvarint(r)? as usize;
-        let nbytes = (len + 3) / 4;
+        let nbytes = len.div_ceil(4);
         let mut packed = vec![0u8; nbytes];
         r.read_exact(&mut packed)?;
         contigs.push((len, packed));
@@ -1028,9 +1028,8 @@ fn partition_of(h: u64, p: u64) -> usize {
 /// iterate the variable number of genome blocks in a shard file).
 fn read_uvarint_opt<R: Read>(r: &mut R) -> io::Result<Option<u64>> {
     let mut first = [0u8; 1];
-    match r.read(&mut first)? {
-        0 => return Ok(None),
-        _ => {}
+    if r.read(&mut first)? == 0 {
+        return Ok(None);
     }
     let mut x = (first[0] & 0x7f) as u64;
     if first[0] & 0x80 == 0 {
@@ -1265,7 +1264,7 @@ pub fn run_ref_build(args: RefBuildArgs) {
             let needed = est_kmers * ACC_BYTES_PER_ENTRY * threads as f64 / budget;
             (needed.ceil() as usize).max(threads).min(512).max(1)
         }
-        _ => 256usize.min(512).max(threads).max(1),
+        _ => 256usize.max(threads).max(1),
     };
     info!(
         "Building reference with {} hash partitions ({} threads), shared-pool threshold >= {} genome(s){}",

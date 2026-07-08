@@ -6,14 +6,14 @@ use std::collections::HashSet;
 pub fn r_from_moments_lambda(m: f64, v: f64, lambda: f64) -> f64 {
     //return (v / m - 1. - lambda + m) / lambda;
     //return 1000.;
-    return lambda / (v - 1. + lambda + m);
+    lambda / (v - 1. + lambda + m)
 }
 
 pub fn ratio_formula(val: f64, r: f64, lambda: f64) -> f64 {
     if r < 100. {
-        return gamma(r + val + 1.) / (val + 1.) / gamma(r + val) * lambda / (r + lambda);
+        gamma(r + val + 1.) / (val + 1.) / gamma(r + val) * lambda / (r + lambda)
     } else {
-        return (r + val + 1.) / (val + 1.) * lambda / (r + lambda);
+        (r + val + 1.) / (val + 1.) * lambda / (r + lambda)
     }
 }
 
@@ -22,11 +22,11 @@ fn ratio_from_moments_lambda(val: f64, lambda: f64, m: f64, v: f64) -> Option<f6
     if r < 0. {
         return None;
     }
-    return Some(ratio_formula(val, r, lambda));
+    Some(ratio_formula(val, r, lambda))
 }
 
 pub fn binary_search_lambda(full_covs: &[u32]) -> Option<f64> {
-    if full_covs.len() == 0 {
+    if full_covs.is_empty() {
         return None;
     }
     let m = mean(full_covs).unwrap();
@@ -64,9 +64,7 @@ pub fn binary_search_lambda(full_covs: &[u32]) -> Option<f64> {
             }
         }
     }
-    if best.is_none() {
-        return None;
-    }
+    best?;
     let best = best.unwrap();
     let r = r_from_moments_lambda(m, v, best);
     dbg!(m, v, ratio_est, r, best);
@@ -94,7 +92,7 @@ pub fn binary_search_lambda(full_covs: &[u32]) -> Option<f64> {
     //        dbg!(endpoints, endpoints_output, proposed);
     //    }
     //
-    return Some(best);
+    Some(best)
 }
 
 pub fn var(data: &[u32]) -> Option<f64> {
@@ -106,7 +104,7 @@ pub fn var(data: &[u32]) -> Option<f64> {
     for x in data {
         var += (*x as f64 - mean) * (*x as f64 - mean)
     }
-    return Some(var / data.len() as f64);
+    Some(var / data.len() as f64)
 }
 
 pub fn mean(data: &[u32]) -> Option<f64> {
@@ -140,13 +138,13 @@ pub fn mme_lambda(full_covs: &[u32]) -> Option<f64> {
         return None;
     }
 
-    let mean = mean(&full_covs).unwrap();
-    let var = var(&full_covs).unwrap();
+    let mean = mean(full_covs).unwrap();
+    let var = var(full_covs).unwrap();
     let lambda = var / mean + mean - 1.;
     if lambda < 0. {
-        return None;
+        None
     } else {
-        return Some(lambda as f64);
+        Some(lambda)
     }
 }
 
@@ -171,11 +169,8 @@ pub fn mle_zip(full_covs: &[u32], _k: f64) -> Option<f64> {
         return None;
     }
 
-    let mean = mean(&full_covs).unwrap();
-    let lambda = newton_raphson(
-        (num_zero as f32 / full_covs.len() as f32).into(),
-        mean.into(),
-    );
+    let mean = mean(full_covs).unwrap();
+    let lambda = newton_raphson((num_zero as f32 / full_covs.len() as f32).into(), mean);
     //    log::trace!("lambda,pi {} {} {}", lambda,pi, num_zero as f64 / full_covs.len() as f64);
     let ret_lambda;
     if lambda < 0. || lambda.is_nan() {
@@ -184,7 +179,7 @@ pub fn mle_zip(full_covs: &[u32], _k: f64) -> Option<f64> {
         ret_lambda = Some(lambda);
     }
 
-    return ret_lambda;
+    ret_lambda
 }
 
 fn newton_raphson(rat: f64, mean: f64) -> f64 {
@@ -195,9 +190,9 @@ fn newton_raphson(rat: f64, mean: f64) -> f64 {
         let t2 = mean * (1. - f64::exp(-curr));
         let t3 = 1. - rat;
         let t4 = mean * (f64::exp(-curr));
-        curr = curr - (t1 - t2) / (t3 - t4);
+        curr -= (t1 - t2) / (t3 - t4);
     }
-    return curr;
+    curr
 }
 
 pub fn ratio_lambda(full_covs: &Vec<u32>, min_count_correct: f64) -> Option<f64> {
@@ -219,20 +214,20 @@ pub fn ratio_lambda(full_covs: &Vec<u32>, min_count_correct: f64) -> Option<f64>
     }
 
     if full_covs.len() - num_zero < SAMPLE_SIZE_CUTOFF {
-        return None;
+        None
     } else {
         let mut sort_vec: Vec<(_, _)> = count_map.iter().map(|x| (x.1, x.0)).collect();
-        sort_vec.sort_by(|x, y| y.cmp(&x));
+        sort_vec.sort_by(|x, y| y.cmp(x));
         let most_ind = sort_vec[0].1;
         if !count_map.contains_key(&(most_ind + 1)) {
             return None;
         }
         let count_p1 = count_map[&(most_ind + 1)] as f64;
-        let count = count_map[&most_ind] as f64;
+        let count = count_map[most_ind] as f64;
         if count_p1 < min_count_correct || count < min_count_correct {
             return None;
         }
-        let lambda = Some(count_p1 / count * ((most_ind + 1) as f64));
-        return lambda;
+
+        Some(count_p1 / count * ((most_ind + 1) as f64))
     }
 }

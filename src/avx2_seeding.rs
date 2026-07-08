@@ -26,7 +26,7 @@ pub unsafe fn mm_hash256(kmer: __m256i) -> __m256i {
     let s6 = _mm256_slli_epi64(key, 31);
     key = _mm256_add_epi64(key, s6);
 
-    return key;
+    key
 }
 
 #[target_feature(enable = "avx2")]
@@ -78,7 +78,7 @@ pub unsafe fn extract_markers_avx2(string: &[u8], kmer_vec: &mut Vec<u64>, c: us
     }
 
     let marker_mask = (Kmer::MAX >> (std::mem::size_of::<Kmer>() * 8 - 2 * k)) as i64;
-    let rev_marker_mask: i64 = !(0 | (3 << 2 * k - 2));
+    let rev_marker_mask: i64 = !(3 << (2 * k - 2));
     //    let rev_marker_mask = i64::from_le_bytes(rev_marker_mask.to_le_bytes());
     //    dbg!(u64::MAX / (c as u64));
     //    dbg!((u64::MAX / (c as u64)) as i64);
@@ -202,7 +202,7 @@ pub unsafe fn extract_markers_avx2_positions(
     }
 
     let marker_mask = (Kmer::MAX >> (std::mem::size_of::<Kmer>() * 8 - 2 * k)) as i64;
-    let rev_marker_mask: i64 = !(0 | (3 << 2 * k - 2));
+    let rev_marker_mask: i64 = !(3 << (2 * k - 2));
     //    let rev_marker_mask = i64::from_le_bytes(rev_marker_mask.to_le_bytes());
     //    dbg!(u64::MAX / (c as u64));
     //    dbg!((u64::MAX / (c as u64)) as i64);

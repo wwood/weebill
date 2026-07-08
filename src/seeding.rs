@@ -27,19 +27,19 @@ pub fn rev_mm_hash64(hashed_key: u64) -> u64 {
     key = key.wrapping_sub(tmp << 31);
     // invert: key = key ^ key >> 28
     tmp = key ^ key >> 28;
-    key = key ^ tmp >> 28;
+    key ^= tmp >> 28;
     // invert: key = key.wrapping_mul(21)
     key = key.wrapping_mul(14933078535860113213u64);
     // invert: key = key ^ key >> 14
     tmp = key ^ key >> 14;
     tmp = key ^ tmp >> 14;
     tmp = key ^ tmp >> 14;
-    key = key ^ tmp >> 14;
+    key ^= tmp >> 14;
     // invert: key = key.wrapping_mul(265)
     key = key.wrapping_mul(15244667743933553977u64);
     // invert: key = key ^ key >> 24
     tmp = key ^ key >> 24;
-    key = key ^ tmp >> 24;
+    key ^= tmp >> 24;
     // invert: key = !(key + (key << 21)); recover x from w = x + (x << 21)
     let w = !key;
     let mut x = w;
@@ -59,7 +59,7 @@ pub fn rev_hash_64(hashed_key: u64) -> u64 {
 
     // Invert h_key = h_key ^ h_key >> 28;
     tmp = key ^ key >> 28;
-    key = key ^ tmp >> 28;
+    key ^= tmp >> 28;
 
     // Invert h_key = h_key.wrapping_add(h_key << 2).wrapping_add(h_key << 4)
     key = key.wrapping_mul(14933078535860113213u64);
@@ -68,14 +68,14 @@ pub fn rev_hash_64(hashed_key: u64) -> u64 {
     tmp = key ^ key >> 14;
     tmp = key ^ tmp >> 14;
     tmp = key ^ tmp >> 14;
-    key = key ^ tmp >> 14;
+    key ^= tmp >> 14;
 
     // Invert h_key = h_key.wrapping_add(h_key << 3).wrapping_add(h_key << 8)
     key = key.wrapping_mul(15244667743933553977u64);
 
     // Invert h_key = h_key ^ h_key >> 24
     tmp = key ^ key >> 24;
-    key = key ^ tmp >> 24;
+    key ^= tmp >> 24;
 
     // Invert h_key = (!h_key).wrapping_add(h_key << 21)
     tmp = !key;
@@ -88,13 +88,13 @@ pub fn rev_hash_64(hashed_key: u64) -> u64 {
 
 pub fn decode(byte: u64) -> u8 {
     if byte == 0 {
-        return b'A';
+        b'A'
     } else if byte == 1 {
-        return b'C';
+        b'C'
     } else if byte == 2 {
-        return b'G';
+        b'G'
     } else if byte == 3 {
-        return b'T';
+        b'T'
     } else {
         panic!("decoding failed")
     }
@@ -103,7 +103,7 @@ pub fn print_string(kmer: u64, k: usize) {
     let mut bytes = vec![];
     let mask = 3;
     for i in 0..k {
-        let val = kmer >> 2 * i;
+        let val = kmer >> (2 * i);
         let val = val & mask;
         bytes.push(decode(val));
     }
