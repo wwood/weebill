@@ -39,13 +39,16 @@ fn read_sample(
         crate::compress::read_seq_sketch_compressed_with_meta(&mut reader)
             .unwrap_or_else(|e| panic!("The compressed sketch `{}` is invalid: {}", path, e))
     } else {
-        let sketch: SequencesSketch = bincode::deserialize_from(&mut reader).unwrap_or_else(|_| {
-            panic!(
-                "The sketch '{}' is not a valid legacy sample sketch. Perhaps it is an older incompatible version.",
-                path
-            )
-        });
-        (sketch, ReadSketchMeta::default())
+        // Legacy uncompressed *.sylsp samples predate the ReadSketchMeta side-channel and
+        // therefore carry no recorded read count. Merging weights each sample's read length
+        // by its read count, so a legacy input would silently contribute a read length of
+        // zero and corrupt the merged mean_read_length. Refuse it rather than merge garbage;
+        // the user can re-sketch to the current format first.
+        error!(
+            "'{}' is a legacy uncompressed sample sketch (*.sylsp) with no recorded read count, so it cannot be merged (read length cannot be determined). Re-sketch it with the current version, or exclude it. Exiting.",
+            path
+        );
+        std::process::exit(1);
     }
 }
 

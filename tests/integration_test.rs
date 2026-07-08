@@ -1150,6 +1150,8 @@ fn test_sketch_merge_single_and_paired() {
 
     // Sketching the same inputs individually and then combining them with the `merge`
     // subcommand must yield the identical distinct-k-mer count as the one-pass --merge.
+    // Use compressed (*.sylspc) sketches: legacy uncompressed *.sylsp lack read metadata
+    // and are rejected as merge inputs.
     let mut cmd = Command::cargo_bin("weebill").unwrap();
     cmd.arg("sketch")
         .arg("-1")
@@ -1158,7 +1160,7 @@ fn test_sketch_merge_single_and_paired() {
         .arg("test_files/k12_R2.fq")
         .arg("-r")
         .arg("test_files/o157_reads.fastq.gz")
-        .arg("-d")
+        .arg("--compressed-database")
         .arg(dir)
         .assert()
         .success()
@@ -1167,8 +1169,8 @@ fn test_sketch_merge_single_and_paired() {
     let via_sub = format!("{}/via_sub", dir);
     let mut cmd = Command::cargo_bin("weebill").unwrap();
     cmd.arg("merge")
-        .arg(format!("{}/k12_R1.fq.paired.sylsp", dir))
-        .arg(format!("{}/o157_reads.fastq.gz.sylsp", dir))
+        .arg(format!("{}/k12_R1.fq.paired.sylspc", dir))
+        .arg(format!("{}/o157_reads.fastq.gz.sylspc", dir))
         .arg("-o")
         .arg(&via_sub)
         .assert()
@@ -1258,7 +1260,8 @@ fn test_profile_merge_single_and_paired() {
     assert_eq!(name, "combined");
 
     // Cross-check: sketch the same inputs, combine them with the `merge` subcommand,
-    // and profile the result -- the containment index must be identical.
+    // and profile the result -- the containment index must be identical. Use compressed
+    // (*.sylspc) sketches: legacy *.sylsp lack read metadata and cannot be merged.
     let mut cmd = Command::cargo_bin("weebill").unwrap();
     cmd.arg("sketch")
         .arg("-1")
@@ -1267,7 +1270,7 @@ fn test_profile_merge_single_and_paired() {
         .arg("test_files/k12_R2.fq")
         .arg("-r")
         .arg("test_files/o157_reads.fastq.gz")
-        .arg("-d")
+        .arg("--compressed-database")
         .arg(dir)
         .assert()
         .success()
@@ -1275,8 +1278,8 @@ fn test_profile_merge_single_and_paired() {
     let merged = format!("{}/m", dir);
     let mut cmd = Command::cargo_bin("weebill").unwrap();
     cmd.arg("merge")
-        .arg(format!("{}/k12_R1.fq.paired.sylsp", dir))
-        .arg(format!("{}/o157_reads.fastq.gz.sylsp", dir))
+        .arg(format!("{}/k12_R1.fq.paired.sylspc", dir))
+        .arg(format!("{}/o157_reads.fastq.gz.sylspc", dir))
         .arg("-o")
         .arg(&merged)
         .assert()
@@ -1298,14 +1301,15 @@ fn test_profile_merge_single_and_paired() {
 
     // --merge must reject inputs whose sampling rates disagree: summing sketches made
     // at different -c would silently corrupt containment. Here a c=100 pre-sketched
-    // sample is mixed with c=200 raw reads against the c=200 database.
+    // sample is mixed with c=200 raw reads against the c=200 database. Use a compressed
+    // (*.sylspc) sketch so it carries read metadata and reaches the c-mismatch check.
     let mut cmd = Command::cargo_bin("weebill").unwrap();
     cmd.arg("sketch")
         .arg("-r")
         .arg("test_files/o157_reads.fastq.gz")
         .arg("-c")
         .arg("100")
-        .arg("-d")
+        .arg("--compressed-database")
         .arg(format!("{}/c100", dir))
         .assert()
         .success()
@@ -1313,10 +1317,93 @@ fn test_profile_merge_single_and_paired() {
     let mut cmd = Command::cargo_bin("weebill").unwrap();
     cmd.arg("profile")
         .arg(&db_file)
-        .arg(format!("{}/c100/o157_reads.fastq.gz.sylsp", dir))
+        .arg(format!("{}/c100/o157_reads.fastq.gz.sylspc", dir))
         .arg("-r")
         .arg("test_files/k12_R1.fq")
         .arg("--merge")
+        .assert()
+        .failure();
+}
+
+/// Legacy uncompressed *.sylsp sketches carry no read count, so they cannot be merged
+/// (read length is undeterminable). Both the `merge` subcommand and `profile --merge`
+/// must reject them rather than silently corrupt the merged read length.
+#[serial]
+#[test]
+fn test_merge_rejects_legacy_sylsp() {
+    let dir = "./tests/results/test_merge_legacy_dir";
+    if Path::new(dir).exists() {
+        let _ = fs::remove_dir_all(dir);
+    }
+    fs::create_dir_all(dir).unwrap();
+
+    // Sketch two samples to legacy uncompressed *.sylsp (the default -d encoding).
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("sketch")
+        .arg("-r")
+        .arg("test_files/o157_reads.fastq.gz")
+        .arg("-r")
+        .arg("test_files/k12_R1.fq")
+        .arg("-d")
+        .arg(dir)
+        .assert()
+        .success()
+        .code(0);
+
+    let legacy_a = format!("{}/o157_reads.fastq.gz.sylsp", dir);
+    let legacy_b = format!("{}/k12_R1.fq.sylsp", dir);
+
+    // The `merge` subcommand rejects a legacy *.sylsp input.
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("merge")
+        .arg(&legacy_a)
+        .arg(&legacy_b)
+        .arg("-o")
+        .arg(format!("{}/merged", dir))
+        .assert()
+        .failure();
+
+    // profile --merge rejects a legacy *.sylsp input mixed with raw reads.
+    let db = format!("{}/db", dir);
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("sketch")
+        .arg("-g")
+        .arg("test_files/e.coli-K12.fasta.gz")
+        .arg("-o")
+        .arg(&db)
+        .assert()
+        .success()
+        .code(0);
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("profile")
+        .arg(format!("{}.syldb", db))
+        .arg(&legacy_a)
+        .arg("-r")
+        .arg("test_files/k12_R1.fq")
+        .arg("--merge")
+        .assert()
+        .failure();
+}
+
+/// `sketch --merge` selects the output encoding from the output flags; an explicit output
+/// path whose suffix names a different encoding is unreadable later, so it is rejected.
+#[serial]
+#[test]
+fn test_sketch_merge_rejects_conflicting_suffix() {
+    let dir = "./tests/results/test_merge_suffix_dir";
+    if Path::new(dir).exists() {
+        let _ = fs::remove_dir_all(dir);
+    }
+    fs::create_dir_all(dir).unwrap();
+
+    // --compressed-database selects the *.sylspc encoding, but the path ends in *.sylsp.
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("sketch")
+        .arg("--merge")
+        .arg("-r")
+        .arg("test_files/o157_reads.fastq.gz")
+        .arg("--compressed-database")
+        .arg(format!("{}/out.sylsp", dir))
         .assert()
         .failure();
 }

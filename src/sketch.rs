@@ -93,18 +93,29 @@ fn write_read_sketch_file(
     info!("Sketching {} complete.", file_path_str);
 }
 
-/// Append a sample-sketch suffix to `base` unless it already carries one. Used by
-/// `--merge`, where the value of `-d`/`--compressed-database`/`--reference` names the
-/// single merged output file rather than a directory.
-fn append_sample_suffix(base: &str, suffix: &str) -> String {
-    if base.ends_with(SAMPLE_FILE_SUFFIX)
-        || base.ends_with(SAMPLE_COMP_FILE_SUFFIX)
-        || base.ends_with(REF_SAMPLE_SUFFIX)
-    {
-        base.to_string()
-    } else {
-        format!("{}{}", base, suffix)
+/// Resolve the `--merge` output path for `base` given the encoding selected by the output
+/// flags (`expected`). If `base` already ends in a known sample suffix it must be the one
+/// matching `expected` — otherwise `write_single_merged_sketch` would write, say, a
+/// reference-delta payload to a `.sylsp` path that can never be decoded back. A conflicting
+/// suffix is rejected; a missing suffix is appended.
+fn resolve_merged_output_path(base: &str, expected: &'static str) -> String {
+    for known in [
+        SAMPLE_FILE_SUFFIX,
+        SAMPLE_COMP_FILE_SUFFIX,
+        REF_SAMPLE_SUFFIX,
+    ] {
+        if base.ends_with(known) {
+            if known != expected {
+                error!(
+                    "--merge output '{}' ends with '{}', but the output flags select the {} encoding. Use a path ending in '{}' (or drop the suffix so it is added automatically). Exiting.",
+                    base, known, expected, expected
+                );
+                std::process::exit(1);
+            }
+            return base.to_string();
+        }
     }
+    format!("{}{}", base, expected)
 }
 
 /// Resolve the single output file path and encoding for `--merge`, mirroring the
@@ -112,17 +123,17 @@ fn append_sample_suffix(base: &str, suffix: &str) -> String {
 fn merged_output_target(args: &SketchArgs) -> (String, &'static str) {
     if args.reference.is_some() {
         (
-            append_sample_suffix(&args.sample_output_dir, REF_SAMPLE_SUFFIX),
+            resolve_merged_output_path(&args.sample_output_dir, REF_SAMPLE_SUFFIX),
             REF_SAMPLE_SUFFIX,
         )
     } else if let Some(dir) = &args.compressed_sample_output_dir {
         (
-            append_sample_suffix(dir, SAMPLE_COMP_FILE_SUFFIX),
+            resolve_merged_output_path(dir, SAMPLE_COMP_FILE_SUFFIX),
             SAMPLE_COMP_FILE_SUFFIX,
         )
     } else {
         (
-            append_sample_suffix(&args.sample_output_dir, SAMPLE_FILE_SUFFIX),
+            resolve_merged_output_path(&args.sample_output_dir, SAMPLE_FILE_SUFFIX),
             SAMPLE_FILE_SUFFIX,
         )
     }
@@ -458,10 +469,16 @@ pub fn sketch(args: SketchArgs) {
     // names don't apply; the first supplied name (if any) names the merged sample.
     let parsed_sample_names = parse_sample_names(&args);
     let (sample_names, merged_sample_name) = if args.merge {
+        // Always name the merged sample explicitly. Without this, merge_sketches would fall
+        // back to sketches[0].file_name, but the read-sketching passes push into the shared
+        // collector in completion order, so which input lands first (and thus names the
+        // merged sample) would vary between runs and leak into inspect/profile output. Use
+        // the first supplied -S name, else a fixed default.
         let name = parsed_sample_names
             .as_ref()
-            .and_then(|v| v.first().cloned());
-        (None, name)
+            .and_then(|v| v.first().cloned())
+            .unwrap_or_else(|| "merged".to_string());
+        (None, Some(name))
     } else {
         (parsed_sample_names, None)
     };

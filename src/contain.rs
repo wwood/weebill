@@ -873,20 +873,33 @@ pub fn contain(mut args: ContainArgs, pseudotax_in: bool) {
         // *.sylsp/*.sylspc/*.sylspr samples) into one sketch and profile it once.
         let n_sketch_files = read_sketch_files.len();
         let total = read_files.len();
-        let mut collected: Vec<(SequencesSketch, ReadSketchMeta)> = Vec::new();
-        for (j, rf) in read_files.iter().enumerate() {
-            let is_sketch = j >= total - n_sketch_files;
-            if let Some(pair) = get_seq_sketch_with_meta(
-                &args,
-                rf,
-                is_sketch,
-                ref_db.as_ref(),
-                effective_genome_c,
-                db_k,
-            ) {
-                collected.push(pair);
-            }
-        }
+        let n_raw = total - n_sketch_files;
+        // Sketch/load every input concurrently. A sequential loop would sketch each raw group
+        // to EOF before opening the next, so raw inputs that are FIFOs fed by one upstream
+        // writer (split R1/R2/orphan pipes) could fill their kernel buffers and deadlock the
+        // producer -- the same streaming hazard `sketch` guards against. Give every raw input
+        // its own thread so all streams stay drained at once; merge order does not change the
+        // summed result. Pre-sketched inputs are plain file reads and never block.
+        let merge_pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(args.threads.max(n_raw).max(1))
+            .build()
+            .expect("Failed to build merge read-sketching thread pool");
+        let mut collected: Vec<(SequencesSketch, ReadSketchMeta)> = merge_pool.install(|| {
+            (0..total)
+                .into_par_iter()
+                .filter_map(|j| {
+                    let is_sketch = j >= total - n_sketch_files;
+                    get_seq_sketch_with_meta(
+                        &args,
+                        &read_files[j],
+                        is_sketch,
+                        ref_db.as_ref(),
+                        effective_genome_c,
+                        db_k,
+                    )
+                })
+                .collect()
+        });
         if collected.is_empty() {
             log::error!("--merge: no read samples could be sketched or loaded. Exiting.");
             std::process::exit(1);
@@ -1230,6 +1243,18 @@ fn get_seq_sketch_with_meta(
             if crate::compress::peek_is_compressed(&mut read_reader).unwrap_or(false) {
                 crate::compress::read_seq_sketch_compressed_with_meta(&mut read_reader).unwrap_or_else(|_| panic!("The sketch `{}` is not a valid sketch. Perhaps it is an older incompatible version ", read_sketch_file))
             } else {
+                // Legacy uncompressed *.sylsp samples carry no recorded read count. Merging
+                // weights each input's read length by its read count, so a legacy sample would
+                // silently contribute a read length of zero and skew the merged sample's
+                // read-count/abundance estimates. Refuse it in --merge mode; per-sample
+                // profiling (the non-merge path) still accepts it unchanged.
+                if args.merge {
+                    error!(
+                        "`{}` is a legacy uncompressed sample sketch (*.sylsp) with no recorded read count, so it cannot be merged (read length cannot be determined). Re-sketch it with the current version, or exclude it from --merge. Exiting.",
+                        read_sketch_file
+                    );
+                    std::process::exit(1);
+                }
                 let sketch: SequencesSketch = bincode::deserialize_from(&mut read_reader).unwrap_or_else(|_| panic!("The sketch `{}` is not a valid sketch. Perhaps it is an older incompatible version ", read_sketch_file));
                 (sketch, ReadSketchMeta::default())
             }
