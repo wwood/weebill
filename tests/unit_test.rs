@@ -617,3 +617,55 @@ fn avx512_seeding_matches_avx2_and_scalar() {
         }
     }
 }
+
+// Paired sketching records mean_read_length as the average of the two mate
+// lengths, not the forward (R1) length alone. With asymmetric mates this is
+// what keeps the coverage correction and --estimate-read-counts unbiased.
+#[test]
+fn paired_mean_read_length_averages_both_mates() {
+    use std::io::Write;
+
+    // Deterministic ACGT sequence of a given length.
+    fn seq(len: usize) -> String {
+        "ACGT".chars().cycle().take(len).collect()
+    }
+    fn write_fastq(path: &std::path::Path, read_len: usize, n: usize) {
+        let mut f = std::fs::File::create(path).unwrap();
+        let s = seq(read_len);
+        let q: String = std::iter::repeat('I').take(read_len).collect();
+        for i in 0..n {
+            writeln!(f, "@read{}\n{}\n+\n{}", i, s, q).unwrap();
+        }
+    }
+
+    let r1_len = 150usize;
+    let r2_len = 100usize;
+    let n_pairs = 8usize;
+
+    let dir = std::env::temp_dir().join(format!("weebill_pair_len_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let r1 = dir.join("r1.fastq");
+    let r2 = dir.join("r2.fastq");
+    write_fastq(&r1, r1_len, n_pairs);
+    write_fastq(&r2, r2_len, n_pairs);
+
+    let (sketch, meta) = weebill::sketch::sketch_pair_sequences(
+        r1.to_str().unwrap(),
+        r2.to_str().unwrap(),
+        200,
+        31,
+        None,
+        false,
+        0.,
+    )
+    .expect("paired sketching should succeed");
+
+    // Mean read length is the average of the two mate lengths, and each pair
+    // counts as one read.
+    let expected = (r1_len + r2_len) as f64 / 2.0;
+    assert_eq!(sketch.mean_read_length, expected);
+    assert!(sketch.paired);
+    assert_eq!(meta.num_reads, n_pairs as u64);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

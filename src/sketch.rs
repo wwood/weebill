@@ -981,10 +981,13 @@ pub fn sketch_pair_sequences(
                         extract_markers(&rec2.seq(), &mut temp_vec2, c, k);
                         let kmer_pair = pair_kmer(&rec1.seq(), &rec2.seq());
 
-                        //moving average
+                        //moving average of the mean mate length (average of R1
+                        //and R2) so asymmetric mate lengths are handled correctly
                         counter += 1.;
+                        let pair_mean_len =
+                            (rec1.seq().len() + rec2.seq().len()) as f64 / 2.0;
                         mean_read_length = mean_read_length
-                            + ((rec1.seq().len() as f64) - mean_read_length) / counter;
+                            + (pair_mean_len - mean_read_length) / counter;
 
                         for km in temp_vec1.iter() {
                             if dedup_fpr == 0. {
@@ -1138,8 +1141,10 @@ pub fn sketch_interleaved_sequences(
             let kmer_pair = pair_kmer(&prev_seq, &current_seq);
 
             counter += 1.;
+            // average of the two mates so asymmetric mate lengths are handled correctly
+            let pair_mean_len = (prev_seq.len() + current_seq.len()) as f64 / 2.0;
             mean_read_length =
-                mean_read_length + ((prev_seq.len() as f64) - mean_read_length) / counter;
+                mean_read_length + (pair_mean_len - mean_read_length) / counter;
 
             for km in temp_vec1.iter() {
                 if dedup_fpr == 0. {
