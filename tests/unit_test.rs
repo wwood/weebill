@@ -617,3 +617,70 @@ fn avx512_seeding_matches_avx2_and_scalar() {
         }
     }
 }
+
+// Write `n` FASTQ records of a fixed length, using a deterministic ACGT
+// sequence and uniform quality.
+fn write_fastq(path: &std::path::Path, read_len: usize, n: usize) {
+    use std::io::Write;
+    let s: String = "ACGT".chars().cycle().take(read_len).collect();
+    let q: String = std::iter::repeat('I').take(read_len).collect();
+    let mut f = std::fs::File::create(path).unwrap();
+    for i in 0..n {
+        writeln!(f, "@read{}\n{}\n+\n{}", i, s, q).unwrap();
+    }
+}
+
+// Sketch a pair of R1/R2 FASTQ files with the given mate lengths and return the
+// resulting mean_read_length and num_reads. Uses a per-tag temp directory.
+fn sketch_pair_lengths(
+    tag: &str,
+    r1_len: usize,
+    r2_len: usize,
+    n_pairs: usize,
+    k: usize,
+) -> (f64, u64) {
+    let dir = std::env::temp_dir().join(format!("weebill_{}_{}", tag, std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let r1 = dir.join("r1.fastq");
+    let r2 = dir.join("r2.fastq");
+    write_fastq(&r1, r1_len, n_pairs);
+    write_fastq(&r2, r2_len, n_pairs);
+
+    let (sketch, meta) = weebill::sketch::sketch_pair_sequences(
+        r1.to_str().unwrap(),
+        r2.to_str().unwrap(),
+        200,
+        k,
+        None,
+        false,
+        0.,
+    )
+    .expect("paired sketching should succeed");
+    assert!(sketch.paired);
+    let _ = std::fs::remove_dir_all(&dir);
+    (sketch.mean_read_length, meta.num_reads)
+}
+
+// Paired sketching records mean_read_length as the average of the two mate
+// lengths, not the forward (R1) length alone. With asymmetric mates this is
+// what keeps the coverage correction and --estimate-read-counts unbiased.
+#[test]
+fn paired_mean_read_length_averages_both_mates() {
+    let (mean_len, num_reads) = sketch_pair_lengths("pair_len", 150, 100, 8, 31);
+    // Average of the two mate lengths; each pair counts as one read.
+    assert_eq!(mean_len, (150.0 + 100.0) / 2.0);
+    assert_eq!(num_reads, 8);
+}
+
+// A mate shorter than k emits no k-mers, so its length must be excluded from
+// mean_read_length. Otherwise the average could fall to/under k-1 and make the
+// `read_length - k + 1` coverage correction in contain.rs zero/negative.
+#[test]
+fn paired_mean_read_length_excludes_sub_k_mates() {
+    // R1=50 (>= k), R2=10 (< k=31): only R1 is counted, so the mean is 50, not
+    // the naive (50+10)/2 = 30 that would break the coverage correction.
+    let (mean_len, num_reads) = sketch_pair_lengths("pair_subk", 50, 10, 8, 31);
+    assert_eq!(mean_len, 50.0);
+    assert!(mean_len as f64 - 31.0 + 1.0 > 0.0);
+    assert_eq!(num_reads, 8);
+}

@@ -966,6 +966,10 @@ pub fn sketch_pair_sequences(
 
     let mut mean_read_length: f64 = 0.;
     let mut counter: f64 = 0.;
+    // Separate count of mates folded into mean_read_length: only mates long
+    // enough to emit k-mers (len >= k) are included, so counter (pairs) and
+    // len_counter (k-mer-emitting mates) diverge when a mate is sub-k.
+    let mut len_counter: f64 = 0.;
 
     loop {
         let n1 = reader1.next();
@@ -981,10 +985,28 @@ pub fn sketch_pair_sequences(
                         extract_markers(&rec2.seq(), &mut temp_vec2, c, k);
                         let kmer_pair = pair_kmer(&rec1.seq(), &rec2.seq());
 
-                        //moving average
+                        // Moving average over both mates (not just R1) so
+                        // asymmetric mate lengths are handled correctly. Mates
+                        // shorter than k emit no k-mers, so they are excluded to
+                        // avoid biasing the coverage correction and driving
+                        // `read_length - k + 1` non-positive in contain.rs.
+                        //
+                        // Known limitation: for short-insert libraries whose
+                        // mates overlap, R2's overlapping markers are deduped
+                        // against R1 below, so the full R2 length counted here
+                        // slightly overstates the length backing the k-mer
+                        // observations, mildly inflating the -u / read-count
+                        // estimates. Left as-is: at default c most reads carry
+                        // no marker, so weighting length by surviving markers
+                        // would itself bias the mean toward longer reads.
                         counter += 1.;
-                        mean_read_length = mean_read_length
-                            + ((rec1.seq().len() as f64) - mean_read_length) / counter;
+                        for mate_len in [rec1.seq().len(), rec2.seq().len()] {
+                            if mate_len >= k {
+                                len_counter += 1.;
+                                mean_read_length +=
+                                    (mate_len as f64 - mean_read_length) / len_counter;
+                            }
+                        }
 
                         for km in temp_vec1.iter() {
                             if dedup_fpr == 0. {
@@ -1110,6 +1132,9 @@ pub fn sketch_interleaved_sequences(
 
     let mut mean_read_length: f64 = 0.;
     let mut counter: f64 = 0.;
+    // See sketch_pair_sequences: only mates that can emit k-mers (len >= k) are
+    // folded into mean_read_length, so this diverges from counter (pairs).
+    let mut len_counter: f64 = 0.;
     let mut pending: Option<(String, Vec<u8>)> = None;
 
     while let Some(rec_result) = reader.next() {
@@ -1138,8 +1163,15 @@ pub fn sketch_interleaved_sequences(
             let kmer_pair = pair_kmer(&prev_seq, &current_seq);
 
             counter += 1.;
-            mean_read_length =
-                mean_read_length + ((prev_seq.len() as f64) - mean_read_length) / counter;
+            // Average over both mates so asymmetric mate lengths are handled
+            // correctly; exclude mates shorter than k since they emit no k-mers.
+            // Same short-insert overlap limitation as sketch_pair_sequences.
+            for mate_len in [prev_seq.len(), current_seq.len()] {
+                if mate_len >= k {
+                    len_counter += 1.;
+                    mean_read_length += (mate_len as f64 - mean_read_length) / len_counter;
+                }
+            }
 
             for km in temp_vec1.iter() {
                 if dedup_fpr == 0. {
