@@ -990,6 +990,15 @@ pub fn sketch_pair_sequences(
                         // shorter than k emit no k-mers, so they are excluded to
                         // avoid biasing the coverage correction and driving
                         // `read_length - k + 1` non-positive in contain.rs.
+                        //
+                        // Known limitation: for short-insert libraries whose
+                        // mates overlap, R2's overlapping markers are deduped
+                        // against R1 below, so the full R2 length counted here
+                        // slightly overstates the length backing the k-mer
+                        // observations, mildly inflating the -u / read-count
+                        // estimates. Left as-is: at default c most reads carry
+                        // no marker, so weighting length by surviving markers
+                        // would itself bias the mean toward longer reads.
                         counter += 1.;
                         for mate_len in [rec1.seq().len(), rec2.seq().len()] {
                             if mate_len >= k {
@@ -1156,6 +1165,7 @@ pub fn sketch_interleaved_sequences(
             counter += 1.;
             // Average over both mates so asymmetric mate lengths are handled
             // correctly; exclude mates shorter than k since they emit no k-mers.
+            // Same short-insert overlap limitation as sketch_pair_sequences.
             for mate_len in [prev_seq.len(), current_seq.len()] {
                 if mate_len >= k {
                     len_counter += 1.;
