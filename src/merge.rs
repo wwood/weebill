@@ -39,35 +39,52 @@ fn read_sample(
         crate::compress::read_seq_sketch_compressed_with_meta(&mut reader)
             .unwrap_or_else(|e| panic!("The compressed sketch `{}` is invalid: {}", path, e))
     } else {
-        let sketch: SequencesSketch = bincode::deserialize_from(&mut reader).unwrap_or_else(|_| {
-            panic!(
-                "The sketch '{}' is not a valid legacy sample sketch. Perhaps it is an older incompatible version.",
-                path
-            )
-        });
-        (sketch, ReadSketchMeta::default())
+        // Legacy uncompressed *.sylsp samples predate the ReadSketchMeta side-channel and
+        // therefore carry no recorded read count. Merging weights each sample's read length
+        // by its read count, so a legacy input would silently contribute a read length of
+        // zero and corrupt the merged mean_read_length. Refuse it rather than merge garbage;
+        // the user can re-sketch to the current format first.
+        error!(
+            "'{}' is a legacy uncompressed sample sketch (*.sylsp) with no recorded read count, so it cannot be merged (read length cannot be determined). Re-sketch it with the current version, or exclude it. Exiting.",
+            path
+        );
+        std::process::exit(1);
     }
 }
 
 fn output_kind(args: &MergeArgs) -> &'static str {
+    // Merge never writes legacy uncompressed *.sylsp: that format carries no read count,
+    // so a merged sample written as *.sylsp could not be re-merged. Default to compressed
+    // *.sylspc, or reference-compressed *.sylspr when requested.
     if args.ref_compress || args.output.ends_with(REF_SAMPLE_SUFFIX) {
         REF_SAMPLE_SUFFIX
-    } else if args.compressed || args.output.ends_with(SAMPLE_COMP_FILE_SUFFIX) {
-        SAMPLE_COMP_FILE_SUFFIX
     } else {
-        SAMPLE_FILE_SUFFIX
+        SAMPLE_COMP_FILE_SUFFIX
     }
 }
 
-fn output_path(path: &str, suffix: &str) -> String {
-    if path.ends_with(SAMPLE_FILE_SUFFIX)
-        || path.ends_with(SAMPLE_COMP_FILE_SUFFIX)
-        || path.ends_with(REF_SAMPLE_SUFFIX)
-    {
-        path.to_string()
-    } else {
-        format!("{}{}", path, suffix)
+fn output_path(path: &str, suffix: &'static str) -> String {
+    // If the user gave an explicit sample suffix it must match the selected encoding,
+    // otherwise we'd write, say, a *.sylspr payload to a *.sylspc path that can't be
+    // decoded back. A legacy *.sylsp path is always rejected here since merge no longer
+    // produces that format.
+    for known in [
+        SAMPLE_FILE_SUFFIX,
+        SAMPLE_COMP_FILE_SUFFIX,
+        REF_SAMPLE_SUFFIX,
+    ] {
+        if path.ends_with(known) {
+            if known != suffix {
+                error!(
+                    "merge output '{}' ends with '{}', but the selected encoding is {}. Use a path ending in '{}' (or drop the suffix so it is added automatically). Exiting.",
+                    path, known, suffix, suffix
+                );
+                std::process::exit(1);
+            }
+            return path.to_string();
+        }
     }
+    format!("{}{}", path, suffix)
 }
 
 pub fn merge(args: MergeArgs) {
@@ -163,9 +180,24 @@ pub fn merge_sketches(
 ) -> (SequencesSketch, ReadSketchMeta) {
     assert!(sketches.len() >= 2);
 
-    let mut merged_counts = sketches[0].0.kmer_counts.clone();
     let c = sketches[0].0.c;
     let k = sketches[0].0.k;
+    // Sketches subsampled at different rates (c) or built with different k cannot be
+    // summed: their k-mer sets were selected against different thresholds, so a merged
+    // count map would mix sampling rates and corrupt containment/coverage. Reject the
+    // mismatch here so every caller (merge subcommand, sketch --merge, profile --merge)
+    // is protected, not just the ones that pre-check.
+    for (sketch, _) in sketches[1..].iter() {
+        if sketch.c != c || sketch.k != k {
+            error!(
+                "Cannot merge sketches with differing parameters: '{}' has c={}, k={} but expected c={}, k={}. All merged inputs must share the same c and k. Exiting.",
+                sketch.file_name, sketch.c, sketch.k, c, k
+            );
+            std::process::exit(1);
+        }
+    }
+
+    let mut merged_counts = sketches[0].0.kmer_counts.clone();
     let mut total_reads = sketches[0].1.num_reads;
     let mut weighted_length = sketches[0].0.mean_read_length * sketches[0].1.num_reads as f64;
     let mut fallback_length_sum = sketches[0].0.mean_read_length;

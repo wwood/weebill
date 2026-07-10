@@ -373,6 +373,12 @@ pub struct SketchArgs {
         help = "Interleaved paired-end fasta/fastq reads. Consecutive reads with the same name (before the first space) are treated as pairs"
     )]
     pub interleaved: Vec<String>,
+    #[clap(
+        long = "merge",
+        help_heading = "OUTPUT",
+        help = "Merge all read inputs (single-end, paired-end, and interleaved) into ONE sample sketch. The value given to --compressed-database (or -d) is then treated as the single output FILE path (suffix appended if missing) rather than a directory. Use -S to name the merged sample."
+    )]
+    pub merge: bool,
 }
 
 #[derive(Args, Clone)]
@@ -495,6 +501,19 @@ pub struct ContainArgs {
         help_heading = "SKETCHING"
     )]
     pub interleaved: Vec<String>,
+    #[clap(
+        long = "merge",
+        help_heading = "SKETCHING",
+        help = "Merge all read inputs (pre-sketched *.sylsp/*.sylspc/*.sylspr samples plus any raw single-end, paired-end, and interleaved reads) into ONE sample sketch, and profile/query that single merged sample instead of each input separately. Use -S to name it."
+    )]
+    pub merge: bool,
+    #[clap(
+        short = 'S',
+        long = "sample-name",
+        help_heading = "SKETCHING",
+        help = "Name for the merged sample produced by --merge (shown in the Sample_file column). Default: 'merged'."
+    )]
+    pub sample_name: Option<String>,
 
     #[clap(
         short,
@@ -632,14 +651,14 @@ pub struct MergeArgs {
     #[clap(
         multiple = true,
         required = true,
-        help = "Sample sketch files (*.sylsp, *.sylspc, or *.sylspr) to merge"
+        help = "Sample sketch files (*.sylspc or *.sylspr) to merge. Legacy uncompressed *.sylsp samples record no read count and cannot be merged; re-sketch them with --compressed-database first."
     )]
     pub files: Vec<String>,
     #[clap(
         short = 'o',
         long = "output",
         required = true,
-        help = "Output file path for merged sketch"
+        help = "Output file path for merged sketch. Written as compressed *.sylspc by default, or *.sylspr with --ref-compress (suffix appended if missing)."
     )]
     pub output: String,
     #[clap(
@@ -648,11 +667,6 @@ pub struct MergeArgs {
         help = "Sample name for the merged sketch"
     )]
     pub sample_name: Option<String>,
-    #[clap(
-        long = "compressed",
-        help = "Write merged output as compressed *.sylspc instead of legacy *.sylsp"
-    )]
-    pub compressed: bool,
     #[clap(
         short = 'r',
         long = "reference",

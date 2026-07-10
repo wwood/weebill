@@ -1093,3 +1093,404 @@ fn test_two_stage_individual_records() {
         .assert()
         .failure();
 }
+
+fn num_sketched_kmers(inspect_stdout: &str) -> u64 {
+    inspect_stdout
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("num_sketched_kmers:"))
+        .and_then(|v| v.trim().parse().ok())
+        .expect("inspect output had no num_sketched_kmers")
+}
+
+#[serial]
+#[test]
+fn test_sketch_merge_single_and_paired() {
+    let dir = "./tests/results/test_merge_dir";
+    if Path::new(dir).exists() {
+        let _ = fs::remove_dir_all(dir);
+    }
+    fs::create_dir_all(dir).unwrap();
+    let out = format!("{}/combined", dir);
+
+    // --merge collapses paired + single-end inputs into ONE compressed sketch, with
+    // the --compressed-database value used as the single output file path.
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("sketch")
+        .arg("--merge")
+        .arg("-1")
+        .arg("test_files/k12_R1.fq")
+        .arg("-2")
+        .arg("test_files/k12_R2.fq")
+        .arg("-r")
+        .arg("test_files/o157_reads.fastq.gz")
+        .arg("--compressed-database")
+        .arg(&out)
+        .arg("-S")
+        .arg("merged_sample")
+        .assert()
+        .success()
+        .code(0);
+
+    let merged_path = format!("{}.sylspc", out);
+    assert!(
+        Path::new(&merged_path).exists(),
+        "merged single output file was not written"
+    );
+
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    let inspect = cmd
+        .arg("inspect")
+        .arg(&merged_path)
+        .output()
+        .expect("Output failed");
+    let inspect = str::from_utf8(&inspect.stdout).expect("Output was not valid UTF-8");
+    assert!(inspect.contains("merged_sample"));
+    assert!(inspect.contains("paired: true"));
+    let merged_kmers = num_sketched_kmers(inspect);
+
+    // Sketching the same inputs individually and then combining them with the `merge`
+    // subcommand must yield the identical distinct-k-mer count as the one-pass --merge.
+    // Use compressed (*.sylspc) sketches: legacy uncompressed *.sylsp lack read metadata
+    // and are rejected as merge inputs.
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("sketch")
+        .arg("-1")
+        .arg("test_files/k12_R1.fq")
+        .arg("-2")
+        .arg("test_files/k12_R2.fq")
+        .arg("-r")
+        .arg("test_files/o157_reads.fastq.gz")
+        .arg("--compressed-database")
+        .arg(dir)
+        .assert()
+        .success()
+        .code(0);
+
+    let via_sub = format!("{}/via_sub", dir);
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("merge")
+        .arg(format!("{}/k12_R1.fq.paired.sylspc", dir))
+        .arg(format!("{}/o157_reads.fastq.gz.sylspc", dir))
+        .arg("-o")
+        .arg(&via_sub)
+        .assert()
+        .success()
+        .code(0);
+
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    let inspect = cmd
+        .arg("inspect")
+        .arg(format!("{}.sylspc", via_sub))
+        .output()
+        .expect("Output failed");
+    let inspect = str::from_utf8(&inspect.stdout).expect("Output was not valid UTF-8");
+    assert_eq!(
+        merged_kmers,
+        num_sketched_kmers(inspect),
+        "one-pass --merge disagreed with sketch + merge subcommand"
+    );
+
+    // --merge with a default output directory (./) is rejected: it needs an explicit path.
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("sketch")
+        .arg("--merge")
+        .arg("-r")
+        .arg("test_files/o157_reads.fastq.gz")
+        .assert()
+        .failure();
+
+    // A directory-style value (trailing slash, or an existing directory) is likewise
+    // rejected rather than writing a hidden file like `<dir>/.sylspc`.
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("sketch")
+        .arg("--merge")
+        .arg("-r")
+        .arg("test_files/o157_reads.fastq.gz")
+        .arg("--compressed-database")
+        .arg(format!("{}/", dir))
+        .assert()
+        .failure();
+
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("sketch")
+        .arg("--merge")
+        .arg("-r")
+        .arg("test_files/o157_reads.fastq.gz")
+        .arg("--compressed-database")
+        .arg(dir)
+        .assert()
+        .failure();
+
+    // --merge must not write a partial sketch when one input fails to sketch. A valid read
+    // combined with a missing file must fail the whole merge rather than silently sketching
+    // only the good input.
+    let partial_out = format!("{}/partial", dir);
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("sketch")
+        .arg("--merge")
+        .arg("-r")
+        .arg("test_files/o157_reads.fastq.gz")
+        .arg("-r")
+        .arg("test_files/does_not_exist.fq")
+        .arg("--compressed-database")
+        .arg(&partial_out)
+        .assert()
+        .failure();
+    assert!(
+        !Path::new(&format!("{}.sylspc", partial_out)).exists(),
+        "a partial merged sketch was written despite a failed input"
+    );
+}
+
+/// Extract the (single) data row's Sample_file (col 1) and Containment_ind (col 12)
+/// from a `profile` TSV, skipping the header line.
+fn profile_sample_and_containment(stdout: &str) -> (String, String) {
+    let row = stdout
+        .lines()
+        .find(|l| !l.starts_with("Sample_file") && !l.trim().is_empty())
+        .expect("no profile data row");
+    let cols: Vec<&str> = row.split('\t').collect();
+    (cols[0].to_string(), cols[11].to_string())
+}
+
+#[serial]
+#[test]
+fn test_profile_merge_single_and_paired() {
+    let dir = "./tests/results/test_profile_merge_dir";
+    if Path::new(dir).exists() {
+        let _ = fs::remove_dir_all(dir);
+    }
+    fs::create_dir_all(dir).unwrap();
+
+    // genome database
+    let db = format!("{}/db", dir);
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("sketch")
+        .arg("-g")
+        .arg("test_files/e.coli-K12.fasta.gz")
+        .arg("-o")
+        .arg(&db)
+        .assert()
+        .success()
+        .code(0);
+    let db_file = format!("{}.syldb", db);
+
+    // profile --merge over paired + single-end reads must emit exactly ONE sample
+    // named by -S, not one row-set per input.
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    let out = cmd
+        .arg("profile")
+        .arg(&db_file)
+        .arg("-1")
+        .arg("test_files/k12_R1.fq")
+        .arg("-2")
+        .arg("test_files/k12_R2.fq")
+        .arg("-r")
+        .arg("test_files/o157_reads.fastq.gz")
+        .arg("--merge")
+        .arg("-S")
+        .arg("combined")
+        .output()
+        .expect("Output failed");
+    let out = str::from_utf8(&out.stdout).expect("Output was not valid UTF-8");
+    let data_rows = out
+        .lines()
+        .filter(|l| !l.starts_with("Sample_file") && !l.trim().is_empty())
+        .count();
+    assert_eq!(data_rows, 1, "--merge must produce a single merged sample");
+    let (name, containment_merge) = profile_sample_and_containment(out);
+    assert_eq!(name, "combined");
+
+    // Cross-check: sketch the same inputs, combine them with the `merge` subcommand,
+    // and profile the result -- the containment index must be identical. Use compressed
+    // (*.sylspc) sketches: legacy *.sylsp lack read metadata and cannot be merged.
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("sketch")
+        .arg("-1")
+        .arg("test_files/k12_R1.fq")
+        .arg("-2")
+        .arg("test_files/k12_R2.fq")
+        .arg("-r")
+        .arg("test_files/o157_reads.fastq.gz")
+        .arg("--compressed-database")
+        .arg(dir)
+        .assert()
+        .success()
+        .code(0);
+    let merged = format!("{}/m", dir);
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("merge")
+        .arg(format!("{}/k12_R1.fq.paired.sylspc", dir))
+        .arg(format!("{}/o157_reads.fastq.gz.sylspc", dir))
+        .arg("-o")
+        .arg(&merged)
+        .assert()
+        .success()
+        .code(0);
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    let out = cmd
+        .arg("profile")
+        .arg(&db_file)
+        .arg(format!("{}.sylspc", merged))
+        .output()
+        .expect("Output failed");
+    let out = str::from_utf8(&out.stdout).expect("Output was not valid UTF-8");
+    let (_, containment_sub) = profile_sample_and_containment(out);
+    assert_eq!(
+        containment_merge, containment_sub,
+        "profile --merge disagreed with merge subcommand + profile"
+    );
+
+    // --merge must reject inputs whose sampling rates disagree: summing sketches made
+    // at different -c would silently corrupt containment. Here a c=100 pre-sketched
+    // sample is mixed with c=200 raw reads against the c=200 database. Use a compressed
+    // (*.sylspc) sketch so it carries read metadata and reaches the c-mismatch check.
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("sketch")
+        .arg("-r")
+        .arg("test_files/o157_reads.fastq.gz")
+        .arg("-c")
+        .arg("100")
+        .arg("--compressed-database")
+        .arg(format!("{}/c100", dir))
+        .assert()
+        .success()
+        .code(0);
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("profile")
+        .arg(&db_file)
+        .arg(format!("{}/c100/o157_reads.fastq.gz.sylspc", dir))
+        .arg("-r")
+        .arg("test_files/k12_R1.fq")
+        .arg("--merge")
+        .assert()
+        .failure();
+
+    // --merge must not silently drop an input that fails to load. A pre-sketched sample
+    // whose c (300) exceeds the database's (200) is unusable; mixed with a valid raw read
+    // the whole merge must fail rather than profile a merged sample that excludes it.
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("sketch")
+        .arg("-r")
+        .arg("test_files/o157_reads.fastq.gz")
+        .arg("-c")
+        .arg("300")
+        .arg("--compressed-database")
+        .arg(format!("{}/c300", dir))
+        .assert()
+        .success()
+        .code(0);
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("profile")
+        .arg(&db_file)
+        .arg(format!("{}/c300/o157_reads.fastq.gz.sylspc", dir))
+        .arg("-r")
+        .arg("test_files/k12_R1.fq")
+        .arg("--merge")
+        .assert()
+        .failure();
+}
+
+/// Legacy uncompressed *.sylsp sketches carry no read count, so they cannot be merged
+/// (read length is undeterminable). Both the `merge` subcommand and `profile --merge`
+/// must reject them rather than silently corrupt the merged read length.
+#[serial]
+#[test]
+fn test_merge_rejects_legacy_sylsp() {
+    let dir = "./tests/results/test_merge_legacy_dir";
+    if Path::new(dir).exists() {
+        let _ = fs::remove_dir_all(dir);
+    }
+    fs::create_dir_all(dir).unwrap();
+
+    // Sketch two samples to legacy uncompressed *.sylsp (the default -d encoding).
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("sketch")
+        .arg("-r")
+        .arg("test_files/o157_reads.fastq.gz")
+        .arg("-r")
+        .arg("test_files/k12_R1.fq")
+        .arg("-d")
+        .arg(dir)
+        .assert()
+        .success()
+        .code(0);
+
+    let legacy_a = format!("{}/o157_reads.fastq.gz.sylsp", dir);
+    let legacy_b = format!("{}/k12_R1.fq.sylsp", dir);
+
+    // The `merge` subcommand rejects a legacy *.sylsp input.
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("merge")
+        .arg(&legacy_a)
+        .arg(&legacy_b)
+        .arg("-o")
+        .arg(format!("{}/merged", dir))
+        .assert()
+        .failure();
+
+    // profile --merge rejects a legacy *.sylsp input mixed with raw reads.
+    let db = format!("{}/db", dir);
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("sketch")
+        .arg("-g")
+        .arg("test_files/e.coli-K12.fasta.gz")
+        .arg("-o")
+        .arg(&db)
+        .assert()
+        .success()
+        .code(0);
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("profile")
+        .arg(format!("{}.syldb", db))
+        .arg(&legacy_a)
+        .arg("-r")
+        .arg("test_files/k12_R1.fq")
+        .arg("--merge")
+        .assert()
+        .failure();
+}
+
+/// `sketch --merge` selects the output encoding from the output flags; an explicit output
+/// path whose suffix names a different encoding is unreadable later, so it is rejected.
+#[serial]
+#[test]
+fn test_sketch_merge_rejects_conflicting_suffix() {
+    let dir = "./tests/results/test_merge_suffix_dir";
+    if Path::new(dir).exists() {
+        let _ = fs::remove_dir_all(dir);
+    }
+    fs::create_dir_all(dir).unwrap();
+
+    // --compressed-database selects the *.sylspc encoding, but the path ends in *.sylsp.
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("sketch")
+        .arg("--merge")
+        .arg("-r")
+        .arg("test_files/o157_reads.fastq.gz")
+        .arg("--compressed-database")
+        .arg(format!("{}/out.sylsp", dir))
+        .assert()
+        .failure();
+
+    // The `merge` subcommand no longer produces legacy *.sylsp, so a *.sylsp output path
+    // is rejected rather than silently downgraded.
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("sketch")
+        .arg("-r")
+        .arg("test_files/o157_reads.fastq.gz")
+        .arg("--compressed-database")
+        .arg(dir)
+        .assert()
+        .success()
+        .code(0);
+    let sample = format!("{}/o157_reads.fastq.gz.sylspc", dir);
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("merge")
+        .arg(&sample)
+        .arg(&sample)
+        .arg("-o")
+        .arg(format!("{}/merged.sylsp", dir))
+        .assert()
+        .failure();
+}

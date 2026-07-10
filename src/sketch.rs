@@ -17,6 +17,7 @@ use std::thread;
 use std::time::Duration;
 
 use crate::constants::*;
+use crate::merge::merge_sketches;
 use crate::refdelta;
 use crate::seeding::*;
 use crate::types::*;
@@ -90,6 +91,93 @@ fn write_read_sketch_file(
         bincode::serialize_into(&mut read_sk_file, read_sketch).unwrap();
     }
     info!("Sketching {} complete.", file_path_str);
+}
+
+/// Resolve the `--merge` output path for `base` given the encoding selected by the output
+/// flags (`expected`). If `base` already ends in a known sample suffix it must be the one
+/// matching `expected` — otherwise `write_single_merged_sketch` would write, say, a
+/// reference-delta payload to a `.sylsp` path that can never be decoded back. A conflicting
+/// suffix is rejected; a missing suffix is appended.
+fn resolve_merged_output_path(base: &str, expected: &'static str) -> String {
+    for known in [
+        SAMPLE_FILE_SUFFIX,
+        SAMPLE_COMP_FILE_SUFFIX,
+        REF_SAMPLE_SUFFIX,
+    ] {
+        if base.ends_with(known) {
+            if known != expected {
+                error!(
+                    "--merge output '{}' ends with '{}', but the output flags select the {} encoding. Use a path ending in '{}' (or drop the suffix so it is added automatically). Exiting.",
+                    base, known, expected, expected
+                );
+                std::process::exit(1);
+            }
+            return base.to_string();
+        }
+    }
+    format!("{}{}", base, expected)
+}
+
+/// Resolve the single output file path and encoding for `--merge`, mirroring the
+/// per-sample output-kind selection in `write_read_sketch_file`.
+fn merged_output_target(args: &SketchArgs) -> (String, &'static str) {
+    if args.reference.is_some() {
+        (
+            resolve_merged_output_path(&args.sample_output_dir, REF_SAMPLE_SUFFIX),
+            REF_SAMPLE_SUFFIX,
+        )
+    } else if let Some(dir) = &args.compressed_sample_output_dir {
+        (
+            resolve_merged_output_path(dir, SAMPLE_COMP_FILE_SUFFIX),
+            SAMPLE_COMP_FILE_SUFFIX,
+        )
+    } else {
+        (
+            resolve_merged_output_path(&args.sample_output_dir, SAMPLE_FILE_SUFFIX),
+            SAMPLE_FILE_SUFFIX,
+        )
+    }
+}
+
+/// Write the single merged read sketch produced by `--merge` to `out_path` in the
+/// encoding named by `out_kind`.
+fn write_single_merged_sketch(
+    out_path: &str,
+    out_kind: &'static str,
+    merged: &SequencesSketch,
+    meta: ReadSketchMeta,
+    ref_index: Option<&refdelta::RefIndex>,
+    ref_db_name: Option<&str>,
+) {
+    if let Some(parent) = Path::new(out_path).parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .unwrap_or_else(|_| panic!("Could not create output directory for '{}'", out_path));
+        }
+    }
+    let mut writer = BufWriter::new(
+        File::create(out_path).unwrap_or_else(|_| panic!("{} path not valid; exiting ", out_path)),
+    );
+    match out_kind {
+        REF_SAMPLE_SUFFIX => {
+            let idx = ref_index.expect("reference index must be loaded for *.sylspr output");
+            refdelta::compress_seq_with_meta(
+                &mut writer,
+                merged,
+                idx,
+                ref_db_name.unwrap_or(""),
+                meta,
+            )
+            .unwrap_or_else(|e| panic!("Could not write reference-compressed output: {}", e));
+        }
+        SAMPLE_COMP_FILE_SUFFIX => {
+            crate::compress::write_seq_sketch_compressed_with_meta(&mut writer, merged, meta)
+                .unwrap_or_else(|e| panic!("Could not write compressed output: {}", e));
+        }
+        _ => {
+            bincode::serialize_into(&mut writer, merged).unwrap();
+        }
+    }
 }
 
 pub fn check_vram_and_block(max_ram: usize, file: &str) {
@@ -232,6 +320,28 @@ fn check_args_valid(args: &SketchArgs) {
         error!("--reference writes *.sylspr sample sketches directly and cannot be combined with --compressed-database.");
         std::process::exit(1);
     }
+    if args.merge {
+        // The merged output path is the value of --compressed-database, or of -d
+        // (also used verbatim for --reference's *.sylspr). It names a single FILE.
+        // A directory-style value -- the default "./", a trailing separator, or an
+        // existing directory -- would get the suffix appended directly and silently
+        // write a hidden file like `results/.sylspc` that downstream commands won't
+        // find, so require an explicit file path regardless of the output mode.
+        let effective_base = match &args.compressed_sample_output_dir {
+            Some(dir) => dir.as_str(),
+            None => args.sample_output_dir.as_str(),
+        };
+        let ends_with_sep =
+            effective_base.ends_with('/') || effective_base.ends_with(std::path::MAIN_SEPARATOR);
+        if effective_base.is_empty() || ends_with_sep || Path::new(effective_base).is_dir() {
+            error!(
+                "--merge writes the merged sketch to a single FILE, but the output path '{}' is empty or a directory. Give an explicit file path (e.g. '{}/merged') via --compressed-database (compressed), -d with --reference (*.sylspr), or -d (legacy). Exiting.",
+                effective_base,
+                effective_base.trim_end_matches('/').trim_end_matches(std::path::MAIN_SEPARATOR)
+            );
+            std::process::exit(1);
+        }
+    }
 }
 
 fn parse_ambiguous_files(
@@ -363,13 +473,34 @@ pub fn sketch(args: SketchArgs) {
             .unwrap_or_else(|e| panic!("{} is not a valid reference DB: {}", path, e))
     });
 
-    let sample_names = parse_sample_names(&args);
+    // In --merge mode all read inputs collapse into one sketch, so per-input sample
+    // names don't apply; the first supplied name (if any) names the merged sample.
+    let parsed_sample_names = parse_sample_names(&args);
+    let (sample_names, merged_sample_name) = if args.merge {
+        // Always name the merged sample explicitly. Without this, merge_sketches would fall
+        // back to sketches[0].file_name, but the read-sketching passes push into the shared
+        // collector in completion order, so which input lands first (and thus names the
+        // merged sample) would vary between runs and leak into inspect/profile output. Use
+        // the first supplied -S name, else a fixed default.
+        let name = parsed_sample_names
+            .as_ref()
+            .and_then(|v| v.first().cloned())
+            .unwrap_or_else(|| "merged".to_string());
+        (None, Some(name))
+    } else {
+        (parsed_sample_names, None)
+    };
     if let Some(names) = &sample_names {
         if names.len() != first_pairs.len() + interleaved_inputs.len() + read_inputs.len() {
             log::error!("Sample name length is not equal to the number of reads. Exiting");
             std::process::exit(1);
         }
     }
+    let collected_read_sketches: Mutex<Vec<(SequencesSketch, ReadSketchMeta)>> = Mutex::new(vec![]);
+    // Inputs that failed to sketch (missing/invalid file) while merging. A merged sketch that
+    // silently omits an input violates the promise to combine all inputs, so any failure aborts
+    // the whole merge rather than writing a partial sketch. Mirrors the `profile --merge` path.
+    let merge_failed_inputs: Mutex<Vec<String>> = Mutex::new(vec![]);
 
     let mut max_ram = usize::MAX;
     if args.max_ram.is_some() {
@@ -428,13 +559,32 @@ pub fn sketch(args: SketchArgs) {
                         args.no_dedup,
                         args.fpr,
                     );
+                    if read_sketch_opt.is_none() {
+                        if args.merge {
+                            merge_failed_inputs
+                                .lock()
+                                .unwrap()
+                                .push(read_file1.to_string());
+                        }
+                        return;
+                    }
                     if read_sketch_opt.is_some() {
-                        let res = fs::create_dir_all(&args.sample_output_dir);
-                        if res.is_err() {
-                            error!("Could not create directory at {}", args.sample_output_dir);
-                            std::process::exit(1);
+                        if !args.merge {
+                            let res = fs::create_dir_all(&args.sample_output_dir);
+                            if res.is_err() {
+                                error!("Could not create directory at {}", args.sample_output_dir);
+                                std::process::exit(1);
+                            }
                         }
                         let (read_sketch, meta) = read_sketch_opt.unwrap();
+
+                        if args.merge {
+                            collected_read_sketches
+                                .lock()
+                                .unwrap()
+                                .push((read_sketch, meta));
+                            return;
+                        }
 
                         let sketch_name = if sample_name.is_some() {
                             read_sketch.sample_name.as_ref().unwrap().clone()
@@ -476,6 +626,13 @@ pub fn sketch(args: SketchArgs) {
                         args.fpr,
                     );
                     if let Some((read_sketch, meta)) = read_sketch_opt {
+                        if args.merge {
+                            collected_read_sketches
+                                .lock()
+                                .unwrap()
+                                .push((read_sketch, meta));
+                            return;
+                        }
                         let sketch_name = if sample_name.is_some() {
                             read_sketch.sample_name.as_ref().unwrap().clone()
                         } else {
@@ -491,6 +648,11 @@ pub fn sketch(args: SketchArgs) {
                             ref_index.as_ref(),
                             args.reference.as_deref(),
                         );
+                    } else if args.merge {
+                        merge_failed_inputs
+                            .lock()
+                            .unwrap()
+                            .push(read_file.to_string());
                     }
                 });
             }
@@ -503,9 +665,12 @@ pub fn sketch(args: SketchArgs) {
 
             let iter_vec: Vec<usize> = (0..read_inputs.len()).into_iter().collect();
             iter_vec.into_par_iter().for_each(|i| {
-                let pref = Path::new(&args.sample_output_dir);
-                std::fs::create_dir_all(pref)
-                    .expect("Could not create directory for output sample files (-d). Exiting...");
+                if !args.merge {
+                    let pref = Path::new(&args.sample_output_dir);
+                    std::fs::create_dir_all(pref).expect(
+                        "Could not create directory for output sample files (-d). Exiting...",
+                    );
+                }
 
                 let read_file = &read_inputs[i];
 
@@ -524,8 +689,24 @@ pub fn sketch(args: SketchArgs) {
                     args.no_dedup,
                 );
 
+                if read_sketch_opt.is_none() {
+                    if args.merge {
+                        merge_failed_inputs
+                            .lock()
+                            .unwrap()
+                            .push(read_file.to_string());
+                    }
+                    return;
+                }
                 if read_sketch_opt.is_some() {
                     let (read_sketch, meta) = read_sketch_opt.unwrap();
+                    if args.merge {
+                        collected_read_sketches
+                            .lock()
+                            .unwrap()
+                            .push((read_sketch, meta));
+                        return;
+                    }
                     let sketch_name = if sample_name.is_some() {
                         read_sketch.sample_name.as_ref().unwrap().clone()
                     } else {
@@ -545,6 +726,48 @@ pub fn sketch(args: SketchArgs) {
             });
         });
     });
+
+    if args.merge {
+        let failed = merge_failed_inputs.into_inner().unwrap();
+        if !failed.is_empty() {
+            error!(
+                "--merge: {} read input(s) could not be sketched ({}); refusing to write a partial merged sketch. Exiting.",
+                failed.len(),
+                failed.join(", ")
+            );
+            std::process::exit(1);
+        }
+        let sketches = collected_read_sketches.into_inner().unwrap();
+        if sketches.is_empty() {
+            error!("--merge was set but no read samples were sketched. Exiting.");
+            std::process::exit(1);
+        }
+        let (out_path, out_kind) = merged_output_target(&args);
+        let (merged, meta) = if sketches.len() == 1 {
+            let (mut sketch, meta) = sketches.into_iter().next().unwrap();
+            if let Some(name) = merged_sample_name.clone() {
+                sketch.file_name = name.clone();
+                sketch.sample_name = Some(name);
+            }
+            (sketch, meta)
+        } else {
+            merge_sketches(&sketches, merged_sample_name.clone())
+        };
+        write_single_merged_sketch(
+            &out_path,
+            out_kind,
+            &merged,
+            meta,
+            ref_index.as_ref(),
+            args.reference.as_deref(),
+        );
+        info!(
+            "Merged all read inputs into '{}' ({} distinct k-mers, {} reads recorded).",
+            out_path,
+            merged.kmer_counts.len(),
+            meta.num_reads,
+        );
+    }
 
     if !genome_inputs.is_empty() {
         info!("Sketching genomes...");
