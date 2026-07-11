@@ -654,6 +654,7 @@ fn sketch_pair_lengths(
         None,
         false,
         0.,
+        false,
     )
     .expect("paired sketching should succeed");
     assert!(sketch.paired);

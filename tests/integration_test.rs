@@ -1242,6 +1242,205 @@ fn test_sketch_merge_single_and_paired() {
     );
 }
 
+/// Sketching must croak when read inputs were requested but every stream turned out
+/// empty -- otherwise a run where an upstream producer emitted nothing (e.g. through a
+/// FIFO) would silently exit 0 having sketched nothing. A single non-empty stream among
+/// empty ones is fine; only a zero total is an error.
+#[serial]
+#[test]
+fn test_sketch_empty_reads_croaks() {
+    let dir = "./tests/results/test_empty_reads_dir";
+    if Path::new(dir).exists() {
+        let _ = fs::remove_dir_all(dir);
+    }
+    fs::create_dir_all(dir).unwrap();
+    let empty = format!("{}/empty.fq", dir);
+    fs::write(&empty, b"").unwrap();
+
+    // A single empty read stream: nothing was sketched, so exit non-zero rather than
+    // silently succeed.
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("sketch")
+        .arg("-r")
+        .arg(&empty)
+        .arg("-d")
+        .arg(dir)
+        .assert()
+        .failure()
+        .code(1);
+
+    // --merge over only-empty read streams likewise fails (and writes no output file).
+    let merged = format!("{}/merged", dir);
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("sketch")
+        .arg("--merge")
+        .arg("-r")
+        .arg(&empty)
+        .arg("--compressed-database")
+        .arg(&merged)
+        .assert()
+        .failure();
+    assert!(
+        !Path::new(&format!("{}.sylspc", merged)).exists(),
+        "an empty merged sketch was written when no reads were sketched"
+    );
+
+    // A non-empty stream alongside the empty one is not an error: some reads were sketched.
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("sketch")
+        .arg("-r")
+        .arg(&empty)
+        .arg("-r")
+        .arg("test_files/o157_reads.fastq.gz")
+        .arg("-d")
+        .arg(dir)
+        .assert()
+        .success()
+        .code(0);
+}
+
+/// `--tolerate-empty-inputs` lets a zero-read stream (e.g. a FIFO from an SRA that has no
+/// unpaired reads) count as a valid empty sketch instead of aborting a `--merge`. Without
+/// the flag such an input fails the merge; with it, the merge succeeds and equals the
+/// non-empty input sketched alone.
+#[serial]
+#[test]
+fn test_sketch_merge_tolerate_empty_inputs() {
+    let dir = "./tests/results/test_merge_tolerate_empty_dir";
+    if Path::new(dir).exists() {
+        let _ = fs::remove_dir_all(dir);
+    }
+    fs::create_dir_all(dir).unwrap();
+    let empty = format!("{}/empty.fq", dir);
+    fs::write(&empty, b"").unwrap();
+
+    // Reference: the good input merged on its own gives the distinct-k-mer count that an
+    // empty input, being zero reads, must not change.
+    let good_only = format!("{}/good_only", dir);
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("sketch")
+        .arg("--merge")
+        .arg("-r")
+        .arg("test_files/o157_reads.fastq.gz")
+        .arg("--compressed-database")
+        .arg(&good_only)
+        .arg("-S")
+        .arg("s")
+        .assert()
+        .success()
+        .code(0);
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    let inspect = cmd
+        .arg("inspect")
+        .arg(format!("{}.sylspc", good_only))
+        .output()
+        .expect("Output failed");
+    let good_kmers = num_sketched_kmers(str::from_utf8(&inspect.stdout).unwrap());
+
+    // Bug repro: a good input alongside an empty one aborts the merge without the flag,
+    // and writes no output.
+    let no_flag = format!("{}/no_flag", dir);
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("sketch")
+        .arg("--merge")
+        .arg("-r")
+        .arg("test_files/o157_reads.fastq.gz")
+        .arg("-r")
+        .arg(&empty)
+        .arg("--compressed-database")
+        .arg(&no_flag)
+        .assert()
+        .failure();
+    assert!(
+        !Path::new(&format!("{}.sylspc", no_flag)).exists(),
+        "a merged sketch was written despite an untolerated empty input"
+    );
+
+    // With --tolerate-empty-inputs the empty stream is a valid zero-read input: the merge
+    // succeeds and matches the good-input-only k-mer count.
+    let tolerated = format!("{}/tolerated", dir);
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("sketch")
+        .arg("--merge")
+        .arg("--tolerate-empty-inputs")
+        .arg("-r")
+        .arg("test_files/o157_reads.fastq.gz")
+        .arg("-r")
+        .arg(&empty)
+        .arg("--compressed-database")
+        .arg(&tolerated)
+        .arg("-S")
+        .arg("s")
+        .assert()
+        .success()
+        .code(0);
+    assert!(Path::new(&format!("{}.sylspc", tolerated)).exists());
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    let inspect = cmd
+        .arg("inspect")
+        .arg(format!("{}.sylspc", tolerated))
+        .output()
+        .expect("Output failed");
+    assert_eq!(
+        good_kmers,
+        num_sketched_kmers(str::from_utf8(&inspect.stdout).unwrap()),
+        "an empty tolerated input changed the merged k-mer count"
+    );
+
+    // The flag also covers empty paired-end mates and an empty interleaved stream mixed in
+    // with a good single-end input -- all empties are zero reads, so the k-mer count is
+    // still that of the good input alone.
+    let empty2 = format!("{}/empty2.fq", dir);
+    fs::write(&empty2, b"").unwrap();
+    let multi = format!("{}/multi", dir);
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("sketch")
+        .arg("--merge")
+        .arg("--tolerate-empty-inputs")
+        .arg("-r")
+        .arg("test_files/o157_reads.fastq.gz")
+        .arg("-1")
+        .arg(&empty)
+        .arg("-2")
+        .arg(&empty2)
+        .arg("--interleaved")
+        .arg(&empty)
+        .arg("--compressed-database")
+        .arg(&multi)
+        .arg("-S")
+        .arg("s")
+        .assert()
+        .success()
+        .code(0);
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    let inspect = cmd
+        .arg("inspect")
+        .arg(format!("{}.sylspc", multi))
+        .output()
+        .expect("Output failed");
+    assert_eq!(
+        good_kmers,
+        num_sketched_kmers(str::from_utf8(&inspect.stdout).unwrap()),
+        "empty paired/interleaved inputs changed the merged k-mer count"
+    );
+
+    // A genuine mismatch -- only one mate of a pair empty -- is a real error, not an empty
+    // input, so it must still fail even with the flag.
+    let mismatch = format!("{}/mismatch", dir);
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("sketch")
+        .arg("--merge")
+        .arg("--tolerate-empty-inputs")
+        .arg("-1")
+        .arg("test_files/k12_R1.fq")
+        .arg("-2")
+        .arg(&empty)
+        .arg("--compressed-database")
+        .arg(&mismatch)
+        .assert()
+        .failure();
+}
+
 /// Extract the (single) data row's Sample_file (col 1) and Containment_ind (col 12)
 /// from a `profile` TSV, skipping the header line.
 fn profile_sample_and_containment(stdout: &str) -> (String, String) {
