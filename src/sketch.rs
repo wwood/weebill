@@ -593,6 +593,12 @@ pub fn sketch(args: SketchArgs) {
                             return;
                         }
 
+                        // A tolerated empty pair (zero reads) writes no per-sample sketch,
+                        // so a failed all-empty run leaves no stray .sylsp/.sylspc behind.
+                        if meta.num_reads == 0 {
+                            return;
+                        }
+
                         let sketch_name = if sample_name.is_some() {
                             read_sketch.sample_name.as_ref().unwrap().clone()
                         } else {
@@ -640,6 +646,11 @@ pub fn sketch(args: SketchArgs) {
                                 .lock()
                                 .unwrap()
                                 .push((read_sketch, meta));
+                            return;
+                        }
+                        // A tolerated empty interleaved input (zero reads) writes no
+                        // per-sample sketch, leaving no stray artifact behind a failed run.
+                        if meta.num_reads == 0 {
                             return;
                         }
                         let sketch_name = if sample_name.is_some() {
@@ -716,6 +727,12 @@ pub fn sketch(args: SketchArgs) {
                             .lock()
                             .unwrap()
                             .push((read_sketch, meta));
+                        return;
+                    }
+                    // A tolerated empty input (zero reads) writes no per-sample sketch: a
+                    // zero-read .sylsp/.sylspc would be a stray artifact left behind a run
+                    // that then fails the all-empty guard below. Skip it.
+                    if meta.num_reads == 0 {
                         return;
                     }
                     let sketch_name = if sample_name.is_some() {

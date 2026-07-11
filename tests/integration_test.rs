@@ -1439,6 +1439,35 @@ fn test_sketch_merge_tolerate_empty_inputs() {
         .arg(&mismatch)
         .assert()
         .failure();
+
+    // Non-merge mode: a run where every input is empty still fails, even with the flag,
+    // and must leave NO per-sample sketch files behind -- a tolerated empty input is a
+    // zero-read sketch that is not written, so a failed run has no stray artifacts.
+    let nm_dir = format!("{}/nonmerge_all_empty", dir);
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("sketch")
+        .arg("--tolerate-empty-inputs")
+        .arg("-r")
+        .arg(&empty)
+        .arg("-r")
+        .arg(&empty2)
+        .arg("-d")
+        .arg(&nm_dir)
+        .assert()
+        .failure();
+    let stray: Vec<_> = fs::read_dir(&nm_dir)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n.ends_with(".sylsp") || n.ends_with(".sylspc"))
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        stray.is_empty(),
+        "a failed all-empty non-merge run left stray sketch files: {:?}",
+        stray
+    );
 }
 
 /// Extract the (single) data row's Sample_file (col 1) and Containment_ind (col 12)
