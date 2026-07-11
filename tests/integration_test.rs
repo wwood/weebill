@@ -1468,6 +1468,44 @@ fn test_sketch_merge_tolerate_empty_inputs() {
         "a failed all-empty non-merge run left stray sketch files: {:?}",
         stray
     );
+
+    // The all-empty check spans input categories: a run whose single-end AND paired-end
+    // inputs are all empty must still fail even with the flag -- the flag only tolerates
+    // empties when some other input has reads, never a wholly empty run. Holds for --merge
+    // (no output file) and non-merge alike.
+    let mixed_merge = format!("{}/mixed_merge", dir);
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("sketch")
+        .arg("--merge")
+        .arg("--tolerate-empty-inputs")
+        .arg("-r")
+        .arg(&empty)
+        .arg("-1")
+        .arg(&empty)
+        .arg("-2")
+        .arg(&empty2)
+        .arg("--compressed-database")
+        .arg(&mixed_merge)
+        .assert()
+        .failure();
+    assert!(
+        !Path::new(&format!("{}.sylspc", mixed_merge)).exists(),
+        "an all-empty single+paired --merge run wrote an output file"
+    );
+
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("sketch")
+        .arg("--tolerate-empty-inputs")
+        .arg("-r")
+        .arg(&empty)
+        .arg("-1")
+        .arg(&empty)
+        .arg("-2")
+        .arg(&empty2)
+        .arg("-d")
+        .arg(format!("{}/mixed_nm", dir))
+        .assert()
+        .failure();
 }
 
 /// Extract the (single) data row's Sample_file (col 1) and Containment_ind (col 12)
