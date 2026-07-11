@@ -1302,7 +1302,7 @@ fn get_seq_sketch_with_meta(
             );
             None
         } else if read_file.len() == 1 {
-            sketch_sequences_needle(read_file[0], args.c, args.k, None, false)
+            sketch_sequences_needle(read_file[0], args.c, args.k, None, false, false)
         } else if read_file.len() == 2 {
             sketch_pair_sequences(
                 read_file[0],
@@ -1312,9 +1312,18 @@ fn get_seq_sketch_with_meta(
                 None,
                 false,
                 DEFAULT_FPR,
+                false,
             )
         } else if read_file.len() == 3 {
-            sketch_interleaved_sequences(read_file[0], args.c, args.k, None, false, DEFAULT_FPR)
+            sketch_interleaved_sequences(
+                read_file[0],
+                args.c,
+                args.k,
+                None,
+                false,
+                DEFAULT_FPR,
+                false,
+            )
         } else {
             panic!(
                 "Internal Error: read_file has length {}. Something went wrong...",

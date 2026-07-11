@@ -379,6 +379,12 @@ pub struct SketchArgs {
         help = "Merge all read inputs (single-end, paired-end, and interleaved) into ONE sample sketch. The value given to --compressed-database (or -d) is then treated as the single output FILE path (suffix appended if missing) rather than a directory. Use -S to name the merged sample."
     )]
     pub merge: bool,
+    #[clap(
+        long = "tolerate-empty-inputs",
+        help_heading = "INPUT",
+        help = "Treat a read input that contains zero reads (an empty file or stream, e.g. a FIFO from an SRA that has no unpaired reads) as a valid zero-read sketch instead of a failure. Useful with --merge so an empty single-end/paired-end/interleaved stream does not abort the merge. A run where EVERY read input is empty is still an error."
+    )]
+    pub tolerate_empty_inputs: bool,
 }
 
 #[derive(Args, Clone)]

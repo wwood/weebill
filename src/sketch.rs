@@ -29,6 +29,7 @@ use std::fs::File;
 use std::io::BufWriter;
 use std::io::{prelude::*, BufReader};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 type Marker = u32;
 
@@ -501,6 +502,10 @@ pub fn sketch(args: SketchArgs) {
     // silently omits an input violates the promise to combine all inputs, so any failure aborts
     // the whole merge rather than writing a partial sketch. Mirrors the `profile --merge` path.
     let merge_failed_inputs: Mutex<Vec<String>> = Mutex::new(vec![]);
+    // Total reads drawn from all read streams (paired + interleaved + single). If read
+    // inputs were requested but every stream turned out empty, we sketched nothing and
+    // must croak rather than silently write nothing (or an empty merged sketch).
+    let total_reads_sketched = AtomicU64::new(0);
 
     let mut max_ram = usize::MAX;
     if args.max_ram.is_some() {
@@ -558,6 +563,7 @@ pub fn sketch(args: SketchArgs) {
                         sample_name.clone(),
                         args.no_dedup,
                         args.fpr,
+                        args.tolerate_empty_inputs,
                     );
                     if read_sketch_opt.is_none() {
                         if args.merge {
@@ -577,12 +583,19 @@ pub fn sketch(args: SketchArgs) {
                             }
                         }
                         let (read_sketch, meta) = read_sketch_opt.unwrap();
+                        total_reads_sketched.fetch_add(meta.num_reads, Ordering::Relaxed);
 
                         if args.merge {
                             collected_read_sketches
                                 .lock()
                                 .unwrap()
                                 .push((read_sketch, meta));
+                            return;
+                        }
+
+                        // A tolerated empty pair (zero reads) writes no per-sample sketch,
+                        // so a failed all-empty run leaves no stray .sylsp/.sylspc behind.
+                        if meta.num_reads == 0 {
                             return;
                         }
 
@@ -624,13 +637,20 @@ pub fn sketch(args: SketchArgs) {
                         sample_name.clone(),
                         args.no_dedup,
                         args.fpr,
+                        args.tolerate_empty_inputs,
                     );
                     if let Some((read_sketch, meta)) = read_sketch_opt {
+                        total_reads_sketched.fetch_add(meta.num_reads, Ordering::Relaxed);
                         if args.merge {
                             collected_read_sketches
                                 .lock()
                                 .unwrap()
                                 .push((read_sketch, meta));
+                            return;
+                        }
+                        // A tolerated empty interleaved input (zero reads) writes no
+                        // per-sample sketch, leaving no stray artifact behind a failed run.
+                        if meta.num_reads == 0 {
                             return;
                         }
                         let sketch_name = if sample_name.is_some() {
@@ -687,6 +707,7 @@ pub fn sketch(args: SketchArgs) {
                     args.k,
                     sample_name.clone(),
                     args.no_dedup,
+                    args.tolerate_empty_inputs,
                 );
 
                 if read_sketch_opt.is_none() {
@@ -700,11 +721,18 @@ pub fn sketch(args: SketchArgs) {
                 }
                 if read_sketch_opt.is_some() {
                     let (read_sketch, meta) = read_sketch_opt.unwrap();
+                    total_reads_sketched.fetch_add(meta.num_reads, Ordering::Relaxed);
                     if args.merge {
                         collected_read_sketches
                             .lock()
                             .unwrap()
                             .push((read_sketch, meta));
+                        return;
+                    }
+                    // A tolerated empty input (zero reads) writes no per-sample sketch: a
+                    // zero-read .sylsp/.sylspc would be a stray artifact left behind a run
+                    // that then fails the all-empty guard below. Skip it.
+                    if meta.num_reads == 0 {
                         return;
                     }
                     let sketch_name = if sample_name.is_some() {
@@ -726,6 +754,17 @@ pub fn sketch(args: SketchArgs) {
             });
         });
     });
+
+    // If the user asked to sketch reads at all (any paired/interleaved/single input) but
+    // every stream came back empty, we produced nothing. Silently exiting 0 (or writing an
+    // empty merged sketch) would hide the fact that no data arrived -- a real hazard when
+    // reads are streamed in through FIFOs and an upstream producer emitted nothing. Croak.
+    let read_inputs_present =
+        !first_pairs.is_empty() || !interleaved_inputs.is_empty() || !read_inputs.is_empty();
+    if read_inputs_present && total_reads_sketched.load(Ordering::Relaxed) == 0 {
+        error!("No reads were sketched: every read input stream was empty. Exiting.");
+        std::process::exit(1);
+    }
 
     if args.merge {
         let failed = merge_failed_inputs.into_inner().unwrap();
@@ -1157,11 +1196,19 @@ pub fn sketch_pair_sequences(
     sample_name: Option<String>,
     no_dedup: bool,
     dedup_fpr: f64,
+    tolerate_empty: bool,
 ) -> Option<(SequencesSketch, ReadSketchMeta)> {
     let r1o = parse_fastx_file(read_file1);
     let r2o = parse_fastx_file(read_file2);
     let mut read_sketch = SequencesSketch::new(read_file1.to_string(), c, k, true, sample_name, 0.);
     if r1o.is_err() || r2o.is_err() {
+        // Both mates being empty is a legitimate zero-read pair (an SRA with no paired
+        // spots); tolerate it when opted in. Only one side empty is a real mismatch.
+        let both_empty = matches!(&r1o, Err(e) if e.kind == needletail::errors::ParseErrorKind::EmptyFile)
+            && matches!(&r2o, Err(e) if e.kind == needletail::errors::ParseErrorKind::EmptyFile);
+        if tolerate_empty && both_empty {
+            return Some((read_sketch, ReadSketchMeta { num_reads: 0 }));
+        }
         log::error!("Paired end reading failed for '{}' and '{}'. Make sure the files are present or the sequences are valid.", read_file1, read_file2);
         std::process::exit(1);
     }
@@ -1326,9 +1373,17 @@ pub fn sketch_interleaved_sequences(
     sample_name: Option<String>,
     no_dedup: bool,
     dedup_fpr: f64,
+    tolerate_empty: bool,
 ) -> Option<(SequencesSketch, ReadSketchMeta)> {
     let reader = parse_fastx_file(read_file);
-    if reader.is_err() {
+    if let Err(e) = &reader {
+        // A zero-read interleaved stream is a valid empty input when the caller opts in.
+        if tolerate_empty && e.kind == needletail::errors::ParseErrorKind::EmptyFile {
+            return Some((
+                SequencesSketch::new(read_file.to_string(), c, k, true, sample_name, 0.),
+                ReadSketchMeta { num_reads: 0 },
+            ));
+        }
         log::error!(
             "Interleaved paired-end reading failed for '{}'. Make sure the file is present and valid.",
             read_file
@@ -1481,6 +1536,7 @@ pub fn sketch_sequences_needle(
     k: usize,
     sample_name: Option<String>,
     no_dedup: bool,
+    tolerate_empty: bool,
 ) -> Option<(SequencesSketch, ReadSketchMeta)> {
     let mut kmer_map = HashMap::default();
     let ref_file = &read_file;
@@ -1490,7 +1546,16 @@ pub fn sketch_sequences_needle(
     let mut kmer_to_pair_table = FxHashSet::default();
     let mut num_dup_removed = 0;
 
-    if reader.is_err() {
+    if let Err(e) = &reader {
+        // An empty input (zero reads) is a legitimate stream, not a corrupt file --
+        // e.g. a FIFO fed by an SRA that has no unpaired reads. When the caller opts in,
+        // treat it as a valid zero-read sketch rather than a failure.
+        if tolerate_empty && e.kind == needletail::errors::ParseErrorKind::EmptyFile {
+            return Some((
+                SequencesSketch::new(read_file.to_string(), c, k, false, sample_name, 0.),
+                ReadSketchMeta { num_reads: 0 },
+            ));
+        }
         warn!("{} is not a valid fasta/fastq file; skipping.", ref_file);
         return None;
     } else {
