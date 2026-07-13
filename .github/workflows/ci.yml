@@ -1,0 +1,54 @@
+# Continuous integration: format check, lint, and test on every push/PR.
+# Drop into .github/workflows/ci.yml. This is the CI guard that backs up the
+# local cargo-fmt pre-commit hook (a hook can be skipped; CI cannot).
+#
+# Pure-Rust crates work as-is. If the crate needs native/conda dependencies
+# (see build.rs + pixi), replace the toolchain setup with the pixi block at the
+# bottom of this file so `cargo test` can find the C headers/libs.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy-test:
+    name: clippy + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # Advisory only: the code inherited from sylph has pre-existing findings.
+      # Findings are reported but do not fail the build; tests below do.
+      - run: cargo clippy --all-targets --all-features
+        continue-on-error: true
+      - run: cargo test --all
+
+# --- Variant for crates with native/conda deps (pixi) --------------------
+# Replace the two jobs above's toolchain + build steps with:
+#
+#   - uses: actions/checkout@v4
+#   - uses: prefix-dev/setup-pixi@v0.8.1
+#     with:
+#       manifest-path: pixi.toml
+#   - run: pixi install
+#   - run: pixi run test      # a [tasks]/[feature.dev.tasks] entry in pixi.toml
+#
+# and let the pixi env supply the Rust toolchain, C compiler, and libraries.

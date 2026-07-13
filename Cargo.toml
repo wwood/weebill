@@ -2,12 +2,16 @@
 name = "weebill"
 version = "0.0.0"
 edition = "2021"
-license = "MIT OR Apache-2.0"
+description = "Fast and precise species-level metagenomic profiling (ANI querying + taxonomic profiling), a fork of sylph"
+license = "MIT"
+repository = "https://github.com/wwood/weebill"
+homepage = "https://github.com/wwood/weebill"
+readme = "README.md"
+# Test data and images would push the published crate over the crates.io 10 MiB limit.
+exclude = ["test_files/", "assets/", "*.png"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
-# The library stays named `sylph` (so `use sylph::...` keeps working), but the
-# installed binary is `weebill`.
 [[bin]]
 name = "weebill"
 path = "src/main.rs"
@@ -50,6 +54,7 @@ serial_test = "*"
 [profile.release]
 panic = "abort"
 lto = true
+codegen-units = 1
 
 [profile.dev]
 #opt-level = 1
@@ -57,3 +62,23 @@ opt-level = 3
 
 #[rust]
 #debuginfo-level = 1
+
+# Config for 'dist' (cargo-dist): prebuilt binaries + shell installer
+[profile.dist]
+inherits = "release"
+lto = "thin"
+
+# Config for 'dist'
+[workspace.metadata.dist]
+# The preferred dist version to use in CI (Cargo.toml SemVer syntax)
+cargo-dist-version = "0.31.0"
+# CI backends to support
+ci = "github"
+# The installers to generate for each app
+installers = ["shell"]
+# Target platforms to build apps for (Rust target-triple syntax)
+targets = ["x86_64-unknown-linux-musl"]
+# Whether to install an updater program
+install-updater = false
+# Path that installers should place binaries in
+install-path = "CARGO_HOME"
