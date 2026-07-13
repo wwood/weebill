@@ -1,6 +1,6 @@
 [package]
 name = "weebill"
-version = "0.0.0"
+version = "0.1.0"
 edition = "2021"
 description = "Fast and precise species-level metagenomic profiling (ANI querying + taxonomic profiling), a fork of sylph"
 license = "MIT"

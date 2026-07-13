@@ -5,6 +5,8 @@ changes made in weebill.
 
 ## Unreleased
 
+## Version 0.1.0
+
 ### Added
 
 - Renamed the binary to `weebill` (library crate remains `sylph`); README documents the fork, installation, and new sub-commands.
