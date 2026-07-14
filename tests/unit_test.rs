@@ -220,7 +220,7 @@ fn error_kmer_fixture(
     let mut db = refdelta::build_refdb(&[gsketch], &tax);
     // store the genome sequence packed 4 bases per byte (same format as on disk)
     let seq_len = genome.len();
-    let mut packed = vec![0u8; (seq_len + 3) / 4];
+    let mut packed = vec![0u8; seq_len.div_ceil(4)];
     for (i, &b) in genome.iter().enumerate() {
         let code = BYTE_TO_SEQ[b as usize];
         packed[i / 4] |= (code & 3) << (2 * (i % 4));
@@ -543,7 +543,7 @@ fn test_hash() {
             println!("{}", format!("{key:b}"));
             use std::arch::x86_64::*;
             use weebill::avx2_seeding::*;
-            let mut rolling_kmer_f_marker = _mm256_set_epi64x(0, 0, 0, key);
+            let rolling_kmer_f_marker = _mm256_set_epi64x(0, 0, 0, key);
             let hash_256 = mm_hash256(rolling_kmer_f_marker);
             let v1 = _mm256_extract_epi64(hash_256, 0);
             println!("{}", format!("{v1:b}"));
@@ -623,7 +623,7 @@ fn avx512_seeding_matches_avx2_and_scalar() {
 fn write_fastq(path: &std::path::Path, read_len: usize, n: usize) {
     use std::io::Write;
     let s: String = "ACGT".chars().cycle().take(read_len).collect();
-    let q: String = std::iter::repeat('I').take(read_len).collect();
+    let q: String = std::iter::repeat_n('I', read_len).collect();
     let mut f = std::fs::File::create(path).unwrap();
     for i in 0..n {
         writeln!(f, "@read{}\n{}\n+\n{}", i, s, q).unwrap();
@@ -682,6 +682,71 @@ fn paired_mean_read_length_excludes_sub_k_mates() {
     // the naive (50+10)/2 = 30 that would break the coverage correction.
     let (mean_len, num_reads) = sketch_pair_lengths("pair_subk", 50, 10, 8, 31);
     assert_eq!(mean_len, 50.0);
-    assert!(mean_len as f64 - 31.0 + 1.0 > 0.0);
+    assert!(mean_len - 31.0 + 1.0 > 0.0);
     assert_eq!(num_reads, 8);
+}
+
+/// True if the zstd frame starting at `frame_start` declares a trailing content
+/// checksum (bit 2 of the frame header descriptor, which follows the 4-byte
+/// zstd magic).
+fn frame_has_checksum(bytes: &[u8], frame_start: usize) -> bool {
+    assert_eq!(
+        &bytes[frame_start..frame_start + 4],
+        &[0x28, 0xB5, 0x2F, 0xFD],
+        "expected a zstd frame magic at offset {}",
+        frame_start
+    );
+    bytes[frame_start + 4] & 0b100 != 0
+}
+
+/// Both compressed sample formats must carry zstd's content checksum, and both
+/// readers must actually validate it. Flipping a bit in the trailing checksum
+/// leaves a payload that decodes perfectly, so it is caught only if the checksum
+/// is written *and* the reader consumes the frame to its end.
+#[test]
+fn compressed_sketches_are_checksummed() {
+    let mut kmer_counts: FxHashMap<u64, u32> = FxHashMap::default();
+    for (h, c) in [(1u64, 5u32), (2, 3), (100, 7), (500, 4), (98765, 9)] {
+        kmer_counts.insert(h, c);
+    }
+    let sketch = SequencesSketch {
+        kmer_counts,
+        c: 200,
+        k: 31,
+        file_name: "sample.fq".into(),
+        sample_name: Some("s".into()),
+        paired: true,
+        mean_read_length: 149.0,
+    };
+
+    // *.sylspc: the zstd frame follows the 6-byte plaintext SYLZ header.
+    let mut spc = Vec::new();
+    compress::write_seq_sketch_compressed(&mut spc, &sketch).unwrap();
+    assert!(
+        frame_has_checksum(&spc, 6),
+        "*.sylspc frame must include a content checksum"
+    );
+    compress::read_seq_sketch_compressed(&spc[..]).expect("intact sketch must read");
+    let mut bad = spc.clone();
+    *bad.last_mut().unwrap() ^= 0xFF;
+    assert!(
+        compress::read_seq_sketch_compressed(&bad[..]).is_err(),
+        "*.sylspc with a corrupt checksum must not read"
+    );
+
+    // *.sylspr: the whole file is one zstd frame.
+    let idx = open_index(&three_genome_db(), 200);
+    let mut spr = Vec::new();
+    refdelta::compress_seq(&mut spr, &sketch, &idx, "unit-test.sylref").unwrap();
+    assert!(
+        frame_has_checksum(&spr, 0),
+        "*.sylspr frame must include a content checksum"
+    );
+    refdelta::decompress_seq(&spr[..], &idx).expect("intact sketch must read");
+    let mut bad = spr.clone();
+    *bad.last_mut().unwrap() ^= 0xFF;
+    assert!(
+        refdelta::decompress_seq(&bad[..], &idx).is_err(),
+        "*.sylspr with a corrupt checksum must not read"
+    );
 }

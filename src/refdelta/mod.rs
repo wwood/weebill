@@ -47,6 +47,11 @@
 //! to "novel" full-price coding), never correctness: decompression reads the exact
 //! genome ids recorded in the sample and loads precisely those dense blocks.
 //!
+//! Because the file is read a block at a time, decoding a sample never touches most
+//! of it, and corruption would go unnoticed. The header therefore carries an XXH64
+//! of the rest of the file, checked on demand by [`RefIndex::verify_checksum`] —
+//! which `weebill inspect` does.
+//!
 //! ## Encoding a read sketch
 //!
 //! Read hashes are partitioned into (a) per-genome distinctive hits, (b) pool
@@ -56,7 +61,10 @@
 //! absent set). The hit genome ids are themselves delta-coded: because strains of
 //! a species are contiguous, a sample's hits cluster into small id ranges.
 //! Novel hashes use Golomb–Rice (as for normal sketches); counts are varints.
-//! The whole payload is zstd-framed.
+//! The whole payload is zstd-framed, with the frame's trailing XXH64 content
+//! checksum enabled so that a truncated or bit-rotted `.sylspr` is detected on
+//! read rather than silently decoded into a corrupt sketch. Decoding reads the
+//! whole frame (`zstd::stream::decode_all`), so the checksum is always checked.
 
 mod ref_build;
 mod sketch_compress;
@@ -64,7 +72,9 @@ mod sketch_decompress;
 
 // Shared constants used by both compress and decompress.
 pub(crate) const SKETCH_MAGIC: &[u8; 4] = b"SYLD";
-pub(crate) const SKETCH_VERSION: u8 = 4;
+/// Bumped whenever the payload layout changes. Only this exact version is
+/// readable — older files must be re-compressed from their source sketch.
+pub(crate) const SKETCH_VERSION: u8 = 5;
 pub(crate) const SCHEME_BITMASK: u8 = 0;
 pub(crate) const SCHEME_PRESENT_RICE: u8 = 1;
 pub(crate) const SCHEME_ABSENT_RICE: u8 = 2;

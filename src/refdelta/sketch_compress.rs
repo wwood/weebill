@@ -646,7 +646,7 @@ pub fn compress_seq_with_opts<W: Write>(
     write_uvarint(&mut payload, pool_section.len() as u64)?;
     write_uvarint(&mut payload, novel_section.len() as u64)?;
     write_uvarint(&mut payload, count_section.len() as u64)?;
-    // v4: single-substitution error-k-mer section
+    // single-substitution error-k-mer section
     write_uvarint(&mut payload, error_count as u64)?;
     write_uvarint(&mut payload, error_section.len() as u64)?;
     payload.extend_from_slice(&hit_section);
@@ -656,6 +656,9 @@ pub fn compress_seq_with_opts<W: Write>(
     payload.extend_from_slice(&count_section);
 
     let mut enc = zstd::stream::write::Encoder::new(inner, ZSTD_LEVEL)?;
+    // Trailing XXH64 content checksum, so decoding a corrupt file errors rather
+    // than yielding a plausible-looking but wrong sketch.
+    enc.include_checksum(true)?;
     enc.write_all(&payload)?;
     enc.finish()?;
     info!(
@@ -850,18 +853,18 @@ struct RefSketchInspect {
     sample_name: String,
     paired: bool,
     mean_read_length: f64,
-    num_reads: Option<u64>,
+    num_reads: u64,
     header_metadata_bytes: usize,
-    hit_genomes: Option<u64>,
-    assigned_to_genomes: Option<u64>,
-    shared_pool: Option<u64>,
-    novel: Option<u64>,
-    hit_section_bytes: Option<u64>,
-    pool_section_bytes: Option<u64>,
-    novel_section_bytes: Option<u64>,
-    count_section_bytes: Option<u64>,
-    error_kmers: Option<u64>,
-    error_section_bytes: Option<u64>,
+    hit_genomes: u64,
+    assigned_to_genomes: u64,
+    shared_pool: u64,
+    novel: u64,
+    hit_section_bytes: u64,
+    pool_section_bytes: u64,
+    novel_section_bytes: u64,
+    count_section_bytes: u64,
+    error_kmers: u64,
+    error_section_bytes: u64,
 }
 
 fn inspect_ref_sketch(path: &str) -> io::Result<RefSketchInspect> {
@@ -878,20 +881,19 @@ fn inspect_ref_sketch(path: &str) -> io::Result<RefSketchInspect> {
     }
     let mut ver = [0u8; 1];
     r.read_exact(&mut ver)?;
-    if ver[0] == 0 || ver[0] > SKETCH_VERSION {
+    if ver[0] != SKETCH_VERSION {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "unsupported reference-delta version",
+            format!(
+                "reference-delta sketch is version {}, but only version {} is readable; re-run ref-compress",
+                ver[0], SKETCH_VERSION
+            ),
         ));
     }
     let mut fp = [0u8; 8];
     r.read_exact(&mut fp)?;
     let reference_fingerprint = u64::from_le_bytes(fp);
-    let reference_db = if ver[0] >= 2 {
-        read_string(&mut r)?
-    } else {
-        "unknown".to_string()
-    };
+    let reference_db = read_string(&mut r)?;
     let c = read_uvarint(&mut r)? as usize;
     let k = read_uvarint(&mut r)? as usize;
     let sample_file = read_string(&mut r)?;
@@ -907,40 +909,18 @@ fn inspect_ref_sketch(path: &str) -> io::Result<RefSketchInspect> {
     let mut mrl = [0u8; 8];
     r.read_exact(&mut mrl)?;
     let mean_read_length = f64::from_le_bytes(mrl);
-    let num_reads = if ver[0] >= 3 {
-        Some(read_uvarint(&mut r)?)
-    } else {
-        None
-    };
+    let num_reads = read_uvarint(&mut r)?;
 
-    let (
-        hit_genomes,
-        assigned_to_genomes,
-        shared_pool,
-        novel,
-        hit_section_bytes,
-        pool_section_bytes,
-        novel_section_bytes,
-        count_section_bytes,
-    ) = if ver[0] >= 2 {
-        (
-            Some(read_uvarint(&mut r)?),
-            Some(read_uvarint(&mut r)?),
-            Some(read_uvarint(&mut r)?),
-            Some(read_uvarint(&mut r)?),
-            Some(read_uvarint(&mut r)?),
-            Some(read_uvarint(&mut r)?),
-            Some(read_uvarint(&mut r)?),
-            Some(read_uvarint(&mut r)?),
-        )
-    } else {
-        (None, None, None, None, None, None, None, None)
-    };
-    let (error_kmers, error_section_bytes) = if ver[0] >= 4 {
-        (Some(read_uvarint(&mut r)?), Some(read_uvarint(&mut r)?))
-    } else {
-        (None, None)
-    };
+    let hit_genomes = read_uvarint(&mut r)?;
+    let assigned_to_genomes = read_uvarint(&mut r)?;
+    let shared_pool = read_uvarint(&mut r)?;
+    let novel = read_uvarint(&mut r)?;
+    let hit_section_bytes = read_uvarint(&mut r)?;
+    let pool_section_bytes = read_uvarint(&mut r)?;
+    let novel_section_bytes = read_uvarint(&mut r)?;
+    let count_section_bytes = read_uvarint(&mut r)?;
+    let error_kmers = read_uvarint(&mut r)?;
+    let error_section_bytes = read_uvarint(&mut r)?;
     let header_metadata_bytes = raw.len() - r.len();
 
     Ok(RefSketchInspect {
@@ -971,21 +951,13 @@ fn inspect_ref_sketch(path: &str) -> io::Result<RefSketchInspect> {
     })
 }
 
-fn opt_u64(x: Option<u64>) -> String {
-    x.map(|v| v.to_string()).unwrap_or_else(|| "-".to_string())
-}
-
 fn run_ref_inspect(files: &[String]) {
     println!(
         "file\tversion\tcompressed_bytes\tpayload_bytes\treference_fingerprint\treference_db\tsample_file\tsample_name\tc\tk\tpaired\tmean_read_length\tnum_reads\theader_metadata_payload_bytes\thit_genomes\tassigned_to_genomes\tshared_pool\tnovel\terror_kmers\ttotal_hashes\thit_section_payload_bytes\tpool_section_payload_bytes\tnovel_section_payload_bytes\terror_section_payload_bytes\tcount_section_payload_bytes"
     );
     for f in files {
         let x = inspect_ref_sketch(f).unwrap_or_else(|e| panic!("Failed to inspect {}: {}", f, e));
-        let err = x.error_kmers.unwrap_or(0);
-        let total_hashes = match (x.assigned_to_genomes, x.shared_pool, x.novel) {
-            (Some(a), Some(p), Some(n)) => (a + p + n + err).to_string(),
-            _ => "-".to_string(),
-        };
+        let total_hashes = x.assigned_to_genomes + x.shared_pool + x.novel + x.error_kmers;
         println!(
             "{}\t{}\t{}\t{}\t{:016x}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             x.path,
@@ -1000,19 +972,19 @@ fn run_ref_inspect(files: &[String]) {
             x.k,
             x.paired,
             x.mean_read_length,
-            opt_u64(x.num_reads),
+            x.num_reads,
             x.header_metadata_bytes,
-            opt_u64(x.hit_genomes),
-            opt_u64(x.assigned_to_genomes),
-            opt_u64(x.shared_pool),
-            opt_u64(x.novel),
-            opt_u64(x.error_kmers),
+            x.hit_genomes,
+            x.assigned_to_genomes,
+            x.shared_pool,
+            x.novel,
+            x.error_kmers,
             total_hashes,
-            opt_u64(x.hit_section_bytes),
-            opt_u64(x.pool_section_bytes),
-            opt_u64(x.novel_section_bytes),
-            opt_u64(x.error_section_bytes),
-            opt_u64(x.count_section_bytes),
+            x.hit_section_bytes,
+            x.pool_section_bytes,
+            x.novel_section_bytes,
+            x.error_section_bytes,
+            x.count_section_bytes,
         );
     }
 }

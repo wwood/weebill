@@ -1,4 +1,5 @@
 use assert_cmd::prelude::*; // Add methods on commands
+use predicates::prelude::predicate;
 use serial_test::serial;
 use std::fs;
 use std::path::Path;
@@ -1759,4 +1760,294 @@ fn test_sketch_merge_rejects_conflicting_suffix() {
         .arg(format!("{}/merged.sylsp", dir))
         .assert()
         .failure();
+}
+
+/// Chop `path` down to `keep` bytes, as a partial write or a bad copy would.
+fn truncate_file(path: &str, keep: u64) {
+    let f = fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .unwrap_or_else(|_| panic!("could not open {} for truncation", path));
+    f.set_len(keep).unwrap();
+}
+
+fn file_len(path: &str) -> u64 {
+    fs::metadata(path).unwrap().len()
+}
+
+/// A truncated *.sylspc must be rejected, not silently read as a short sketch.
+/// Both a chopped-in-half file and one missing only the zstd frame's trailing
+/// checksum are corrupt; the latter still holds every payload byte the reader
+/// wants, so it is only caught because the reader drains the frame to its end.
+#[serial]
+#[test]
+fn test_truncated_sylspc_is_rejected() {
+    let dir = "./tests/results/truncated_sylspc";
+    let _ = fs::remove_dir_all(dir);
+
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("sketch")
+        .arg("test_files/e.coli-K12.fasta.gz")
+        .arg("test_files/e.coli-o157.fasta.gz")
+        .arg("-o")
+        .arg(format!("{}/db", dir))
+        .arg("-d")
+        .arg(dir)
+        .assert()
+        .success()
+        .code(0);
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("sketch")
+        .arg("-r")
+        .arg("test_files/o157_reads.fastq.gz")
+        .arg("--compressed-database")
+        .arg(dir)
+        .assert()
+        .success()
+        .code(0);
+
+    let db = format!("{}/db.syldb", dir);
+    let sample = format!("{}/o157_reads.fastq.gz.sylspc", dir);
+    let intact_len = file_len(&sample);
+
+    // the intact sketch profiles fine
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("profile")
+        .arg(&db)
+        .arg(&sample)
+        .assert()
+        .success()
+        .code(0);
+
+    // losing only the trailing checksum is still corruption
+    let intact = fs::read(&sample).unwrap();
+    truncate_file(&sample, intact_len - 4);
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("profile").arg(&db).arg(&sample).assert().failure();
+
+    // ... as is losing half the file
+    fs::write(&sample, &intact).unwrap();
+    truncate_file(&sample, intact_len / 2);
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("profile").arg(&db).arg(&sample).assert().failure();
+
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("inspect").arg(&sample).assert().failure();
+}
+
+/// A truncated *.sylspr must be rejected by every reader of the format: `query`
+/// against its reference, and `ref-compress --inspect`.
+#[serial]
+#[test]
+fn test_truncated_sylspr_is_rejected() {
+    let dir = "./tests/results/truncated_sylspr";
+    let _ = fs::remove_dir_all(dir);
+
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("sketch")
+        .arg("test_files/e.coli-K12.fasta.gz")
+        .arg("test_files/e.coli-o157.fasta.gz")
+        .arg("-o")
+        .arg(format!("{}/db", dir))
+        .arg("-d")
+        .arg(dir)
+        .assert()
+        .success()
+        .code(0);
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("sketch")
+        .arg("test_files/o157_reads.fastq.gz")
+        .arg("-d")
+        .arg(dir)
+        .assert()
+        .success()
+        .code(0);
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("ref-build")
+        .arg(format!("{}/db.syldb", dir))
+        .arg("-o")
+        .arg(format!("{}/ref", dir))
+        .assert()
+        .success()
+        .code(0);
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("ref-compress")
+        .arg(format!("{}/o157_reads.fastq.gz.sylsp", dir))
+        .arg("-r")
+        .arg(format!("{}/ref.sylref", dir))
+        .arg("-d")
+        .arg(dir)
+        .assert()
+        .success()
+        .code(0);
+
+    let db = format!("{}/db.syldb", dir);
+    let refdb = format!("{}/ref.sylref", dir);
+    let sample = format!("{}/o157_reads.fastq.gz.sylspr", dir);
+    let intact_len = file_len(&sample);
+
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("query")
+        .arg(&db)
+        .arg(&sample)
+        .arg("--reference")
+        .arg(&refdb)
+        .assert()
+        .success()
+        .code(0);
+
+    // losing only the trailing checksum is still corruption
+    let intact = fs::read(&sample).unwrap();
+    truncate_file(&sample, intact_len - 4);
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("query")
+        .arg(&db)
+        .arg(&sample)
+        .arg("--reference")
+        .arg(&refdb)
+        .assert()
+        .failure();
+
+    // ... as is losing half the file
+    fs::write(&sample, &intact).unwrap();
+    truncate_file(&sample, intact_len / 2);
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("query")
+        .arg(&db)
+        .arg(&sample)
+        .arg("--reference")
+        .arg(&refdb)
+        .assert()
+        .failure();
+
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("ref-compress")
+        .arg("--inspect")
+        .arg(&sample)
+        .assert()
+        .failure();
+}
+
+/// Flip a bit in the byte at `offset`, as bit rot or a bad disk would.
+fn flip_byte(path: &str, offset: u64) {
+    let mut bytes = fs::read(path).unwrap();
+    bytes[offset as usize] ^= 0x01;
+    fs::write(path, &bytes).unwrap();
+}
+
+/// A corrupt *.sylref must be caught by `inspect`. The seekable databases are read
+/// a block at a time, so nothing validates them end to end in normal use; the
+/// whole-file checksum in the header is what `inspect` checks.
+#[serial]
+#[test]
+fn test_corrupt_sylref_is_rejected() {
+    let dir = "./tests/results/corrupt_sylref";
+    let _ = fs::remove_dir_all(dir);
+
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("sketch")
+        .arg("test_files/e.coli-K12.fasta.gz")
+        .arg("test_files/e.coli-o157.fasta.gz")
+        .arg("-o")
+        .arg(format!("{}/db", dir))
+        .arg("-d")
+        .arg(dir)
+        .assert()
+        .success()
+        .code(0);
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("ref-build")
+        .arg(format!("{}/db.syldb", dir))
+        .arg("-o")
+        .arg(format!("{}/ref", dir))
+        .assert()
+        .success()
+        .code(0);
+
+    let refdb = format!("{}/ref.sylref", dir);
+    let intact = fs::read(&refdb).unwrap();
+    let intact_len = intact.len() as u64;
+
+    // the intact reference inspects cleanly, and says so
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("inspect")
+        .arg(&refdb)
+        .assert()
+        .success()
+        .code(0)
+        .stdout(predicate::str::contains("checksum: ok"));
+
+    // a single flipped bit in the body is caught, even though every offset in the
+    // header still points somewhere valid
+    flip_byte(&refdb, intact_len / 2);
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("inspect")
+        .arg(&refdb)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("corrupt"));
+
+    // ... as is a truncated file
+    fs::write(&refdb, &intact).unwrap();
+    truncate_file(&refdb, intact_len / 2);
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("inspect").arg(&refdb).assert().failure();
+}
+
+/// As above for the two-stage genome database: a corrupt *.syl2db must be caught by
+/// `inspect`.
+#[serial]
+#[test]
+fn test_corrupt_syl2db_is_rejected() {
+    let dir = "./tests/results/corrupt_syl2db";
+    let _ = fs::remove_dir_all(dir);
+
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("sketch")
+        .arg("-c")
+        .arg("50")
+        .arg("test_files/e.coli-K12.fasta.gz")
+        .arg("test_files/e.coli-o157.fasta.gz")
+        .arg("-o")
+        .arg(format!("{}/db", dir))
+        .arg("-d")
+        .arg(dir)
+        .assert()
+        .success()
+        .code(0);
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("db-convert")
+        .arg(format!("{}/db.syldb", dir))
+        .arg("--screen-c")
+        .arg("200")
+        .arg("-o")
+        .arg(format!("{}/db2", dir))
+        .assert()
+        .success()
+        .code(0);
+
+    let two = format!("{}/db2.syl2db", dir);
+    let intact = fs::read(&two).unwrap();
+    let intact_len = intact.len() as u64;
+
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("inspect")
+        .arg(&two)
+        .assert()
+        .success()
+        .code(0)
+        .stdout(predicate::str::contains("checksum: ok"));
+
+    flip_byte(&two, intact_len / 2);
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("inspect")
+        .arg(&two)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("corrupt"));
+
+    fs::write(&two, &intact).unwrap();
+    truncate_file(&two, intact_len / 2);
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("inspect").arg(&two).assert().failure();
 }

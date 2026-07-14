@@ -1262,7 +1262,10 @@ fn get_seq_sketch_with_meta(
             });
             let mut read_reader = BufReader::with_capacity(10_000_000, file);
             if crate::compress::peek_is_compressed(&mut read_reader).unwrap_or(false) {
-                crate::compress::read_seq_sketch_compressed_with_meta(&mut read_reader).unwrap_or_else(|_| panic!("The sketch `{}` is not a valid sketch. Perhaps it is an older incompatible version ", read_sketch_file))
+                crate::compress::read_seq_sketch_compressed_with_meta(&mut read_reader)
+                    .unwrap_or_else(|e| {
+                        panic!("The sketch `{}` could not be read: {}", read_sketch_file, e)
+                    })
             } else {
                 // Legacy uncompressed *.sylsp samples carry no recorded read count. Merging
                 // weights each input's read length by its read count, so a legacy sample would

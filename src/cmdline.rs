@@ -642,7 +642,10 @@ pub struct ContainArgs {
 
 #[derive(Args)]
 pub struct InspectArgs {
-    #[clap(multiple = true, help = "Pre-sketched *.syldb/*.sylsp files.")]
+    #[clap(
+        multiple = true,
+        help = "Sketches (*.syldb/*.sylsp, compressed or not) and databases (*.sylref/*.syl2db) to inspect. Every file is checked for corruption: the compressed sketch formats are checksummed by their zstd frame, and the seekable databases carry a whole-file checksum that is verified here."
+    )]
     pub files: Vec<String>,
     #[clap(
         short = 'o',

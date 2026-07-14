@@ -34,13 +34,24 @@
 //! `bincode` file begins with a little-endian length, which could only equal
 //! the `SYLZ` magic at ~1.5 billion entries — impossible for a FracMinHash
 //! sketch — so the two formats never collide.
+//!
+//! ## Integrity
+//!
+//! The zstd frame carries a trailing XXH64 content checksum, so a truncated or
+//! bit-rotted file is detected rather than silently decoded into a corrupt
+//! sketch. zstd only validates that checksum once the frame's epilogue is
+//! reached, which does not happen if the reader stops as soon as it has the
+//! bytes it wants — so every reader here ends with [`finish_frame`], which
+//! drains the decoder to EOF and thereby forces the check.
 
 use crate::types::*;
 use fxhash::FxHashMap;
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 
 const MAGIC: &[u8; 4] = b"SYLZ";
-const VERSION: u8 = 4;
+/// Bumped whenever the payload layout changes. Only this exact version is
+/// readable — older files must be re-sketched.
+const VERSION: u8 = 5;
 const TYPE_GENOME_DB: u8 = 1;
 const TYPE_SEQ_SAMPLE: u8 = 2;
 
@@ -354,7 +365,7 @@ fn write_header<W: Write>(w: &mut W, sketch_type: u8) -> io::Result<()> {
     w.write_all(&[VERSION, sketch_type])
 }
 
-fn read_and_check_header<R: Read>(r: &mut R, expected_type: u8) -> io::Result<u8> {
+fn read_and_check_header<R: Read>(r: &mut R, expected_type: u8) -> io::Result<()> {
     let mut magic = [0u8; 4];
     r.read_exact(&mut magic)?;
     if &magic != MAGIC {
@@ -365,10 +376,13 @@ fn read_and_check_header<R: Read>(r: &mut R, expected_type: u8) -> io::Result<u8
     }
     let mut meta = [0u8; 2];
     r.read_exact(&mut meta)?;
-    if meta[0] < 3 || meta[0] > VERSION {
+    if meta[0] != VERSION {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("unsupported compressed sketch version {}", meta[0]),
+            format!(
+                "compressed sketch is version {}, but only version {} is readable; re-sketch the input",
+                meta[0], VERSION
+            ),
         ));
     }
     if meta[1] != expected_type {
@@ -377,7 +391,37 @@ fn read_and_check_header<R: Read>(r: &mut R, expected_type: u8) -> io::Result<u8
             "compressed sketch is of an unexpected type",
         ));
     }
-    Ok(meta[0])
+    Ok(())
+}
+
+/// Start a zstd frame that carries a trailing content checksum.
+fn frame_encoder<W: Write>(inner: W) -> io::Result<zstd::stream::write::Encoder<'static, W>> {
+    let mut enc = zstd::stream::write::Encoder::new(inner, ZSTD_LEVEL)?;
+    enc.include_checksum(true)?;
+    Ok(enc)
+}
+
+/// Read the decompressor to EOF once the payload has been parsed. zstd verifies
+/// the frame's content checksum (and reports a truncated frame) only when the
+/// epilogue is reached, so a reader that stops at the last byte it needs would
+/// never see either error. Any bytes still to come are corruption in their own
+/// right — the writers emit exactly the fields the readers consume.
+fn finish_frame<R: Read>(mut r: R) -> io::Result<()> {
+    let mut buf = [0u8; 4096];
+    let mut trailing = 0usize;
+    loop {
+        match r.read(&mut buf)? {
+            0 => break,
+            n => trailing += n,
+        }
+    }
+    if trailing > 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{} trailing bytes after the end of the sketch", trailing),
+        ));
+    }
+    Ok(())
 }
 
 fn write_genome_sketch<W: Write>(w: &mut W, s: &GenomeSketch) -> io::Result<()> {
@@ -429,7 +473,7 @@ pub fn write_genome_sketches_compressed<W: Write>(
     sketches: &[GenomeSketch],
 ) -> io::Result<()> {
     write_header(&mut inner, TYPE_GENOME_DB)?;
-    let mut w = BufWriter::new(zstd::stream::write::Encoder::new(inner, ZSTD_LEVEL)?);
+    let mut w = BufWriter::new(frame_encoder(inner)?);
     write_uvarint(&mut w, sketches.len() as u64)?;
     for s in sketches {
         write_genome_sketch(&mut w, s)?;
@@ -449,6 +493,7 @@ pub fn read_genome_sketches_compressed<R: Read>(mut inner: R) -> io::Result<Vec<
     for _ in 0..n {
         out.push(read_genome_sketch(&mut r)?);
     }
+    finish_frame(&mut r)?;
     Ok(out)
 }
 
@@ -465,6 +510,7 @@ pub fn stream_genome_sketches_compressed<R: Read, F: FnMut(GenomeSketch) -> io::
         let s = read_genome_sketch(&mut r)?;
         f(s)?;
     }
+    finish_frame(&mut r)?;
     Ok(n)
 }
 
@@ -480,7 +526,7 @@ pub fn write_seq_sketch_compressed_with_meta<W: Write>(
     meta: ReadSketchMeta,
 ) -> io::Result<()> {
     write_header(&mut inner, TYPE_SEQ_SAMPLE)?;
-    let mut w = BufWriter::new(zstd::stream::write::Encoder::new(inner, ZSTD_LEVEL)?);
+    let mut w = BufWriter::new(frame_encoder(inner)?);
     write_uvarint(&mut w, s.c as u64)?;
     write_uvarint(&mut w, s.k as u64)?;
     write_string(&mut w, &s.file_name)?;
@@ -519,7 +565,7 @@ pub fn read_seq_sketch_compressed<R: Read>(inner: R) -> io::Result<SequencesSket
 pub fn read_seq_sketch_compressed_with_meta<R: Read>(
     mut inner: R,
 ) -> io::Result<(SequencesSketch, ReadSketchMeta)> {
-    let version = read_and_check_header(&mut inner, TYPE_SEQ_SAMPLE)?;
+    read_and_check_header(&mut inner, TYPE_SEQ_SAMPLE)?;
     let mut r = BufReader::with_capacity(1 << 22, zstd::stream::read::Decoder::new(inner)?);
     let c = read_uvarint(&mut r)? as usize;
     let k = read_uvarint(&mut r)? as usize;
@@ -531,12 +577,8 @@ pub fn read_seq_sketch_compressed_with_meta<R: Read>(
     };
     let paired = read_bool(&mut r)?;
     let mean_read_length = read_f64(&mut r)?;
-    let meta = if version >= 4 {
-        ReadSketchMeta {
-            num_reads: read_uvarint(&mut r)?,
-        }
-    } else {
-        ReadSketchMeta::default()
+    let meta = ReadSketchMeta {
+        num_reads: read_uvarint(&mut r)?,
     };
 
     let keys = read_hashes(&mut r)?;
@@ -545,6 +587,7 @@ pub fn read_seq_sketch_compressed_with_meta<R: Read>(
         let count = read_uvarint(&mut r)? as u32;
         kmer_counts.insert(key, count);
     }
+    finish_frame(&mut r)?;
 
     Ok((
         SequencesSketch {

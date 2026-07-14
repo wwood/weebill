@@ -74,6 +74,27 @@ pub struct DatabaseSketch {
     pub genome_files: Vec<GenomeSketchInspect>,
 }
 
+/// Summary of a seekable database (`.sylref` / `.syl2db`), whose stored checksum
+/// `inspect` verifies. The single-frame formats need no such entry: reading one at
+/// all decodes its whole zstd frame, which validates its checksum.
+#[derive(Deserialize, Serialize, Debug, PartialEq)]
+struct SeekableDatabaseInspect {
+    pub database_file: String,
+    pub format: String,
+    pub checksum: String,
+    pub c: usize,
+    pub k: usize,
+    /// The stage-1 (sparse screen) FracMinHash rate.
+    pub stage1_c: usize,
+    pub num_genomes: usize,
+    /// `.sylref` only: size of the shared conserved-k-mer pool.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pool_kmers: Option<usize>,
+    /// `.sylref` only: whether genome sequences are stored (`ref-build --store-genomes`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stores_genome_sequences: Option<bool>,
+}
+
 #[derive(Debug, Default)]
 struct DatabaseVisitor {
     c: Option<usize>,
@@ -121,6 +142,7 @@ pub fn inspect(args: InspectArgs) {
 
     let mut read_sketch_files = Vec::new();
     let mut genome_sketch_files = Vec::new();
+    let mut seekable_db_files = Vec::new();
 
     for file in args.files.iter() {
         let mut genome_sketch_good_suffix = false;
@@ -143,8 +165,13 @@ pub fn inspect(args: InspectArgs) {
             genome_sketch_files.push(file);
         } else if sample_sketch_good_suffix {
             read_sketch_files.push(file);
+        } else if file.ends_with(REF_DB_SUFFIX) || file.ends_with(TWO_STAGE_DB_SUFFIX) {
+            seekable_db_files.push(file);
         } else {
-            warn!("{} file is not a .sylsp or .syldb file. Skipping...", &file);
+            warn!(
+                "{} is not a .sylsp/.syldb, .sylref or .syl2db file. Skipping...",
+                &file
+            );
         }
     }
 
@@ -152,6 +179,15 @@ pub fn inspect(args: InspectArgs) {
         Some(ref x) => Box::new(BufWriter::new(File::create(x).unwrap())) as Box<dyn Write + Send>,
         None => Box::new(BufWriter::new(std::io::stdout())) as Box<dyn Write + Send>,
     };
+
+    let mut seekable_dbs_inspect = Vec::new();
+    for file in seekable_db_files.iter() {
+        seekable_dbs_inspect.push(get_seekable_db_inspect(file));
+    }
+    if !seekable_dbs_inspect.is_empty() {
+        let yaml = serde_yaml::to_string(&seekable_dbs_inspect).unwrap();
+        pipe_write(&yaml, &mut out_writer);
+    }
 
     let mut db_sketches_inspect = Vec::new();
     for file in genome_sketch_files.iter() {
@@ -172,6 +208,49 @@ pub fn inspect(args: InspectArgs) {
     let yaml = serde_yaml::to_string(&seq_sketches_inspect).unwrap();
     if !seq_sketches_inspect.is_empty() {
         pipe_write(&yaml, &mut out_writer);
+    }
+}
+
+/// Open a seekable database, verify the checksum in its header against its actual
+/// contents, and summarise it. A corrupt database is fatal: reporting metadata read
+/// out of a file we know to be damaged would be worse than useless.
+fn get_seekable_db_inspect(path: &String) -> SeekableDatabaseInspect {
+    let fatal = |e: std::io::Error| -> ! {
+        error!("{}: {}", path, e);
+        std::process::exit(1);
+    };
+
+    if path.ends_with(REF_DB_SUFFIX) {
+        let file = File::open(path).unwrap_or_else(|e| fatal(e));
+        let idx = crate::refdelta::open_ref_index_file(file).unwrap_or_else(|e| fatal(e));
+        idx.verify_checksum().unwrap_or_else(|e| fatal(e));
+        info!("Reference database {} verified", path);
+        SeekableDatabaseInspect {
+            database_file: path.clone(),
+            format: REF_DB_SUFFIX.to_string(),
+            checksum: "ok".to_string(),
+            c: idx.c,
+            k: idx.k,
+            stage1_c: idx.sparse_c(),
+            num_genomes: idx.genomes.len(),
+            pool_kmers: Some(idx.pool.len()),
+            stores_genome_sequences: Some(idx.has_genome_seqs()),
+        }
+    } else {
+        let db = crate::twostage_db::open_file(path).unwrap_or_else(|e| fatal(e));
+        db.verify_checksum().unwrap_or_else(|e| fatal(e));
+        info!("Two-stage database {} verified", path);
+        SeekableDatabaseInspect {
+            database_file: path.clone(),
+            format: TWO_STAGE_DB_SUFFIX.to_string(),
+            checksum: "ok".to_string(),
+            c: db.c,
+            k: db.k,
+            stage1_c: db.screen_c,
+            num_genomes: db.len(),
+            pool_kmers: None,
+            stores_genome_sequences: None,
+        }
     }
 }
 

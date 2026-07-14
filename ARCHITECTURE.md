@@ -30,7 +30,8 @@ Start here when reading the code:
 | `refdelta/sketch_decompress.rs` | Decompression of `.sylspr` back to sample sketches | `decompress_seq`, `decompress_seq_with_meta`, `decode_subset` |
 | `twostage_db.rs` | Two-stage seekable genome database (`.syl2db`) | `TwoStageDb`, `run_db_convert` |
 | `merge.rs` | Merge multiple sample sketches into one | `merge` |
-| `inspect.rs` | YAML metadata inspection of sketch files | `inspect` |
+| `checksum.rs` | Whole-file XXH64 checksums for the seekable databases (`.sylref`, `.syl2db`) | `hash_reader`, `HashingWriter` |
+| `inspect.rs` | YAML metadata inspection of sketch files; verifies every format's checksum | `inspect` |
 | `cmdline.rs` | All CLI argument structs (clap derive) | `SketchArgs`, `ContainArgs`, `RefBuildArgs`, `RefCompressArgs`, `DbConvertArgs` |
 | `constants.rs` | File-suffix constants and algorithm defaults | file suffixes (`.syldb`, `.sylsp`, …), `MIN_ANI_DEF`, `DENSE_C_DEFAULT` |
 | `main.rs` | Entry point; dispatches to modules by subcommand | — |

@@ -17,13 +17,13 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 const REFDB_MAGIC: &[u8; 4] = b"SYLR";
-/// v5 adds an optional per-rep-genome 2-bit nucleotide section (`--store-genomes`)
-/// used by error-k-mer encoding. v4 files (no genomes) are still readable.
-const REFDB_VERSION: u8 = 5;
-const REFDB_MIN_VERSION: u8 = 4;
+/// Bumped whenever the layout changes. Only this exact version is readable — an
+/// older reference must be rebuilt with `ref-build`.
+const REFDB_VERSION: u8 = 6;
 
-/// Fixed size of the `.sylref` header: magic (4) + version (1) + footer offset (8).
-const HEADER_LEN: u64 = 13;
+/// Fixed size of the `.sylref` header: magic (4) + version (1) + XXH64 of the rest
+/// of the file (8) + footer offset (8).
+const HEADER_LEN: u64 = 21;
 
 const SPARSE_MIN_HITS: u32 = 1;
 const SPARSE_MPHF_GAMMA: f64 = 2.0;
@@ -520,12 +520,16 @@ pub fn write_refdb<W: Write + Seek>(mut w: W, db: &RefDb, sparse_c: usize) -> io
     // (the sparse/index/pool/dense sections) nor the genome sequences are ever held
     // in RAM in full — important for references over hundreds of thousands of
     // genomes, where the body alone is tens of GB. `pos` tracks the absolute file
-    // offset; a small `buf` is reused to serialize one section at a time. The footer
-    // offset is only known at the end, so the header keeps a placeholder that is
-    // patched once everything is written (needs Seek).
+    // offset; a small `buf` is reused to serialize one section at a time. Neither the
+    // checksum nor the footer offset is known until the end, so the header keeps
+    // placeholders that are patched once everything is written (needs Seek).
     w.write_all(REFDB_MAGIC)?;
     w.write_all(&[REFDB_VERSION])?;
+    w.write_all(&0u64.to_le_bytes())?; // placeholder checksum
     w.write_all(&0u64.to_le_bytes())?; // placeholder footer offset
+                                       // Hashes the body and footer as they stream past, so nothing has to be re-read
+                                       // to checksum the file.
+    let mut w = crate::checksum::HashingWriter::new(w);
     let mut pos = HEADER_LEN;
     let mut buf: Vec<u8> = Vec::new();
 
@@ -648,9 +652,11 @@ pub fn write_refdb<W: Write + Seek>(mut w: W, db: &RefDb, sparse_c: usize) -> io
     let footer_comp = zstd::stream::encode_all(&footer[..], 9)?;
     w.write_all(&footer_comp)?;
 
-    // Patch the header's footer offset now that the genome section length is known.
+    // Patch the header now that the checksum and the footer offset are both known.
+    let (mut w, checksum) = w.finish();
     w.flush()?;
     w.seek(SeekFrom::Start(5))?;
+    w.write_all(&checksum.to_le_bytes())?;
     w.write_all(&footer_offset.to_le_bytes())?;
     w.flush()?;
     Ok(())
@@ -733,6 +739,10 @@ pub struct RefIndex {
     pub k: usize,
     sparse_c: usize,
     pub(crate) fingerprint: u64,
+    /// XXH64 of the file after the header, as recorded when it was written.
+    /// Checked by [`RefIndex::verify_checksum`], not on open: validating it costs a
+    /// full read of a file that queries otherwise only touch a few blocks of.
+    checksum: u64,
     pub genomes: Vec<RefGenomeMeta>,
     /// stage-1: sparse distinctive hash -> owning genome id via MPHF slot arrays.
     sparse_mphf: Mphf<u64>,
@@ -753,6 +763,29 @@ impl RefIndex {
     /// encoding). True if any genome has a non-zero sequence offset.
     pub fn has_genome_seqs(&self) -> bool {
         self.genomes.iter().any(|g| g.seq_offset != 0)
+    }
+
+    /// The stage-1 sparse FracMinHash rate.
+    pub fn sparse_c(&self) -> usize {
+        self.sparse_c
+    }
+
+    /// Re-hash the whole file and compare against the checksum in its header. This
+    /// reads every byte, so it is on-demand (`weebill inspect`) rather than part of
+    /// opening the reference.
+    pub fn verify_checksum(&self) -> io::Result<()> {
+        let got = crate::checksum::hash_reader(BufReader::with_capacity(
+            1 << 20,
+            self.store.cursor(HEADER_LEN),
+        ))?;
+        if got != self.checksum {
+            return Err(crate::checksum::mismatch(
+                "the reference database",
+                self.checksum,
+                got,
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -791,14 +824,17 @@ fn open_ref_index_from_store(store: RefStore, mode: RefOpenMode) -> io::Result<R
             "not a sylph reference DB",
         ));
     }
-    let version = hdr[4];
-    if !(REFDB_MIN_VERSION..=REFDB_VERSION).contains(&version) {
+    if hdr[4] != REFDB_VERSION {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "unsupported reference DB version",
+            format!(
+                "reference DB is version {}, but only version {} is readable; rebuild it with ref-build",
+                hdr[4], REFDB_VERSION
+            ),
         ));
     }
-    let footer_offset = u64::from_le_bytes(hdr[5..13].try_into().unwrap());
+    let checksum = u64::from_le_bytes(hdr[5..13].try_into().unwrap());
+    let footer_offset = u64::from_le_bytes(hdr[13..21].try_into().unwrap());
     if footer_offset > total_len {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -854,14 +890,12 @@ fn open_ref_index_from_store(store: RefStore, mode: RefOpenMode) -> io::Result<R
         });
     }
 
-    // v5: optional per-genome sequence-block offset directory.
-    if version >= 5 {
-        let mut has_seqs = [0u8; 1];
-        f.read_exact(&mut has_seqs)?;
-        if has_seqs[0] != 0 {
-            for g in 0..ng {
-                genomes[g].seq_offset = read_uvarint(&mut f)?;
-            }
+    // Optional per-genome sequence-block offset directory (`--store-genomes`).
+    let mut has_seqs = [0u8; 1];
+    f.read_exact(&mut has_seqs)?;
+    if has_seqs[0] != 0 {
+        for g in 0..ng {
+            genomes[g].seq_offset = read_uvarint(&mut f)?;
         }
     }
 
@@ -884,6 +918,7 @@ fn open_ref_index_from_store(store: RefStore, mode: RefOpenMode) -> io::Result<R
         k,
         sparse_c,
         fingerprint,
+        checksum,
         genomes,
         sparse_mphf,
         sparse_fingerprints,

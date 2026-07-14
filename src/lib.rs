@@ -1,3 +1,4 @@
+pub(crate) mod checksum;
 pub mod cmdline;
 pub mod compress;
 pub mod constants;

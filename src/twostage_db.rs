@@ -17,6 +17,7 @@
 //! ```text
 //! [4]  magic  "SY2D"
 //! [1]  version
+//! [8]  checksum      (XXH64 of everything after the header, u64 LE)
 //! [8]  index_offset  (u64 LE)
 //! [8]  footer_offset (u64 LE)
 //! ---- body ----
@@ -42,6 +43,14 @@
 //! Golomb-Rice-coded block at a known offset. Only the genomes that pass the
 //! stage-1 screen are decoded (and cached across samples) to reconstruct their
 //! exact `GenomeSketch` for the dense profiling pass.
+//!
+//! ## Integrity
+//!
+//! Profiling only ever touches a few blocks of the file, so a corrupt database is
+//! not detected as a side effect of reading it (unlike the single-frame `.sylspc` /
+//! `.sylspr` formats, whose zstd checksum is validated on every decode). The header
+//! instead carries an XXH64 of the rest of the file, checked on demand by
+//! [`TwoStageDb::verify_checksum`] — which `weebill inspect` does.
 
 use crate::cmdline::DbConvertArgs;
 use crate::constants::*;
@@ -50,16 +59,19 @@ use boomphf::Mphf;
 use fxhash::FxHashMap;
 use log::*;
 use std::fs::File;
-use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 const MAGIC: &[u8; 4] = b"SY2D";
 /// Format version (dense Golomb-Rice blocks + pooled-MPHF stage-1 screen index).
-const VERSION: u8 = 2;
-/// magic (4) + version (1) + index offset (8) + footer offset (8)
-const HEADER_LEN: u64 = 21;
+/// Only this exact version is readable — an older database must be rebuilt with
+/// `db-convert`.
+const VERSION: u8 = 3;
+/// magic (4) + version (1) + XXH64 of the rest of the file (8) + index offset (8)
+/// + footer offset (8)
+const HEADER_LEN: u64 = 29;
 /// boomphf construction gamma (space/speed trade-off), matching the ref-delta
 /// sparse index.
 const MPHF_GAMMA: f64 = 2.0;
@@ -587,8 +599,20 @@ pub fn write_two_stage_db<W: Write>(
     let index_offset = HEADER_LEN + body.len() as u64;
     let footer_offset = index_offset + index_block.len() as u64;
 
+    // Everything after the header is checksummed, so `inspect` can detect a
+    // truncated or bit-rotted database that a seeking reader would otherwise decode
+    // into a plausible-looking but wrong sketch.
+    let checksum = {
+        let mut h = crate::checksum::HashingWriter::new(io::sink());
+        h.write_all(&body)?;
+        h.write_all(&index_block)?;
+        h.write_all(&footer_bytes)?;
+        h.finish().1
+    };
+
     w.write_all(MAGIC)?;
     w.write_all(&[VERSION])?;
+    w.write_all(&checksum.to_le_bytes())?;
     w.write_all(&index_offset.to_le_bytes())?;
     w.write_all(&footer_offset.to_le_bytes())?;
     w.write_all(&body)?;
@@ -630,6 +654,10 @@ pub struct TwoStageDb {
     pub c: usize,
     pub k: usize,
     pub screen_c: usize,
+    /// XXH64 of the file after the header, as recorded when it was written. Checked
+    /// by [`TwoStageDb::verify_checksum`], not on open: validating it costs a full
+    /// read of a file that profiling otherwise only touches a few blocks of.
+    checksum: u64,
     /// File offset where the dense-block region ends (start of the screen index);
     /// used to bound the last genome's block for positional reads.
     index_offset: u64,
@@ -641,8 +669,8 @@ pub struct TwoStageDb {
     cache: Mutex<FxHashMap<u32, Arc<GenomeSketch>>>,
 }
 
-/// Parse the magic + version header; return `(index_offset, footer_offset)`.
-fn parse_header(hdr: &[u8]) -> io::Result<(u64, u64)> {
+/// Parse the magic + version header; return `(checksum, index_offset, footer_offset)`.
+fn parse_header(hdr: &[u8]) -> io::Result<(u64, u64, u64)> {
     if hdr.len() < HEADER_LEN as usize || &hdr[0..4] != MAGIC {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -652,17 +680,22 @@ fn parse_header(hdr: &[u8]) -> io::Result<(u64, u64)> {
     if hdr[4] != VERSION {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "unsupported two-stage database version",
+            format!(
+                "two-stage database is version {}, but only version {} is readable; rebuild it with db-convert",
+                hdr[4], VERSION
+            ),
         ));
     }
-    let index_offset = u64::from_le_bytes(hdr[5..13].try_into().unwrap());
-    let footer_offset = u64::from_le_bytes(hdr[13..21].try_into().unwrap());
-    Ok((index_offset, footer_offset))
+    let checksum = u64::from_le_bytes(hdr[5..13].try_into().unwrap());
+    let index_offset = u64::from_le_bytes(hdr[13..21].try_into().unwrap());
+    let footer_offset = u64::from_le_bytes(hdr[21..29].try_into().unwrap());
+    Ok((checksum, index_offset, footer_offset))
 }
 
 /// Assemble a `TwoStageDb` from its parsed footer + screen index + backing store.
 fn build_db(
     footer: Footer,
+    checksum: u64,
     index_offset: u64,
     screen_index: ScreenIndex,
     data: DenseData,
@@ -671,6 +704,7 @@ fn build_db(
         c: footer.c,
         k: footer.k,
         screen_c: footer.screen_c,
+        checksum,
         index_offset,
         genomes: footer.genomes,
         screen_index,
@@ -682,7 +716,7 @@ fn build_db(
 /// Parse the header + index + footer of a `.syl2db` already resident in `data`.
 fn from_bytes(data: DenseData) -> io::Result<TwoStageDb> {
     let bytes = data.bytes();
-    let (index_offset, footer_offset) = parse_header(bytes)?;
+    let (checksum, index_offset, footer_offset) = parse_header(bytes)?;
     if index_offset > footer_offset || footer_offset as usize > bytes.len() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -696,7 +730,7 @@ fn from_bytes(data: DenseData) -> io::Result<TwoStageDb> {
         footer.screen_c,
         footer.k,
     )?;
-    Ok(build_db(footer, index_offset, screen_index, data))
+    Ok(build_db(footer, checksum, index_offset, screen_index, data))
 }
 
 /// Open a `.syl2db` from an in-memory reader (reads it all into memory).
@@ -780,6 +814,28 @@ impl TwoStageDb {
         })
     }
 
+    /// Re-hash the whole file and compare against the checksum in its header. This
+    /// reads every byte, so it is on-demand (`weebill inspect`) rather than part of
+    /// opening the database.
+    pub fn verify_checksum(&self) -> io::Result<()> {
+        let got = match &self.data {
+            DenseData::Owned(v) => crate::checksum::hash_reader(&v[HEADER_LEN as usize..])?,
+            DenseData::File(file) => {
+                let mut r = BufReader::with_capacity(1 << 20, file.try_clone()?);
+                r.seek(SeekFrom::Start(HEADER_LEN))?;
+                crate::checksum::hash_reader(r)?
+            }
+        };
+        if got != self.checksum {
+            return Err(crate::checksum::mismatch(
+                "the two-stage database",
+                self.checksum,
+                got,
+            ));
+        }
+        Ok(())
+    }
+
     /// Decode genome `g`'s full dense `GenomeSketch`, caching it across calls.
     pub fn load_dense(&self, g: u32) -> io::Result<Arc<GenomeSketch>> {
         if let Some(a) = self.cache.lock().unwrap().get(&g) {
@@ -798,7 +854,7 @@ pub fn open_file(path: &str) -> io::Result<TwoStageDb> {
     let file = File::open(path)?;
     let mut hdr = [0u8; HEADER_LEN as usize];
     file.read_exact_at(&mut hdr, 0)?;
-    let (index_offset, footer_offset) = parse_header(&hdr)?;
+    let (checksum, index_offset, footer_offset) = parse_header(&hdr)?;
     let flen = file.metadata()?.len();
     if index_offset > footer_offset || footer_offset > flen {
         return Err(io::Error::new(
@@ -815,6 +871,7 @@ pub fn open_file(path: &str) -> io::Result<TwoStageDb> {
     let screen_index = ScreenIndex::read(&ibytes, footer.screen_c, footer.k)?;
     Ok(build_db(
         footer,
+        checksum,
         index_offset,
         screen_index,
         DenseData::File(file),

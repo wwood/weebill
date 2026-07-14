@@ -63,6 +63,8 @@ pub fn decompress_seq_with_meta<R: Read>(
     idx: &RefIndex,
 ) -> io::Result<(SequencesSketch, ReadSketchMeta)> {
     idx.ensure_can_decompress()?;
+    // Reads the whole frame, so zstd validates its trailing content checksum and
+    // rejects a truncated file here.
     let raw = zstd::stream::decode_all(inner)?;
     let mut r = &raw[..];
     let mut magic = [0u8; 4];
@@ -75,10 +77,13 @@ pub fn decompress_seq_with_meta<R: Read>(
     }
     let mut ver = [0u8; 1];
     r.read_exact(&mut ver)?;
-    if ver[0] == 0 || ver[0] > SKETCH_VERSION {
+    if ver[0] != SKETCH_VERSION {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "unsupported reference-delta version",
+            format!(
+                "reference-delta sketch is version {}, but only version {} is readable; re-run ref-compress",
+                ver[0], SKETCH_VERSION
+            ),
         ));
     }
     let mut fp = [0u8; 8];
@@ -89,9 +94,7 @@ pub fn decompress_seq_with_meta<R: Read>(
             "reference DB does not match the one used to compress this sample",
         ));
     }
-    if ver[0] >= 2 {
-        let _ref_db_name = read_string(&mut r)?;
-    }
+    let _ref_db_name = read_string(&mut r)?;
     let c = read_uvarint(&mut r)? as usize;
     let k = read_uvarint(&mut r)? as usize;
     let file_name = read_string(&mut r)?;
@@ -107,24 +110,14 @@ pub fn decompress_seq_with_meta<R: Read>(
     let mut mrl = [0u8; 8];
     r.read_exact(&mut mrl)?;
     let mean_read_length = f64::from_le_bytes(mrl);
-    let meta = if ver[0] >= 3 {
-        ReadSketchMeta {
-            num_reads: read_uvarint(&mut r)?,
-        }
-    } else {
-        ReadSketchMeta::default()
+    let meta = ReadSketchMeta {
+        num_reads: read_uvarint(&mut r)?,
     };
 
-    if ver[0] >= 2 {
-        for _ in 0..8 {
-            let _ = read_uvarint(&mut r)?;
-        }
-    }
-    if ver[0] >= 4 {
-        // error-entry count and error-section length (header metadata only)
-        for _ in 0..2 {
-            let _ = read_uvarint(&mut r)?;
-        }
+    // Section counts and lengths: header metadata for `--inspect` only, not
+    // needed to decode (the sections are read in order below).
+    for _ in 0..10 {
+        let _ = read_uvarint(&mut r)?;
     }
 
     let mut hashes: Vec<u64> = Vec::new();
@@ -151,47 +144,45 @@ pub fn decompress_seq_with_meta<R: Read>(
 
     // error k-mers: reconstruct each (genome, position, offset, base) entry back
     // to its canonical FracMinHash hash using the stored genome sequence.
-    if ver[0] >= 4 {
-        let n_err_genomes = read_uvarint(&mut r)? as usize;
-        let mut gids = Vec::with_capacity(n_err_genomes);
-        let mut counts_e = Vec::with_capacity(n_err_genomes);
-        let mut gg = 0u64;
-        for _ in 0..n_err_genomes {
-            gg += read_uvarint(&mut r)?;
-            let cnt = read_uvarint(&mut r)? as usize;
-            gids.push(gg as u32);
-            counts_e.push(cnt);
-        }
-        // array 1: per-genome Golomb-Rice position blocks
-        let mut positions: Vec<Vec<u64>> = Vec::with_capacity(n_err_genomes);
-        for _ in 0..n_err_genomes {
-            positions.push(read_hashes(&mut r)?);
-        }
-        let total: usize = counts_e.iter().sum();
-        // array 2: one offset byte per entry
-        let mut offsets = vec![0u8; total];
-        r.read_exact(&mut offsets)?;
-        // array 3: 2-bit-packed replacement bases
-        let mut packed = vec![0u8; total.div_ceil(4)];
-        r.read_exact(&mut packed)?;
+    let n_err_genomes = read_uvarint(&mut r)? as usize;
+    let mut gids = Vec::with_capacity(n_err_genomes);
+    let mut counts_e = Vec::with_capacity(n_err_genomes);
+    let mut gg = 0u64;
+    for _ in 0..n_err_genomes {
+        gg += read_uvarint(&mut r)?;
+        let cnt = read_uvarint(&mut r)? as usize;
+        gids.push(gg as u32);
+        counts_e.push(cnt);
+    }
+    // array 1: per-genome Golomb-Rice position blocks
+    let mut positions: Vec<Vec<u64>> = Vec::with_capacity(n_err_genomes);
+    for _ in 0..n_err_genomes {
+        positions.push(read_hashes(&mut r)?);
+    }
+    let total: usize = counts_e.iter().sum();
+    // array 2: one offset byte per entry
+    let mut offsets = vec![0u8; total];
+    r.read_exact(&mut offsets)?;
+    // array 3: 2-bit-packed replacement bases
+    let mut packed = vec![0u8; total.div_ceil(4)];
+    r.read_exact(&mut packed)?;
 
-        let mut e = 0usize;
-        for gi in 0..n_err_genomes {
-            let seq = idx.load_genome_seq(gids[gi])?.ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "error k-mers reference a genome with no stored sequence",
-                )
-            })?;
-            let cum = seq.cumulative();
-            for &pos in &positions[gi] {
-                let off = offsets[e] as usize;
-                let base = (packed[e / 4] >> (2 * (e % 4))) & 3;
-                let (ci, local) = seq.locate(&cum, pos);
-                let (f, rr) = window_fr(&seq.contigs[ci].1, local, k);
-                hashes.push(substituted_hash(f, rr, k, off, base));
-                e += 1;
-            }
+    let mut e = 0usize;
+    for gi in 0..n_err_genomes {
+        let seq = idx.load_genome_seq(gids[gi])?.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "error k-mers reference a genome with no stored sequence",
+            )
+        })?;
+        let cum = seq.cumulative();
+        for &pos in &positions[gi] {
+            let off = offsets[e] as usize;
+            let base = (packed[e / 4] >> (2 * (e % 4))) & 3;
+            let (ci, local) = seq.locate(&cum, pos);
+            let (f, rr) = window_fr(&seq.contigs[ci].1, local, k);
+            hashes.push(substituted_hash(f, rr, k, off, base));
+            e += 1;
         }
     }
 

@@ -5,6 +5,17 @@ changes made in weebill.
 
 ## Unreleased
 
+### Added
+
+- The zstd frames in `.sylspc`/`.syldbc` and `.sylspr` now carry a trailing content checksum, so truncated or bit-rotted sketches are detected on read instead of decoding into a silently corrupt sketch. Readers drain the frame to its end, which is what forces zstd to validate the checksum.
+- The seekable databases `.sylref` and `.syl2db` now store an XXH64 of the whole file in their header. They are read a block at a time, so nothing validates them end to end in normal use; `weebill inspect` accepts both and verifies the checksum (reporting `checksum: ok`, or failing with a non-zero exit if the file is corrupt).
+
+### Changed
+
+- **Breaking:** the `.sylspc`/`.syldbc` format is now version 5 and `.sylspr` is version 5; older files are refused rather than read. Re-sketch (or re-run `ref-compress`) to upgrade.
+- **Breaking:** `.sylref` is now version 6 and `.syl2db` version 3 (checksum in the header); older files are refused rather than read. Rebuild with `ref-build` / `db-convert` to upgrade.
+- A compressed sample sketch that cannot be read now reports the underlying error (e.g. `Restored data doesn't match checksum`, `incomplete frame`) instead of always blaming an incompatible version.
+
 ## Version 0.1.0
 
 ### Added
