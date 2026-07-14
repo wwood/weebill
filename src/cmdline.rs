@@ -174,6 +174,18 @@ pub struct RefCompressArgs {
     )]
     pub min_dense_kmers_for_error: usize,
     #[clap(
+        long = "min-coverage-for-error",
+        default_value_t = MIN_COVERAGE_FOR_ERROR_DEFAULT,
+        help = "Minimum estimated coverage depth a hit genome must have before it is scanned for single-substitution error k-mers. Scanning a genome costs a pass over its sequence regardless of how deeply it is covered, while the error k-mers recovered scale with depth, so shallow genomes cost the same and pay back almost nothing."
+    )]
+    pub min_coverage_for_error: f64,
+    #[clap(
+        long = "min-error-kmer-shrink",
+        default_value_t = MIN_ERROR_SHRINK_DEFAULT,
+        help = "Minimum fraction (0-1) by which the error-k-mer scan must be predicted to shrink the output before it is run at all. The scan has a fixed cost that scales with the sample's novel k-mers, so on a diverse, shallowly-covered sample (soil) it can spend minutes to take 2% off the file, while on a high-coverage sample (human gut) it takes a fifth off in seconds. Lower it to trade time for space."
+    )]
+    pub min_error_shrink: f64,
+    #[clap(
         long = "no-error-kmer",
         help = "Disable single-substitution error-k-mer encoding during compression. Stops after dense k-mer partitioning and stores remaining hashes as novel k-mers."
     )]
@@ -245,6 +257,20 @@ pub struct SketchArgs {
         help = "Minimum dense exact k-mer hits a hit genome must have before it is scanned for single-substitution error k-mers during --reference compression."
     )]
     pub min_dense_kmers_for_error: usize,
+    #[clap(
+        long = "min-coverage-for-error",
+        default_value_t = MIN_COVERAGE_FOR_ERROR_DEFAULT,
+        help_heading = "OUTPUT",
+        help = "Minimum estimated coverage depth a hit genome must have before it is scanned for single-substitution error k-mers during --reference compression. Scanning a genome costs a pass over its sequence regardless of how deeply it is covered, while the error k-mers recovered scale with depth, so shallow genomes cost the same and pay back almost nothing."
+    )]
+    pub min_coverage_for_error: f64,
+    #[clap(
+        long = "min-error-kmer-shrink",
+        default_value_t = MIN_ERROR_SHRINK_DEFAULT,
+        help_heading = "OUTPUT",
+        help = "Minimum fraction (0-1) by which the error-k-mer scan must be predicted to shrink the output before it is run at all. The scan has a fixed cost that scales with the sample's novel k-mers, so on a diverse, shallowly-covered sample (soil) it can spend minutes to take 2% off the file, while on a high-coverage sample (human gut) it takes a fifth off in seconds. Lower it to trade time for space."
+    )]
+    pub min_error_shrink: f64,
     #[clap(
         long = "no-error-kmer",
         help_heading = "OUTPUT",

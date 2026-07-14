@@ -11,6 +11,17 @@ changes made in weebill.
 - The zstd frames in `.sylspc`/`.syldbc` and `.sylspr` now carry a trailing content checksum, so truncated or bit-rotted sketches are detected on read instead of decoding into a silently corrupt sketch. Readers drain the frame to its end, which is what forces zstd to validate the checksum.
 - The seekable databases `.sylref` and `.syl2db` now store an XXH64 of the whole file in their header. They are read a block at a time, so nothing validates them end to end in normal use; `weebill inspect` accepts both and verifies the checksum (reporting `checksum: ok`, or failing with a non-zero exit if the file is corrupt).
 
+- The error-k-mer scan is now gated on what it is predicted to be worth, by two new options:
+  - `--min-coverage-for-error` (default 0.1x) decides **which genomes** to scan, on their estimated coverage depth. Scanning a genome costs a pass over its sequence per chunk of novel k-mers -- proportional to genome length, flat in depth -- while the k-mers recovered scale with depth x length. The return per unit of work is therefore set by depth alone, and genome size cancels; `--min-dense-kmers-for-error` conflated the two and could not express this.
+  - `--min-error-kmer-shrink` (default 0.10) decides **whether to scan at all**, on the fraction by which the scan is predicted to shrink the output. The scan's fixed cost scales with the sample's novel k-mers, so on a diverse, shallowly covered sample it can spend minutes to take 2% off the file, while on a high-coverage one it takes a fifth off in seconds.
+
+  The prediction combines sequencing errors (which scale with a genome's summed sample counts) and strain SNPs against the reference (which scale with the genome k-mers covered *and* the genome's stage-1 ANI divergence -- soil organisms sit much further from their GTDB representative than human gut strains, and yield far more recodable k-mers per k-mer covered). Calibrated across 18 metagenomes spanning human, marine, soil and bioreactor: the defaults skip 95% of the total scan time to give up a third of the total saving, running the scan on every sample it shrinks by a tenth or more (e.g. human gut, 2.1MB -> 1.6MB in 0.9s) and skipping the rest (e.g. a soil sample that spent 222s to take 1.9% off a 162MB file).
+- `ref-compress --telemetry` reports two new per-genome columns, `coverage_depth` and `expected_error_kmers`, so the thresholds above can be recalibrated against what the scan actually recovers.
+
+### Fixed
+
+- The error-k-mer scan no longer does a minute or more of work when no genome is eligible to be scanned. It built its per-chunk novel-k-mer index and bloom filter before checking that it had any genome sequence to scan them against, so a sample with tens of millions of novel k-mers paid the full setup cost to find nothing (78s on a soil metagenome with 38M novel k-mers and zero eligible genomes).
+
 ### Changed
 
 - **Breaking:** the `.sylspc`/`.syldbc` format is now version 5 and `.sylspr` is version 5; older files are refused rather than read. Re-sketch (or re-run `ref-compress`) to upgrade.

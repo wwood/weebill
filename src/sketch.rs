@@ -496,6 +496,8 @@ pub fn sketch(args: SketchArgs) {
         opts: refdelta::CompressOpts {
             ref_screen_ani: args.ref_screen_ani,
             min_dense_kmers_for_error: args.min_dense_kmers_for_error,
+            min_coverage_for_error: args.min_coverage_for_error,
+            min_error_shrink: args.min_error_shrink,
             enable_error_kmers: !args.no_error_kmer,
             ..refdelta::CompressOpts::default()
         },

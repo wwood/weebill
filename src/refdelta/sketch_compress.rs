@@ -35,6 +35,15 @@ pub struct RefCompressTelemetry {
     pub sparse_total: u32,
     pub sparse_ani: f64,
     pub assigned_kmers: usize,
+    /// Estimated mean coverage depth of this genome in the sample: the sample counts assigned
+    /// to it over its whole distinctive dense domain.
+    pub coverage_depth: f64,
+    /// Novel k-mers this genome was predicted to let the scan recode, from the sample counts
+    /// assigned to it (sequencing errors) and the distinct genome k-mers it covers (strain
+    /// SNPs). Compare against `error_kmers` to see what the scan actually recovered; genomes
+    /// below the coverage threshold are never scanned, so they carry a prediction with an
+    /// `error_kmers` of 0.
+    pub expected_error_kmers: f64,
     pub error_kmers: usize,
 }
 
@@ -230,6 +239,14 @@ fn find_error_kmers(
         Ok(())
     })?;
 
+    // With nothing to scan against, the per-chunk index and bloom below would be built and
+    // thrown away: on a sample with tens of millions of novel k-mers that is a minute-plus of
+    // pure waste. Bail out before paying for it. Genomes drop out here (not just via the
+    // caller's k-mer threshold) when they are non-representative or carry no stored sequence.
+    if genome_seqs.is_empty() {
+        return Ok((by_genome, consumed));
+    }
+
     // Phase 2 (CPU): scan in chunks of NOVEL_CHUNK novel k-mers.
     let mut per_genome_matches: FxHashMap<u32, Vec<(u64, ErrorEntry)>> = FxHashMap::default();
 
@@ -417,6 +434,13 @@ pub struct CompressOpts {
     /// Minimum assigned dense k-mers a genome needs before it is scanned for
     /// single-substitution error k-mers.
     pub min_dense_kmers_for_error: usize,
+    /// Minimum estimated coverage depth a genome needs before it is scanned for
+    /// single-substitution error k-mers. This is the gate that matters for per-genome cost:
+    /// see [`MIN_COVERAGE_FOR_ERROR_DEFAULT`].
+    pub min_coverage_for_error: f64,
+    /// Minimum fraction by which the scan must be predicted to shrink the output before it is
+    /// run at all: see [`MIN_ERROR_SHRINK_DEFAULT`].
+    pub min_error_shrink: f64,
     /// Whether to reclassify novel hashes as single-substitution error k-mers.
     pub enable_error_kmers: bool,
 }
@@ -427,6 +451,8 @@ impl Default for CompressOpts {
             meta: ReadSketchMeta::default(),
             ref_screen_ani: REF_SCREEN_ANI_DEFAULT,
             min_dense_kmers_for_error: MIN_DENSE_KMERS_FOR_ERROR_DEFAULT,
+            min_coverage_for_error: MIN_COVERAGE_FOR_ERROR_DEFAULT,
+            min_error_shrink: MIN_ERROR_SHRINK_DEFAULT,
             enable_error_kmers: true,
         }
     }
@@ -479,6 +505,8 @@ pub fn compress_seq_with_opts<W: Write>(
         meta,
         ref_screen_ani,
         min_dense_kmers_for_error,
+        min_coverage_for_error,
+        min_error_shrink,
         enable_error_kmers,
     } = opts;
 
@@ -509,13 +537,18 @@ pub fn compress_seq_with_opts<W: Write>(
 
     let assign_start = Instant::now();
     let mut per_genome: FxHashMap<u32, Vec<u64>> = FxHashMap::default();
+    // Sum of the sample's k-mer counts over the k-mers assigned to each genome. For a genome
+    // at mean depth lambda this sums to about lambda * genome_length / c, which is what makes
+    // `coverage_depth` below a depth estimate and the error-k-mer yield predictable.
+    let mut per_genome_count: FxHashMap<u32, u64> = FxHashMap::default();
     let mut pool_hits: Vec<u64> = Vec::new();
     let mut novel: Vec<u64> = Vec::new();
-    for &h in sketch.kmer_counts.keys() {
+    for (&h, &count) in sketch.kmer_counts.iter() {
         if let Some(pidx) = idx.pool_index(h) {
             pool_hits.push(pidx as u64);
         } else if let Some(&(g, i)) = map.get(&h) {
             per_genome.entry(g).or_default().push(i as u64);
+            *per_genome_count.entry(g).or_default() += count as u64;
         } else {
             novel.push(h);
         }
@@ -530,18 +563,87 @@ pub fn compress_seq_with_opts<W: Write>(
     drop(map);
     novel.shrink_to_fit();
 
+    // Per hit genome: its estimated coverage depth (lambda), and the novel k-mers scanning it
+    // should let us recode. Both fall out of stage 3 for free.
+    //
+    // Depth is the counts assigned to the genome spread over its *whole* distinctive dense
+    // domain, not just the part the sample hit, so a genome seen thinly across a few positions
+    // reads as the shallow genome it is instead of looking like depth ~1.
+    //
+    // The yield has two sources the single-substitution scan cannot tell apart. Sequencing
+    // errors scale with the observations drawn from the genome (its summed counts). Strain SNPs
+    // against the reference scale with the distinct genome k-mers covered *and* with how far
+    // the sampled strain has diverged from that reference: at a differing base, each of the k
+    // read k-mers spanning it is a single substitution from the reference, so `k * divergence`
+    // of them recode per covered k-mer. Divergence comes free from the stage-1 screen as
+    // 1 - ANI, and using it instead of a fixed coefficient is what makes the prediction hold
+    // across biomes -- soil organisms sit far further from their GTDB representative than human
+    // gut strains do, and yield correspondingly more recodable k-mers per k-mer covered.
+    let error_stats: FxHashMap<u32, (f64, f64)> = hit_counts
+        .iter()
+        .map(|&(g, sparse_hits)| {
+            let observations = per_genome_count.get(&g).copied().unwrap_or(0) as f64;
+            let covered = per_genome.get(&g).map(|v| v.len()).unwrap_or(0) as f64;
+            let gmeta = &idx.genomes[g as usize];
+            let domain = gmeta.dense_domain as f64;
+            let depth = if domain > 0. {
+                observations / domain
+            } else {
+                0.
+            };
+            let divergence = (1. - sparse_naive_ani(sparse_hits, gmeta.sparse_count, idx.k) / 100.)
+                .clamp(0., 1.);
+            let expected = ERROR_YIELD_CALIBRATION
+                * (ERROR_YIELD_PER_OBSERVATION * observations
+                    + idx.k as f64 * divergence * covered);
+            (g, (depth, expected))
+        })
+        .collect();
+
+    // A genome earns its scan on depth, not on how many k-mers it was assigned. Scanning costs
+    // one pass over its sequence per novel chunk -- proportional to genome length, flat in
+    // depth -- while the yield above goes as depth x length. So the return per unit of work is
+    // a function of depth alone, and genome size cancels. `min_dense_kmers_for_error` remains
+    // as a floor against genomes whose depth estimate rests on almost no evidence.
+    let error_hits: Vec<u32> = hits
+        .iter()
+        .copied()
+        .filter(|&g| {
+            per_genome.get(&g).map(|v| v.len()).unwrap_or(0) >= min_dense_kmers_for_error
+                && error_stats[&g].0 >= min_coverage_for_error
+        })
+        .collect();
+
+    // What the whole scan is predicted to buy, as a fraction of the output size. The scan's
+    // fixed cost scales with the novel set it has to index, so what decides whether to run it
+    // is the *share* of those novel k-mers it can recode -- and the output shrinks in
+    // proportion to that share. A human gut sample recodes nearly half its novel k-mers and
+    // comes out a fifth smaller; a soil sample recodes a few percent of a novel set 100x
+    // larger, and comes out 2% smaller after minutes of scanning.
+    let predicted_yield: f64 = error_hits.iter().map(|&g| error_stats[&g].1).sum();
+    let predicted_shrink = if novel.is_empty() {
+        0.
+    } else {
+        SHRINK_PER_RECODED_SHARE * predicted_yield / novel.len() as f64
+    };
+
     let error_start = Instant::now();
     let error_by_genome = if enable_error_kmers && idx.has_genome_seqs() && !novel.is_empty() {
-        let error_hits: Vec<u32> = hits
-            .iter()
-            .copied()
-            .filter(|g| {
-                per_genome.get(g).map(|v| v.len()).unwrap_or(0) >= min_dense_kmers_for_error
-            })
-            .collect();
         let n_novel_chunks = novel.len().div_ceil(NOVEL_CHUNK);
         let work_pairs = n_novel_chunks.saturating_mul(error_hits.len());
-        if work_pairs > MAX_ERROR_SCAN_PAIRS {
+        if predicted_shrink < min_error_shrink {
+            info!(
+                "ref-compress stage4 skip: {} eligible genomes predict only {:.0} recodable k-mers \
+                 of {} novel, shrinking the output by {:.1}% (below {:.1}%); error-kmer scan not \
+                 worth its fixed cost",
+                error_hits.len(),
+                predicted_yield,
+                novel.len(),
+                100. * predicted_shrink,
+                100. * min_error_shrink
+            );
+            Vec::new()
+        } else if work_pairs > MAX_ERROR_SCAN_PAIRS {
             info!(
                 "ref-compress stage4 skip: {} novel chunks × {} eligible genomes = {} pairs \
                  exceeds limit {}; error-kmer scan skipped",
@@ -566,11 +668,11 @@ pub fn compress_seq_with_opts<W: Write>(
         Vec::new()
     };
     info!(
-        "ref-compress stage4 error-kmer scan: {} eligible genomes, {} error genomes, {} error kmers in {:.3}s",
-        hits
-            .iter()
-            .filter(|g| per_genome.get(g).map(|v| v.len()).unwrap_or(0) >= min_dense_kmers_for_error)
-            .count(),
+        "ref-compress stage4 error-kmer scan: {} eligible genomes (of {} hit; >= {} assigned kmers and >= {}x coverage), {} error genomes, {} error kmers in {:.3}s",
+        error_hits.len(),
+        hits.len(),
+        min_dense_kmers_for_error,
+        min_coverage_for_error,
         error_by_genome.len(),
         error_by_genome.iter().map(|(_, v)| v.len()).sum::<usize>(),
         error_start.elapsed().as_secs_f64()
@@ -688,6 +790,8 @@ pub fn compress_seq_with_opts<W: Write>(
                 sparse_total: gmeta.sparse_count,
                 sparse_ani: sparse_naive_ani(sparse_hits, gmeta.sparse_count, idx.k),
                 assigned_kmers: per_genome.get(&g).map(|v| v.len()).unwrap_or(0),
+                coverage_depth: error_stats.get(&g).map(|s| s.0).unwrap_or(0.),
+                expected_error_kmers: error_stats.get(&g).map(|s| s.1).unwrap_or(0.),
                 error_kmers: *error_counts.get(&g).unwrap_or(&0),
             }
         })
@@ -1019,7 +1123,7 @@ fn telemetry_field(s: &str) -> String {
 fn write_telemetry_header<W: Write>(w: &mut W) -> io::Result<()> {
     writeln!(
         w,
-        "sample\tref_db\tref_screen_ani\thit_genomes_total\tgenome_id\tgenome_file\tspecies\tsparse_hits\tsparse_total\tsparse_ani\tassigned_kmers\terror_kmers"
+        "sample\tref_db\tref_screen_ani\thit_genomes_total\tgenome_id\tgenome_file\tspecies\tsparse_hits\tsparse_total\tsparse_ani\tassigned_kmers\tcoverage_depth\texpected_error_kmers\terror_kmers"
     )
 }
 
@@ -1027,7 +1131,7 @@ fn write_telemetry_rows<W: Write>(w: &mut W, rows: &[RefCompressTelemetry]) -> i
     for row in rows {
         writeln!(
             w,
-            "{}\t{}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.6}\t{}\t{}",
+            "{}\t{}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.6}\t{}\t{:.3}\t{:.1}\t{}",
             telemetry_field(&row.sample_name),
             telemetry_field(&row.ref_db_name),
             row.ref_screen_ani,
@@ -1039,6 +1143,8 @@ fn write_telemetry_rows<W: Write>(w: &mut W, rows: &[RefCompressTelemetry]) -> i
             row.sparse_total,
             row.sparse_ani,
             row.assigned_kmers,
+            row.coverage_depth,
+            row.expected_error_kmers,
             row.error_kmers
         )?;
     }
@@ -1147,6 +1253,8 @@ pub fn run_ref_compress(args: RefCompressArgs) {
                     meta: ReadSketchMeta::default(),
                     ref_screen_ani: args.ref_screen_ani,
                     min_dense_kmers_for_error: args.min_dense_kmers_for_error,
+                    min_coverage_for_error: args.min_coverage_for_error,
+                    min_error_shrink: args.min_error_shrink,
                     enable_error_kmers: !args.no_error_kmer,
                 },
             )

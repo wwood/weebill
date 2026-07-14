@@ -817,14 +817,25 @@ fn test_sketch_reference_compression_options() {
     let no_error_len = sketch_with("no_error", &["--min-dense-kmers-for-error", "100000000"]);
     let strict_screen_len = sketch_with("strict_screen", &["--ref-screen-ani", "99.9"]);
     let no_error_kmer_len = sketch_with("no_error_kmer", &["--no-error-kmer"]);
+    // An unreachable coverage bar (no genome is sequenced 1000x deep here) and an unreachable
+    // shrink bar (the scan can never take 99% off the file) each suppress the scan too.
+    let no_coverage_len = sketch_with("no_coverage", &["--min-coverage-for-error", "1000"]);
+    let no_yield_len = sketch_with("no_yield", &["--min-error-kmer-shrink", "0.99"]);
 
-    // --no-error-kmer and an unreachable --min-dense-kmers-for-error both suppress error-k-mer
-    // recoding, by different routes, so they must land on the same bytes.
-    assert_eq!(
-        no_error_kmer_len, no_error_len,
-        "--no-error-kmer gave {} bytes, but suppressing error k-mers via the dense threshold gave {}",
-        no_error_kmer_len, no_error_len
-    );
+    // --no-error-kmer, an unreachable --min-dense-kmers-for-error, an unreachable
+    // --min-coverage-for-error and an unreachable --min-error-kmer-shrink all suppress error-k-mer
+    // recoding, by four different routes, so they must all land on the same bytes.
+    for (name, len) in [
+        ("--no-error-kmer", no_error_kmer_len),
+        ("--min-coverage-for-error", no_coverage_len),
+        ("--min-error-kmer-shrink", no_yield_len),
+    ] {
+        assert_eq!(
+            len, no_error_len,
+            "suppressing the scan with {} gave {} bytes, but suppressing it via the dense-k-mer threshold gave {}",
+            name, len, no_error_len
+        );
+    }
     assert!(
         no_error_len > default_len,
         "--min-dense-kmers-for-error was ignored: suppressing error-k-mer recoding gave {} bytes, same or less than the default {}",
@@ -857,7 +868,14 @@ fn test_sketch_reference_compression_options() {
     let orig = str::from_utf8(&orig.stdout).expect("Output was not valid UTF-8");
     assert!(orig.contains("e.coli-o157.fasta.gz"));
 
-    for subdir in ["default", "no_error", "strict_screen", "no_error_kmer"] {
+    for subdir in [
+        "default",
+        "no_error",
+        "strict_screen",
+        "no_error_kmer",
+        "no_coverage",
+        "no_yield",
+    ] {
         let mut cmd = Command::cargo_bin("weebill").unwrap();
         let from_ref = cmd
             .arg("query")
