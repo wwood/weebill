@@ -33,6 +33,25 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 type Marker = u32;
 
+/// Everything the `--reference` output path needs: the loaded index, the reference DB
+/// path recorded inside each `*.sylspr`, and the compression tunables from the command
+/// line. `opts.meta` is a placeholder here; each sketch supplies its own via
+/// [`RefTarget::opts_with_meta`].
+struct RefTarget<'a> {
+    idx: &'a refdelta::RefIndex,
+    db_name: &'a str,
+    opts: refdelta::CompressOpts,
+}
+
+impl RefTarget<'_> {
+    fn opts_with_meta(&self, meta: ReadSketchMeta) -> refdelta::CompressOpts {
+        refdelta::CompressOpts {
+            meta,
+            ..self.opts.clone()
+        }
+    }
+}
+
 /// Write a single read (sample) sketch to disk, in either the legacy `bincode`
 /// format or, when a `--compressed-database` directory is given, the compressed
 /// format.
@@ -43,10 +62,9 @@ fn write_read_sketch_file(
     paired: bool,
     sample_output_dir: &str,
     compressed_sample_output_dir: &Option<String>,
-    ref_index: Option<&refdelta::RefIndex>,
-    ref_db_name: Option<&str>,
+    ref_target: Option<&RefTarget>,
 ) {
-    let (dir, output_kind) = if ref_index.is_some() {
+    let (dir, output_kind) = if ref_target.is_some() {
         (sample_output_dir, REF_SAMPLE_SUFFIX)
     } else {
         match compressed_sample_output_dir {
@@ -67,13 +85,13 @@ fn write_read_sketch_file(
         File::create(&file_path_str)
             .unwrap_or_else(|_| panic!("{} path not valid; exiting ", file_path_str)),
     );
-    if let Some(idx) = ref_index {
-        refdelta::compress_seq_with_meta(
+    if let Some(target) = ref_target {
+        refdelta::compress_seq_with_opts(
             &mut read_sk_file,
             read_sketch,
-            idx,
-            ref_db_name.unwrap_or(""),
-            meta,
+            target.idx,
+            target.db_name,
+            target.opts_with_meta(meta),
         )
         .unwrap_or_else(|_| {
             panic!(
@@ -147,8 +165,7 @@ fn write_single_merged_sketch(
     out_kind: &'static str,
     merged: &SequencesSketch,
     meta: ReadSketchMeta,
-    ref_index: Option<&refdelta::RefIndex>,
-    ref_db_name: Option<&str>,
+    ref_target: Option<&RefTarget>,
 ) {
     if let Some(parent) = Path::new(out_path).parent() {
         if !parent.as_os_str().is_empty() {
@@ -161,13 +178,13 @@ fn write_single_merged_sketch(
     );
     match out_kind {
         REF_SAMPLE_SUFFIX => {
-            let idx = ref_index.expect("reference index must be loaded for *.sylspr output");
-            refdelta::compress_seq_with_meta(
+            let target = ref_target.expect("reference index must be loaded for *.sylspr output");
+            refdelta::compress_seq_with_opts(
                 &mut writer,
                 merged,
-                idx,
-                ref_db_name.unwrap_or(""),
-                meta,
+                target.idx,
+                target.db_name,
+                target.opts_with_meta(meta),
             )
             .unwrap_or_else(|e| panic!("Could not write reference-compressed output: {}", e));
         }
@@ -473,6 +490,16 @@ pub fn sketch(args: SketchArgs) {
         refdelta::open_ref_index_file_for_compress(file)
             .unwrap_or_else(|e| panic!("{} is not a valid reference DB: {}", path, e))
     });
+    let ref_target = ref_index.as_ref().map(|idx| RefTarget {
+        idx,
+        db_name: args.reference.as_deref().unwrap(),
+        opts: refdelta::CompressOpts {
+            ref_screen_ani: args.ref_screen_ani,
+            min_dense_kmers_for_error: args.min_dense_kmers_for_error,
+            enable_error_kmers: !args.no_error_kmer,
+            ..refdelta::CompressOpts::default()
+        },
+    });
 
     // In --merge mode all read inputs collapse into one sketch, so per-input sample
     // names don't apply; the first supplied name (if any) names the merged sample.
@@ -612,8 +639,7 @@ pub fn sketch(args: SketchArgs) {
                             true,
                             &args.sample_output_dir,
                             &args.compressed_sample_output_dir,
-                            ref_index.as_ref(),
-                            args.reference.as_deref(),
+                            ref_target.as_ref(),
                         );
                     }
                 });
@@ -665,8 +691,7 @@ pub fn sketch(args: SketchArgs) {
                             true,
                             &args.sample_output_dir,
                             &args.compressed_sample_output_dir,
-                            ref_index.as_ref(),
-                            args.reference.as_deref(),
+                            ref_target.as_ref(),
                         );
                     } else if args.merge {
                         merge_failed_inputs
@@ -747,8 +772,7 @@ pub fn sketch(args: SketchArgs) {
                         false,
                         &args.sample_output_dir,
                         &args.compressed_sample_output_dir,
-                        ref_index.as_ref(),
-                        args.reference.as_deref(),
+                        ref_target.as_ref(),
                     );
                 }
             });
@@ -792,14 +816,7 @@ pub fn sketch(args: SketchArgs) {
         } else {
             merge_sketches(&sketches, merged_sample_name.clone())
         };
-        write_single_merged_sketch(
-            &out_path,
-            out_kind,
-            &merged,
-            meta,
-            ref_index.as_ref(),
-            args.reference.as_deref(),
-        );
+        write_single_merged_sketch(&out_path, out_kind, &merged, meta, ref_target.as_ref());
         info!(
             "Merged all read inputs into '{}' ({} distinct k-mers, {} reads recorded).",
             out_path,

@@ -232,6 +232,26 @@ pub struct SketchArgs {
     )]
     pub reference: Option<String>,
     #[clap(
+        long = "ref-screen-ani",
+        default_value_t = REF_SCREEN_ANI_DEFAULT,
+        help_heading = "OUTPUT",
+        help = "Minimum sparse-stage naive ANI (0-100) for a reference genome to be decoded during --reference compression. Lower values improve compression for distant/low-signal samples at higher CPU cost."
+    )]
+    pub ref_screen_ani: f64,
+    #[clap(
+        long = "min-dense-kmers-for-error",
+        default_value_t = MIN_DENSE_KMERS_FOR_ERROR_DEFAULT,
+        help_heading = "OUTPUT",
+        help = "Minimum dense exact k-mer hits a hit genome must have before it is scanned for single-substitution error k-mers during --reference compression."
+    )]
+    pub min_dense_kmers_for_error: usize,
+    #[clap(
+        long = "no-error-kmer",
+        help_heading = "OUTPUT",
+        help = "Disable single-substitution error-k-mer encoding during --reference compression. Stops after dense k-mer partitioning and stores remaining hashes as novel k-mers."
+    )]
+    pub no_error_kmer: bool,
+    #[clap(
         short,
         long = "individual-records",
         help_heading = "GENOME INPUT",

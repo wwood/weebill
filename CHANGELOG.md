@@ -7,6 +7,7 @@ changes made in weebill.
 
 ### Added
 
+- `sketch --reference` now takes `--ref-screen-ani`, `--min-dense-kmers-for-error` and `--no-error-kmer`, the reference-delta compression tunables that were previously only settable on `ref-compress`. Sketching straight to `.sylspr` used the built-in defaults with no way to change them.
 - The zstd frames in `.sylspc`/`.syldbc` and `.sylspr` now carry a trailing content checksum, so truncated or bit-rotted sketches are detected on read instead of decoding into a silently corrupt sketch. Readers drain the frame to its end, which is what forces zstd to validate the checksum.
 - The seekable databases `.sylref` and `.syl2db` now store an XXH64 of the whole file in their header. They are read a block at a time, so nothing validates them end to end in normal use; `weebill inspect` accepts both and verifies the checksum (reporting `checksum: ok`, or failing with a non-zero exit if the file is corrupt).
 

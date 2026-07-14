@@ -759,6 +759,130 @@ fn test_refdelta_query_with_reference() {
         .failure();
 }
 
+/// `sketch --reference` accepts the same compression tunables as `ref-compress`, and they
+/// change only how tightly the sample is packed: --no-error-kmer (or an unreachable
+/// --min-dense-kmers-for-error) suppresses error-k-mer recoding (a bigger file), a near-100
+/// --ref-screen-ani decodes fewer reference genomes (bigger still), and every setting still
+/// round-trips losslessly.
+#[serial]
+#[test]
+fn test_sketch_reference_compression_options() {
+    fresh();
+    let dir = "./tests/results/test_sketch_dir";
+
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("sketch")
+        .arg("test_files/e.coli-K12.fasta.gz")
+        .arg("test_files/e.coli-o157.fasta.gz")
+        .arg("-o")
+        .arg(format!("{}/db", dir))
+        .arg("-d")
+        .arg(dir)
+        .assert()
+        .success()
+        .code(0);
+    // --store-genomes: error-k-mer encoding (and so --min-dense-kmers-for-error) only has
+    // anything to do when the reference carries the genome sequences.
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("ref-build")
+        .arg(format!("{}/db.syldb", dir))
+        .arg("--store-genomes")
+        .arg("-o")
+        .arg(format!("{}/ref", dir))
+        .assert()
+        .success()
+        .code(0);
+    let refdb = format!("{}/ref.sylref", dir);
+
+    // sketch the reads straight to *.sylspr under three settings of the new flags
+    let sketch_with = |subdir: &str, flags: &[&str]| -> u64 {
+        let out = format!("{}/{}", dir, subdir);
+        let mut cmd = Command::cargo_bin("weebill").unwrap();
+        cmd.arg("sketch")
+            .arg("test_files/o157_reads.fastq.gz")
+            .arg("--reference")
+            .arg(&refdb)
+            .arg("-d")
+            .arg(&out)
+            .args(flags)
+            .assert()
+            .success()
+            .code(0);
+        let sample = format!("{}/o157_reads.fastq.gz.sylspr", out);
+        fs::metadata(&sample)
+            .unwrap_or_else(|_| panic!("sketch --reference did not produce {}", sample))
+            .len()
+    };
+    let default_len = sketch_with("default", &[]);
+    let no_error_len = sketch_with("no_error", &["--min-dense-kmers-for-error", "100000000"]);
+    let strict_screen_len = sketch_with("strict_screen", &["--ref-screen-ani", "99.9"]);
+    let no_error_kmer_len = sketch_with("no_error_kmer", &["--no-error-kmer"]);
+
+    // --no-error-kmer and an unreachable --min-dense-kmers-for-error both suppress error-k-mer
+    // recoding, by different routes, so they must land on the same bytes.
+    assert_eq!(
+        no_error_kmer_len, no_error_len,
+        "--no-error-kmer gave {} bytes, but suppressing error k-mers via the dense threshold gave {}",
+        no_error_kmer_len, no_error_len
+    );
+    assert!(
+        no_error_len > default_len,
+        "--min-dense-kmers-for-error was ignored: suppressing error-k-mer recoding gave {} bytes, same or less than the default {}",
+        no_error_len,
+        default_len
+    );
+    assert!(
+        strict_screen_len > default_len,
+        "--ref-screen-ani was ignored: screening out reference genomes gave {} bytes, same or less than the default {}",
+        strict_screen_len,
+        default_len
+    );
+
+    // whatever the settings, the sketch still decodes to the same thing
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("sketch")
+        .arg("test_files/o157_reads.fastq.gz")
+        .arg("-d")
+        .arg(dir)
+        .assert()
+        .success()
+        .code(0);
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    let orig = cmd
+        .arg("query")
+        .arg(format!("{}/db.syldb", dir))
+        .arg(format!("{}/o157_reads.fastq.gz.sylsp", dir))
+        .output()
+        .expect("Output failed");
+    let orig = str::from_utf8(&orig.stdout).expect("Output was not valid UTF-8");
+    assert!(orig.contains("e.coli-o157.fasta.gz"));
+
+    for subdir in ["default", "no_error", "strict_screen", "no_error_kmer"] {
+        let mut cmd = Command::cargo_bin("weebill").unwrap();
+        let from_ref = cmd
+            .arg("query")
+            .arg(format!("{}/db.syldb", dir))
+            .arg(format!("{}/{}/o157_reads.fastq.gz.sylspr", dir, subdir))
+            .arg("--reference")
+            .arg(&refdb)
+            .output()
+            .expect("Output failed");
+        let from_ref = str::from_utf8(&from_ref.stdout).expect("Output was not valid UTF-8");
+        // the sample path differs between the .sylsp and .sylspr runs; the rest must not
+        let strip = |s: &str| {
+            s.replace(&format!("{}/", subdir), "")
+                .replace(".sylspr", "")
+                .replace(".sylsp", "")
+        };
+        assert_eq!(
+            strip(orig),
+            strip(from_ref),
+            "sketch --reference ({}) did not round-trip to the same query result",
+            subdir
+        );
+    }
+}
+
 #[serial]
 #[test]
 fn test_two_stage_profile() {
