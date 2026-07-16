@@ -13,7 +13,7 @@ Weebill is currently in development and is experimental. Efforts are made to con
 
 - [Installation](#installation)
 - [Usage examples](#usage-examples)
-  - [From reads to a profile (standard compressed sketches)](#from-reads-to-a-profile-standard-compressed-sketches)
+  - [From reads to a profile (two-stage)](#from-reads-to-a-profile-two-stage)
   - [Pooling samples with `profile --merge`](#pooling-samples-with-profile---merge)
   - [Reference-delta samples with `profile --reference`](#reference-delta-samples-with-profile---reference)
 - [Changes in the weebill fork](#changes-in-the-weebill-fork)
@@ -54,29 +54,34 @@ Weebill has a two-step model: **sketch** sequences into compact indexes, then **
 The examples below assume `weebill` is on your `PATH`; add `-t <threads>` to any command to
 parallelise.
 
-### From reads to a profile (standard compressed sketches)
+### From reads to a profile (two-stage)
 
-This is the recommended everyday workflow — sketch once into the compressed formats, then
-profile. Compressed sketches are smaller on disk and are read transparently by `profile`,
-`query`, and `inspect`.
+This is the recommended everyday workflow. Sketch the genomes once, convert the database into a
+two-stage seekable database (`.syl2db`), sketch your reads into compressed sample sketches, then
+profile with `--two-stage` — which is much faster and uses far less RAM than a standard profile
+(see [Changes in the weebill fork](#changes-in-the-weebill-fork)).
 
 ```sh
-# 1. Sketch a genome database once into a compressed database (-> gtdb.syldbc)
-weebill sketch -g genomes/*.fa --compressed-output gtdb
+# 1. Sketch a genome database (standard .syldb; db-convert reads this format)
+weebill sketch -g genomes/*.fa -o gtdb
 
-# 2. Sketch metagenome reads into compressed sample sketches (-> sketches/*.sylspc)
+# 2. Convert it into a two-stage seekable database (-> gtdb.syl2db)
+weebill db-convert gtdb.syldb -o gtdb
+
+# 3. Sketch metagenome reads into compressed sample sketches (-> sketches/*.sylspc)
 #    single-end (one .sylspc per input file):
 weebill sketch -r sampleA.fastq.gz -r sampleB.fastq.gz --compressed-database sketches/
 #    paired-end:
 weebill sketch -1 sampleA_1.fq.gz -2 sampleA_2.fq.gz --compressed-database sketches/
 
-# 3. Taxonomic profile: relative abundance + ANI per detected species (TSV to stdout)
-weebill profile gtdb.syldbc sketches/*.sylspc > profile.tsv
+# 4. Two-stage taxonomic profile: relative abundance + ANI per detected species (TSV to stdout)
+weebill profile --two-stage gtdb.syl2db sketches/*.sylspc > profile.tsv
 ```
 
-`profile` also accepts raw fastq/fasta directly and will sketch them on the fly, e.g.
-`weebill profile gtdb.syldbc -r sampleA.fastq.gz`. Swap `profile` for `query` to get
-nearest-neighbour containment ANI instead of a profile.
+Compressed sample sketches are smaller on disk and are read transparently by `profile`,
+`query`, and `inspect`. `profile` also accepts raw fastq/fasta directly and will sketch them on
+the fly, e.g. `weebill profile --two-stage gtdb.syl2db -r sampleA.fastq.gz`. Swap `profile` for
+`query` (against `gtdb.syldb`) to get nearest-neighbour containment ANI instead of a profile.
 
 ### Pooling samples with `profile --merge`
 
@@ -86,7 +91,7 @@ each input separately. Handy for co-assemblies or for pooling multiple sequencin
 same biological sample.
 
 ```sh
-weebill profile gtdb.syldbc --merge -S patient1_pooled \
+weebill profile --two-stage gtdb.syl2db --merge -S patient1_pooled \
     sketches/run1.sylspc sketches/run2.sylspc sketches/run3.sylspc \
     -o patient1_pooled.profile.tsv
 ```
@@ -112,7 +117,7 @@ weebill sketch -r sampleA.fastq.gz --reference gtdb.sylref -d sketches_ref/
 #    (or compress existing samples: weebill ref-compress -r gtdb.sylref sketches/*.sylsp -d sketches_ref/)
 
 # 3. Profile the .sylspr samples — --reference is REQUIRED to decode them
-weebill profile gtdb.syldbc sketches_ref/*.sylspr --reference gtdb.sylref > profile.tsv
+weebill profile gtdb.syldb sketches_ref/*.sylspr --reference gtdb.sylref > profile.tsv
 ```
 
 `--reference` writes `.sylspr` directly and so cannot be combined with `--compressed-database`;
@@ -172,9 +177,9 @@ Smaller improvements and fixes beyond the headline features above:
   seeded, so repeated sketching of the same input is deterministic.
 - **More accurate paired read lengths** — the read-length estimate for paired-end data uses the
   mean of both mates and excludes sub-*k* mates, improving `--estimate-unknown` coverage scaling.
-- **Corruption detection in every sketch/database format** — compressed sketches are checksummed by
-  their zstd frame and the seekable databases carry a whole-file checksum, both verified on read
-  (e.g. via `weebill inspect`).
+- **Corruption detection in the new sketch/database formats** — the compressed sketches are
+  checksummed by their zstd frame and the seekable databases carry a whole-file checksum, both
+  verified on read (e.g. via `weebill inspect`).
 
 ## Development
 
