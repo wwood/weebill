@@ -9,6 +9,116 @@ species-level metagenomic profiler (ANI querying + taxonomic profiling). See the
 
 Weebill is currently in development and is experimental. Efforts are made to contribute improvements back upstream to sylph, but some features are beyond its scope.
 
+## Contents
+
+- [Installation](#installation)
+- [Usage examples](#usage-examples)
+  - [From reads to a profile (standard compressed sketches)](#from-reads-to-a-profile-standard-compressed-sketches)
+  - [Pooling samples with `profile --merge`](#pooling-samples-with-profile---merge)
+  - [Reference-delta samples with `profile --reference`](#reference-delta-samples-with-profile---reference)
+- [Changes in the weebill fork](#changes-in-the-weebill-fork)
+- [Minor changes since the fork](#minor-changes-since-the-fork)
+- [Development](#development)
+- [Citation](#citation)
+
+## Installation
+
+Prebuilt static Linux binaries (x86_64) are attached to each release. Download one from the
+[**releases page**](https://github.com/wwood/weebill/releases), then place the `weebill`
+binary somewhere on your `PATH` (e.g. `~/.cargo/bin` or `~/.local/bin`) and make it executable:
+
+```sh
+chmod +x weebill
+```
+
+Alternatively, build from source with the [Rust toolchain](https://www.rust-lang.org/tools/install)
+(`cargo`). Install the `weebill` binary straight from GitHub:
+
+```sh
+cargo install --git https://github.com/wwood/weebill
+```
+
+This builds and installs `weebill` into `~/.cargo/bin` (make sure it is on your `PATH`). To build
+from a local clone instead:
+
+```sh
+git clone https://github.com/wwood/weebill
+cd weebill
+cargo install --path .
+```
+
+## Usage examples
+
+Weebill has a two-step model: **sketch** sequences into compact indexes, then **profile** (or
+**query**) those indexes. Reads become *sample* sketches; genomes become a *database* sketch.
+The examples below assume `weebill` is on your `PATH`; add `-t <threads>` to any command to
+parallelise.
+
+### From reads to a profile (standard compressed sketches)
+
+This is the recommended everyday workflow — sketch once into the compressed formats, then
+profile. Compressed sketches are smaller on disk and are read transparently by `profile`,
+`query`, and `inspect`.
+
+```sh
+# 1. Sketch a genome database once into a compressed database (-> gtdb.syldbc)
+weebill sketch -g genomes/*.fa --compressed-output gtdb
+
+# 2. Sketch metagenome reads into compressed sample sketches (-> sketches/*.sylspc)
+#    single-end (one .sylspc per input file):
+weebill sketch -r sampleA.fastq.gz -r sampleB.fastq.gz --compressed-database sketches/
+#    paired-end:
+weebill sketch -1 sampleA_1.fq.gz -2 sampleA_2.fq.gz --compressed-database sketches/
+
+# 3. Taxonomic profile: relative abundance + ANI per detected species (TSV to stdout)
+weebill profile gtdb.syldbc sketches/*.sylspc > profile.tsv
+```
+
+`profile` also accepts raw fastq/fasta directly and will sketch them on the fly, e.g.
+`weebill profile gtdb.syldbc -r sampleA.fastq.gz`. Swap `profile` for `query` to get
+nearest-neighbour containment ANI instead of a profile.
+
+### Pooling samples with `profile --merge`
+
+`--merge` combines several read inputs — any mix of pre-sketched samples and raw reads — into a
+single sample (summing per-genome k-mer counts) and profiles that one pooled sample instead of
+each input separately. Handy for co-assemblies or for pooling multiple sequencing runs of the
+same biological sample.
+
+```sh
+weebill profile gtdb.syldbc --merge -S patient1_pooled \
+    sketches/run1.sylspc sketches/run2.sylspc sketches/run3.sylspc \
+    -o patient1_pooled.profile.tsv
+```
+
+`-S` names the merged sample in the `Sample_file` column (default: `merged`). The same
+`--merge`/`-S` flags exist on `weebill sketch` if you want to write the pooled sketch to disk
+rather than profile it immediately, and on the standalone `weebill merge` sub-command.
+
+### Reference-delta samples with `profile --reference`
+
+Reference-delta compression stores each sample as only the reference hashes it contains plus any
+novel hashes, producing very small `.sylspr` files (see
+[Changes in the weebill fork](#changes-in-the-weebill-fork)). Build the reference once, compress
+your samples against it, then profile the `.sylspr` samples by passing the same reference so they
+can be decoded.
+
+```sh
+# 1. Build a reference database once from the genome database sketch (-> gtdb.sylref)
+weebill ref-build gtdb.syldb -o gtdb
+
+# 2. Sketch reads straight to reference-delta samples (-> sketches_ref/*.sylspr)
+weebill sketch -r sampleA.fastq.gz --reference gtdb.sylref -d sketches_ref/
+#    (or compress existing samples: weebill ref-compress -r gtdb.sylref sketches/*.sylsp -d sketches_ref/)
+
+# 3. Profile the .sylspr samples — --reference is REQUIRED to decode them
+weebill profile gtdb.syldbc sketches_ref/*.sylspr --reference gtdb.sylref > profile.tsv
+```
+
+`--reference` writes `.sylspr` directly and so cannot be combined with `--compressed-database`;
+give the output directory with `-d`. The profile produced is identical to profiling the
+uncompressed samples — reference-delta compression is lossless.
+
 ## Changes in the weebill fork
 
 The binary is installed as `weebill`. Weebill changes:
@@ -43,31 +153,28 @@ The binary is installed as `weebill`. Weebill changes:
   `.sylspc` by default (or `.sylspr` with `--ref-compress`). Legacy uncompressed `.sylsp` samples
   record no read count and so cannot be merged — re-sketch them with `--compressed-database` first.
 
-## Installation
+## Minor changes since the fork
 
-The quickest way is the installer script attached to each
-[release](https://github.com/wwood/weebill/releases), which drops a prebuilt static Linux binary
-(x86_64) into `~/.cargo/bin`:
+Smaller improvements and fixes beyond the headline features above:
 
-```sh
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/wwood/weebill/releases/latest/download/weebill-installer.sh | sh
-```
-
-Otherwise, build from source. This requires the [Rust toolchain](https://www.rust-lang.org/tools/install)
-(`cargo`); install the `weebill` binary straight from GitHub:
-
-```sh
-cargo install --git https://github.com/wwood/weebill
-```
-
-This builds and installs `weebill` into `~/.cargo/bin` (make sure it is on your `PATH`). To build
-from a local clone instead:
-
-```sh
-git clone https://github.com/wwood/weebill
-cd weebill
-cargo install --path .
-```
+- **Concurrent streaming of multiple read inputs** — single-end, paired-end and interleaved read
+  passes are drained concurrently during sketching rather than one input at a time, improving
+  throughput when many read files are given at once.
+- **`sketch`/`profile --merge`** — a `--merge` flag on `sketch` and `profile` (distinct from the
+  `merge` sub-command) combines all read inputs into one sample sketch; `-S` names it. Used in the
+  [pooling example](#pooling-samples-with-profile---merge) above.
+- **`--tolerate-empty-inputs`** — treat a read input containing zero reads (an empty file or an SRA
+  FIFO with no unpaired reads) as a valid zero-read sketch instead of an error, so a single empty
+  stream does not abort a `--merge`. A run where *every* input is empty is still an error.
+- **AVX-512 k-mer extraction** — an 8-lane AVX-512 seeding path (with `vpcompressq`) alongside the
+  existing AVX2 path, for faster k-mer extraction on capable CPUs.
+- **Reproducible sketching** — `rand` is pinned and the read-deduplication cuckoo filter RNG is
+  seeded, so repeated sketching of the same input is deterministic.
+- **More accurate paired read lengths** — the read-length estimate for paired-end data uses the
+  mean of both mates and excludes sub-*k* mates, improving `--estimate-unknown` coverage scaling.
+- **Corruption detection in every sketch/database format** — compressed sketches are checksummed by
+  their zstd frame and the seekable databases carry a whole-file checksum, both verified on read
+  (e.g. via `weebill inspect`).
 
 ## Development
 
