@@ -35,7 +35,7 @@ Alternatively, build from source with the [Rust toolchain](https://www.rust-lang
 (`cargo`). Install the `weebill` binary straight from GitHub:
 
 ```sh
-cargo install --git https://github.com/wwood/weebill
+cargo install weebill
 ```
 
 This builds and installs `weebill` into `~/.cargo/bin` (make sure it is on your `PATH`). To build
