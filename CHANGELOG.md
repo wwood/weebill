@@ -5,6 +5,8 @@ changes made in weebill.
 
 ## Unreleased
 
+## Version 0.2.0
+
 ### Added
 
 - `sketch --reference` now takes `--ref-screen-ani`, `--min-dense-kmers-for-error` and `--no-error-kmer`, the reference-delta compression tunables that were previously only settable on `ref-compress`. Sketching straight to `.sylspr` used the built-in defaults with no way to change them.
