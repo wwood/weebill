@@ -114,7 +114,7 @@ weebill ref-build gtdb.syldb -o gtdb
 
 # 2. Sketch reads straight to reference-delta samples (-> sketches_ref/*.sylspr)
 weebill sketch -r sampleA.fastq.gz --reference gtdb.sylref -d sketches_ref/
-#    (or compress existing samples: weebill ref-compress -r gtdb.sylref sketches/*.sylsp -d sketches_ref/)
+#    (or compress the sample sketches made above: weebill ref-compress -r gtdb.sylref sketches/*.sylspc -d sketches_ref/)
 
 # 3. Profile the .sylspr samples — --reference is REQUIRED to decode them
 weebill profile gtdb.syldb sketches_ref/*.sylspr --reference gtdb.sylref > profile.tsv
