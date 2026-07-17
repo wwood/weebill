@@ -1290,6 +1290,66 @@ where
     rx
 }
 
+/// Per-read marker extraction result for a single-end read, computed off the
+/// serial dedup path.
+///
+/// `extract_markers` (and `pair_kmer*`) scan the whole read and dominate the
+/// per-read CPU cost, while the dedup fold that consumes their output only
+/// touches the handful of surviving markers but must run in file order (the
+/// fixed-seed dedup filters are order-dependent, which is what makes the sketch
+/// byte-reproducible). Splitting the two lets the extraction run across rayon
+/// workers on a batch while the fold stays single-threaded and ordered.
+struct SingleMarkers {
+    markers: Vec<u64>,
+    kmer_pair: Option<([Marker; 2], [Marker; 2])>,
+    seq_len: usize,
+}
+
+/// Per-pair marker extraction result for a mate pair (paired or interleaved),
+/// computed off the serial dedup path. See [`SingleMarkers`].
+struct PairMarkers {
+    markers1: Vec<u64>,
+    markers2: Vec<u64>,
+    kmer_pair: Option<([Marker; 2], [Marker; 2])>,
+    len1: usize,
+    len2: usize,
+}
+
+/// Extract the markers for one single-end read. Pure and side-effect free, so
+/// it is safe to run across rayon workers.
+fn extract_single(seq: &[u8], c: usize, k: usize) -> SingleMarkers {
+    let mut markers = vec![];
+    extract_markers(seq, &mut markers, c, k);
+    // Reads longer than 400bp are treated as long reads and carry no paired
+    // k-mer signature (matches the previous inline behaviour).
+    let kmer_pair = if seq.len() > 400 {
+        None
+    } else {
+        pair_kmer_single(seq)
+    };
+    SingleMarkers {
+        markers,
+        kmer_pair,
+        seq_len: seq.len(),
+    }
+}
+
+/// Extract the markers for one mate pair. Pure and side-effect free, so it is
+/// safe to run across rayon workers.
+fn extract_pair(seq1: &[u8], seq2: &[u8], c: usize, k: usize) -> PairMarkers {
+    let mut markers1 = vec![];
+    let mut markers2 = vec![];
+    extract_markers(seq1, &mut markers1, c, k);
+    extract_markers(seq2, &mut markers2, c, k);
+    PairMarkers {
+        kmer_pair: pair_kmer(seq1, seq2),
+        len1: seq1.len(),
+        len2: seq2.len(),
+        markers1,
+        markers2,
+    }
+}
+
 pub fn sketch_pair_sequences(
     read_file1: &str,
     read_file2: &str,
@@ -1389,14 +1449,14 @@ pub fn sketch_pair_sequences(
             ReaderMsg::Batch(pairs) => pairs,
             ReaderMsg::ParseError => return None,
         };
-        for (seq1, seq2) in pairs {
-            let mut temp_vec1 = vec![];
-            let mut temp_vec2 = vec![];
-
-            extract_markers(&seq1, &mut temp_vec1, c, k);
-            extract_markers(&seq2, &mut temp_vec2, c, k);
-            let kmer_pair = pair_kmer(&seq1, &seq2);
-
+        // Extract markers for every pair in the batch across rayon workers.
+        // `collect` preserves file order, so the serial dedup fold below stays
+        // byte-identical to processing the pairs one at a time.
+        let extracted: Vec<PairMarkers> = pairs
+            .par_iter()
+            .map(|(seq1, seq2)| extract_pair(seq1, seq2, c, k))
+            .collect();
+        for pm in &extracted {
             // Moving average over both mates (not just R1) so
             // asymmetric mate lengths are handled correctly. Mates
             // shorter than k emit no k-mers, so they are excluded to
@@ -1412,20 +1472,20 @@ pub fn sketch_pair_sequences(
             // no marker, so weighting length by surviving markers
             // would itself bias the mean toward longer reads.
             counter += 1.;
-            for mate_len in [seq1.len(), seq2.len()] {
+            for mate_len in [pm.len1, pm.len2] {
                 if mate_len >= k {
                     len_counter += 1.;
                     mean_read_length += (mate_len as f64 - mean_read_length) / len_counter;
                 }
             }
 
-            for km in temp_vec1.iter() {
+            for km in pm.markers1.iter() {
                 if dedup_fpr == 0. {
                     dup_removal_lsh_full_exact(
                         &mut read_sketch.kmer_counts,
                         &mut kmer_pair_set,
                         km,
-                        kmer_pair,
+                        pm.kmer_pair,
                         &mut num_dup_removed,
                         no_dedup,
                         None,
@@ -1435,15 +1495,15 @@ pub fn sketch_pair_sequences(
                         &mut read_sketch.kmer_counts,
                         &mut kmer_pair_set_approx,
                         km,
-                        kmer_pair,
+                        pm.kmer_pair,
                         &mut num_dup_removed,
                         no_dedup,
                     );
                 }
                 //dup_removal_lsh(&mut read_sketch.kmer_counts, &mut kmer_pair_set, km, kmer_pair, &mut num_dup_removed, no_dedup);
             }
-            for km in temp_vec2.iter() {
-                if temp_vec1.contains(km) {
+            for km in pm.markers2.iter() {
+                if pm.markers1.contains(km) {
                     continue;
                 }
                 if dedup_fpr == 0. {
@@ -1451,7 +1511,7 @@ pub fn sketch_pair_sequences(
                         &mut read_sketch.kmer_counts,
                         &mut kmer_pair_set,
                         km,
-                        kmer_pair,
+                        pm.kmer_pair,
                         &mut num_dup_removed,
                         no_dedup,
                         None,
@@ -1461,7 +1521,7 @@ pub fn sketch_pair_sequences(
                         &mut read_sketch.kmer_counts,
                         &mut kmer_pair_set_approx,
                         km,
-                        kmer_pair,
+                        pm.kmer_pair,
                         &mut num_dup_removed,
                         no_dedup,
                     );
@@ -1565,6 +1625,10 @@ pub fn sketch_interleaved_sequences(
             ReaderMsg::Batch(records) => records,
             ReaderMsg::ParseError => return None,
         };
+        // Pair consecutive mates serially (carrying `pending` across batches),
+        // validating that each pair's names match. This is cheap (name compare
+        // plus moving the owned sequences) and keeps the pairing deterministic.
+        let mut mate_pairs: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(records.len() / 2 + 1);
         for (current_name, current_seq) in records {
             if let Some((prev_name, prev_seq)) = pending.take() {
                 if prev_name != current_name {
@@ -1576,73 +1640,76 @@ pub fn sketch_interleaved_sequences(
                 );
                     std::process::exit(1);
                 }
-
-                let mut temp_vec1 = vec![];
-                let mut temp_vec2 = vec![];
-                extract_markers(&prev_seq, &mut temp_vec1, c, k);
-                extract_markers(&current_seq, &mut temp_vec2, c, k);
-                let kmer_pair = pair_kmer(&prev_seq, &current_seq);
-
-                counter += 1.;
-                // Average over both mates so asymmetric mate lengths are handled
-                // correctly; exclude mates shorter than k since they emit no k-mers.
-                // Same short-insert overlap limitation as sketch_pair_sequences.
-                for mate_len in [prev_seq.len(), current_seq.len()] {
-                    if mate_len >= k {
-                        len_counter += 1.;
-                        mean_read_length += (mate_len as f64 - mean_read_length) / len_counter;
-                    }
-                }
-
-                for km in temp_vec1.iter() {
-                    if dedup_fpr == 0. {
-                        dup_removal_lsh_full_exact(
-                            &mut read_sketch.kmer_counts,
-                            &mut kmer_pair_set,
-                            km,
-                            kmer_pair,
-                            &mut num_dup_removed,
-                            no_dedup,
-                            None,
-                        );
-                    } else {
-                        dup_removal_lsh_full(
-                            &mut read_sketch.kmer_counts,
-                            &mut kmer_pair_set_approx,
-                            km,
-                            kmer_pair,
-                            &mut num_dup_removed,
-                            no_dedup,
-                        );
-                    }
-                }
-                for km in temp_vec2.iter() {
-                    if temp_vec1.contains(km) {
-                        continue;
-                    }
-                    if dedup_fpr == 0. {
-                        dup_removal_lsh_full_exact(
-                            &mut read_sketch.kmer_counts,
-                            &mut kmer_pair_set,
-                            km,
-                            kmer_pair,
-                            &mut num_dup_removed,
-                            no_dedup,
-                            None,
-                        );
-                    } else {
-                        dup_removal_lsh_full(
-                            &mut read_sketch.kmer_counts,
-                            &mut kmer_pair_set_approx,
-                            km,
-                            kmer_pair,
-                            &mut num_dup_removed,
-                            no_dedup,
-                        );
-                    }
-                }
+                mate_pairs.push((prev_seq, current_seq));
             } else {
                 pending = Some((current_name, current_seq));
+            }
+        }
+        // Extract markers for the paired mates across rayon workers; `collect`
+        // preserves order so the serial dedup fold below stays byte-identical to
+        // processing the pairs one at a time.
+        let extracted: Vec<PairMarkers> = mate_pairs
+            .par_iter()
+            .map(|(seq1, seq2)| extract_pair(seq1, seq2, c, k))
+            .collect();
+        for pm in &extracted {
+            counter += 1.;
+            // Average over both mates so asymmetric mate lengths are handled
+            // correctly; exclude mates shorter than k since they emit no k-mers.
+            // Same short-insert overlap limitation as sketch_pair_sequences.
+            for mate_len in [pm.len1, pm.len2] {
+                if mate_len >= k {
+                    len_counter += 1.;
+                    mean_read_length += (mate_len as f64 - mean_read_length) / len_counter;
+                }
+            }
+
+            for km in pm.markers1.iter() {
+                if dedup_fpr == 0. {
+                    dup_removal_lsh_full_exact(
+                        &mut read_sketch.kmer_counts,
+                        &mut kmer_pair_set,
+                        km,
+                        pm.kmer_pair,
+                        &mut num_dup_removed,
+                        no_dedup,
+                        None,
+                    );
+                } else {
+                    dup_removal_lsh_full(
+                        &mut read_sketch.kmer_counts,
+                        &mut kmer_pair_set_approx,
+                        km,
+                        pm.kmer_pair,
+                        &mut num_dup_removed,
+                        no_dedup,
+                    );
+                }
+            }
+            for km in pm.markers2.iter() {
+                if pm.markers1.contains(km) {
+                    continue;
+                }
+                if dedup_fpr == 0. {
+                    dup_removal_lsh_full_exact(
+                        &mut read_sketch.kmer_counts,
+                        &mut kmer_pair_set,
+                        km,
+                        pm.kmer_pair,
+                        &mut num_dup_removed,
+                        no_dedup,
+                        None,
+                    );
+                } else {
+                    dup_removal_lsh_full(
+                        &mut read_sketch.kmer_counts,
+                        &mut kmer_pair_set_approx,
+                        km,
+                        pm.kmer_pair,
+                        &mut num_dup_removed,
+                        no_dedup,
+                    );
+                }
             }
         }
     }
@@ -1722,21 +1789,20 @@ pub fn sketch_sequences_needle(
                 // abort_on_error is false, so ParseError is never sent here.
                 ReaderMsg::ParseError => continue,
             };
-            for seq in seqs {
-                let mut vec = vec![];
-                let kmer_pair;
-                if seq.len() > 400 {
-                    kmer_pair = None;
-                } else {
-                    kmer_pair = pair_kmer_single(&seq);
-                }
-                extract_markers(&seq, &mut vec, c, k);
-                for km in vec {
+            // Extract markers for every read in the batch across rayon workers;
+            // `collect` preserves file order so the serial dedup fold below is
+            // byte-identical to processing the reads one at a time.
+            let extracted: Vec<SingleMarkers> = seqs
+                .par_iter()
+                .map(|seq| extract_single(seq, c, k))
+                .collect();
+            for sm in extracted {
+                for km in sm.markers {
                     dup_removal_lsh_full_exact(
                         &mut kmer_map,
                         &mut kmer_to_pair_table,
                         &km,
-                        kmer_pair,
+                        sm.kmer_pair,
                         &mut num_dup_removed,
                         no_dedup,
                         Some(MAX_DEDUP_COUNT),
@@ -1745,7 +1811,7 @@ pub fn sketch_sequences_needle(
                 //moving average
                 counter += 1.;
                 mean_read_length =
-                    mean_read_length + ((seq.len() as f64) - mean_read_length) / counter;
+                    mean_read_length + ((sm.seq_len as f64) - mean_read_length) / counter;
             }
         }
     }
