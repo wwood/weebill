@@ -1651,6 +1651,120 @@ fn test_sketch_merge_tolerate_empty_inputs() {
         .failure();
 }
 
+/// Interleave two equal-length FASTQ mate files (R1 then R2, per record) into `out`.
+/// Used to synthesise a valid interleaved input from the existing paired test files.
+fn write_interleaved(r1_path: &str, r2_path: &str, out: &str) {
+    let r1 = fs::read_to_string(r1_path).unwrap();
+    let r2 = fs::read_to_string(r2_path).unwrap();
+    let recs = |s: &str| -> Vec<String> {
+        s.lines()
+            .collect::<Vec<_>>()
+            .chunks(4)
+            .filter(|c| c.len() == 4)
+            .map(|c| c.join("\n"))
+            .collect()
+    };
+    let (a, b) = (recs(&r1), recs(&r2));
+    assert_eq!(a.len(), b.len(), "mate files differ in record count");
+    let mut buf = String::new();
+    for (x, y) in a.iter().zip(b.iter()) {
+        buf.push_str(x);
+        buf.push('\n');
+        buf.push_str(y);
+        buf.push('\n');
+    }
+    fs::write(out, buf).unwrap();
+}
+
+/// The reader-thread split (IO decoupled from k-mer processing) must coexist with
+/// `--tolerate-empty-inputs`: an empty stream short-circuits before any reader thread is
+/// spawned, while a *good* paired or interleaved input in the same `--merge` run is drained
+/// through the threaded path. The prior tolerate-empty test only routed a good single-end
+/// input through the threaded path; this covers the paired and interleaved consumers running
+/// to completion alongside tolerated empties. The tolerated empties are zero reads, so the
+/// merged k-mer count must equal the same good inputs merged without them.
+#[serial]
+#[test]
+fn test_sketch_merge_tolerate_empty_with_good_paired_and_interleaved() {
+    let dir = "./tests/results/test_merge_tolerate_empty_good_dir";
+    if Path::new(dir).exists() {
+        let _ = fs::remove_dir_all(dir);
+    }
+    fs::create_dir_all(dir).unwrap();
+    let empty = format!("{}/empty.fq", dir);
+    let empty2 = format!("{}/empty2.fq", dir);
+    fs::write(&empty, b"").unwrap();
+    fs::write(&empty2, b"").unwrap();
+    let interleaved = format!("{}/k12_interleaved.fq", dir);
+    write_interleaved("test_files/k12_R1.fq", "test_files/k12_R2.fq", &interleaved);
+
+    let kmers_of = |sketch: &str| -> u64 {
+        let mut cmd = Command::cargo_bin("weebill").unwrap();
+        let out = cmd
+            .arg("inspect")
+            .arg(sketch)
+            .output()
+            .expect("inspect failed");
+        num_sketched_kmers(str::from_utf8(&out.stdout).unwrap())
+    };
+
+    // Reference: the good paired and interleaved inputs merged with no empties present.
+    let good = format!("{}/good", dir);
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("sketch")
+        .arg("--merge")
+        .arg("-1")
+        .arg("test_files/k12_R1.fq")
+        .arg("-2")
+        .arg("test_files/k12_R2.fq")
+        .arg("--interleaved")
+        .arg(&interleaved)
+        .arg("--compressed-database")
+        .arg(&good)
+        .arg("-S")
+        .arg("s")
+        .assert()
+        .success()
+        .code(0);
+    let good_kmers = kmers_of(&format!("{}.sylspc", good));
+
+    // Same good paired + interleaved inputs, now with empty paired, empty interleaved, and
+    // empty single-end streams tolerated in the same merge. The good inputs flow through the
+    // threaded paired/interleaved paths; the empties are zero reads and must not change the
+    // result.
+    let mixed = format!("{}/mixed", dir);
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("sketch")
+        .arg("--merge")
+        .arg("--tolerate-empty-inputs")
+        .arg("-1")
+        .arg("test_files/k12_R1.fq")
+        .arg("-1")
+        .arg(&empty)
+        .arg("-2")
+        .arg("test_files/k12_R2.fq")
+        .arg("-2")
+        .arg(&empty2)
+        .arg("--interleaved")
+        .arg(&interleaved)
+        .arg("--interleaved")
+        .arg(&empty)
+        .arg("-r")
+        .arg(&empty)
+        .arg("--compressed-database")
+        .arg(&mixed)
+        .arg("-S")
+        .arg("s")
+        .assert()
+        .success()
+        .code(0);
+    assert_eq!(
+        good_kmers,
+        kmers_of(&format!("{}.sylspc", mixed)),
+        "tolerated empty streams changed the merged k-mer count of the good threaded inputs"
+    );
+}
+
 /// Extract the (single) data row's Sample_file (col 1) and Containment_ind (col 12)
 /// from a `profile` TSV, skipping the header line.
 fn profile_sample_and_containment(stdout: &str) -> (String, String) {

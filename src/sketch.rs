@@ -1207,6 +1207,149 @@ fn dup_removal_lsh_full<R: rand::Rng>(
     *c += 1;
 }
 
+/// Number of records grouped into one channel message by the reader thread.
+/// Batching amortizes the per-message channel overhead down to negligible
+/// relative to the k-mer work the consumer does per record.
+const READER_BATCH_SIZE: usize = 8192;
+
+/// Maximum number of batches allowed to sit unconsumed in the channel. The
+/// reader thread blocks once this many are queued, so it never races more than
+/// a few batches ahead of processing. This backpressure keeps memory bounded
+/// even for an unbounded piped/streamed input, instead of reading it all at
+/// once.
+const READER_CHANNEL_BOUND: usize = 4;
+
+/// A message handed from a reader thread to the processing thread.
+enum ReaderMsg<T> {
+    /// A batch of successfully parsed, owned records, in file order.
+    Batch(Vec<T>),
+    /// A record failed to parse and the reader was asked to abort on error.
+    ParseError,
+}
+
+/// Spawn a thread that pulls records from `reader`, turns each into an owned
+/// value with `map`, and streams them (batched, in file order) down the
+/// returned channel.
+///
+/// The point is to decouple the reading of a fastx stream -- which for a piped
+/// or gzipped input is dominated by IO and decompression -- from the CPU-bound
+/// k-mer extraction and dedup that the consumer performs. On a single thread the
+/// two ping-pong: the CPU stalls while the next record is read, then IO stalls
+/// while the record is processed. Splitting them lets the two overlap.
+///
+/// A *single* consumer drains the channel in file order, so any order-dependent
+/// downstream state (the dedup filters) is updated in exactly the same order as
+/// the old single-threaded loop, keeping read sketches byte-for-byte
+/// reproducible.
+///
+/// On a record parse error: if `abort_on_error` is set, a [`ReaderMsg::ParseError`]
+/// is sent and the thread stops; otherwise the record is skipped, `warn_msg` (if
+/// any) is logged, and reading continues -- matching the pre-existing per-path
+/// error handling.
+fn spawn_fastx_reader<T, F>(
+    mut reader: Box<dyn needletail::parser::FastxReader>,
+    mut map: F,
+    abort_on_error: bool,
+    warn_msg: Option<String>,
+) -> std::sync::mpsc::Receiver<ReaderMsg<T>>
+where
+    T: Send + 'static,
+    F: FnMut(&needletail::parser::SequenceRecord) -> T + Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::sync_channel(READER_CHANNEL_BOUND);
+    thread::spawn(move || {
+        let mut batch: Vec<T> = Vec::with_capacity(READER_BATCH_SIZE);
+        while let Some(rec_result) = reader.next() {
+            match rec_result {
+                Ok(rec) => {
+                    batch.push(map(&rec));
+                    if batch.len() >= READER_BATCH_SIZE {
+                        let full =
+                            std::mem::replace(&mut batch, Vec::with_capacity(READER_BATCH_SIZE));
+                        // A send error means the consumer hung up (returned
+                        // early); stop reading rather than spin.
+                        if tx.send(ReaderMsg::Batch(full)).is_err() {
+                            return;
+                        }
+                    }
+                }
+                Err(_) => {
+                    if abort_on_error {
+                        let _ = tx.send(ReaderMsg::ParseError);
+                        return;
+                    } else if let Some(msg) = &warn_msg {
+                        warn!("{}", msg);
+                    }
+                }
+            }
+        }
+        if !batch.is_empty() {
+            let _ = tx.send(ReaderMsg::Batch(batch));
+        }
+    });
+    rx
+}
+
+/// Per-read marker extraction result for a single-end read, computed off the
+/// serial dedup path.
+///
+/// `extract_markers` (and `pair_kmer*`) scan the whole read and dominate the
+/// per-read CPU cost, while the dedup fold that consumes their output only
+/// touches the handful of surviving markers but must run in file order (the
+/// fixed-seed dedup filters are order-dependent, which is what makes the sketch
+/// byte-reproducible). Splitting the two lets the extraction run across rayon
+/// workers on a batch while the fold stays single-threaded and ordered.
+struct SingleMarkers {
+    markers: Vec<u64>,
+    kmer_pair: Option<([Marker; 2], [Marker; 2])>,
+    seq_len: usize,
+}
+
+/// Per-pair marker extraction result for a mate pair (paired or interleaved),
+/// computed off the serial dedup path. See [`SingleMarkers`].
+struct PairMarkers {
+    markers1: Vec<u64>,
+    markers2: Vec<u64>,
+    kmer_pair: Option<([Marker; 2], [Marker; 2])>,
+    len1: usize,
+    len2: usize,
+}
+
+/// Extract the markers for one single-end read. Pure and side-effect free, so
+/// it is safe to run across rayon workers.
+fn extract_single(seq: &[u8], c: usize, k: usize) -> SingleMarkers {
+    let mut markers = vec![];
+    extract_markers(seq, &mut markers, c, k);
+    // Reads longer than 400bp are treated as long reads and carry no paired
+    // k-mer signature (matches the previous inline behaviour).
+    let kmer_pair = if seq.len() > 400 {
+        None
+    } else {
+        pair_kmer_single(seq)
+    };
+    SingleMarkers {
+        markers,
+        kmer_pair,
+        seq_len: seq.len(),
+    }
+}
+
+/// Extract the markers for one mate pair. Pure and side-effect free, so it is
+/// safe to run across rayon workers.
+fn extract_pair(seq1: &[u8], seq2: &[u8], c: usize, k: usize) -> PairMarkers {
+    let mut markers1 = vec![];
+    let mut markers2 = vec![];
+    extract_markers(seq1, &mut markers1, c, k);
+    extract_markers(seq2, &mut markers2, c, k);
+    PairMarkers {
+        kmer_pair: pair_kmer(seq1, seq2),
+        len1: seq1.len(),
+        len2: seq2.len(),
+        markers1,
+        markers2,
+    }
+}
+
 pub fn sketch_pair_sequences(
     read_file1: &str,
     read_file2: &str,
@@ -1260,99 +1403,131 @@ pub fn sketch_pair_sequences(
     // len_counter (k-mer-emitting mates) diverge when a mate is sub-k.
     let mut len_counter: f64 = 0.;
 
-    loop {
-        let n1 = reader1.next();
-        let n2 = reader2.next();
-        if let Some(rec1_o) = n1 {
-            if let Some(rec2_o) = n2 {
-                if let Ok(rec1) = rec1_o {
-                    if let Ok(rec2) = rec2_o {
-                        let mut temp_vec1 = vec![];
-                        let mut temp_vec2 = vec![];
-
-                        extract_markers(&rec1.seq(), &mut temp_vec1, c, k);
-                        extract_markers(&rec2.seq(), &mut temp_vec2, c, k);
-                        let kmer_pair = pair_kmer(&rec1.seq(), &rec2.seq());
-
-                        // Moving average over both mates (not just R1) so
-                        // asymmetric mate lengths are handled correctly. Mates
-                        // shorter than k emit no k-mers, so they are excluded to
-                        // avoid biasing the coverage correction and driving
-                        // `read_length - k + 1` non-positive in contain.rs.
-                        //
-                        // Known limitation: for short-insert libraries whose
-                        // mates overlap, R2's overlapping markers are deduped
-                        // against R1 below, so the full R2 length counted here
-                        // slightly overstates the length backing the k-mer
-                        // observations, mildly inflating the -u / read-count
-                        // estimates. Left as-is: at default c most reads carry
-                        // no marker, so weighting length by surviving markers
-                        // would itself bias the mean toward longer reads.
-                        counter += 1.;
-                        for mate_len in [rec1.seq().len(), rec2.seq().len()] {
-                            if mate_len >= k {
-                                len_counter += 1.;
-                                mean_read_length +=
-                                    (mate_len as f64 - mean_read_length) / len_counter;
-                            }
-                        }
-
-                        for km in temp_vec1.iter() {
-                            if dedup_fpr == 0. {
-                                dup_removal_lsh_full_exact(
-                                    &mut read_sketch.kmer_counts,
-                                    &mut kmer_pair_set,
-                                    km,
-                                    kmer_pair,
-                                    &mut num_dup_removed,
-                                    no_dedup,
-                                    None,
-                                );
-                            } else {
-                                dup_removal_lsh_full(
-                                    &mut read_sketch.kmer_counts,
-                                    &mut kmer_pair_set_approx,
-                                    km,
-                                    kmer_pair,
-                                    &mut num_dup_removed,
-                                    no_dedup,
-                                );
-                            }
-                            //dup_removal_lsh(&mut read_sketch.kmer_counts, &mut kmer_pair_set, km, kmer_pair, &mut num_dup_removed, no_dedup);
-                        }
-                        for km in temp_vec2.iter() {
-                            if temp_vec1.contains(km) {
-                                continue;
-                            }
-                            if dedup_fpr == 0. {
-                                dup_removal_lsh_full_exact(
-                                    &mut read_sketch.kmer_counts,
-                                    &mut kmer_pair_set,
-                                    km,
-                                    kmer_pair,
-                                    &mut num_dup_removed,
-                                    no_dedup,
-                                    None,
-                                );
-                            } else {
-                                dup_removal_lsh_full(
-                                    &mut read_sketch.kmer_counts,
-                                    &mut kmer_pair_set_approx,
-                                    km,
-                                    kmer_pair,
-                                    &mut num_dup_removed,
-                                    no_dedup,
-                                );
-                            }
-                            //dup_removal_lsh(&mut read_sketch.kmer_counts, &mut kmer_pair_set, km, kmer_pair, &mut num_dup_removed, no_dedup);
+    // Read both mate files on a dedicated thread that zips them and streams
+    // owned (R1, R2) sequence pairs over, so IO/decompression of both files
+    // overlaps with the k-mer extraction and dedup on this thread instead of
+    // ping-ponging. The zip logic preserves the previous behaviour exactly: a
+    // parse error on R1 aborts (`return None`); a missing or errored R2 for a
+    // present R1, or a shorter R2 file, silently drops the unpaired R1 tail;
+    // exhausting R1 ends the stream. A single consumer keeps pair/dedup order
+    // identical to the old loop.
+    let rx: std::sync::mpsc::Receiver<ReaderMsg<(Vec<u8>, Vec<u8>)>> = {
+        let (tx, rx) = std::sync::mpsc::sync_channel(READER_CHANNEL_BOUND);
+        thread::spawn(move || {
+            let mut batch: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(READER_BATCH_SIZE);
+            loop {
+                let n1 = reader1.next();
+                let n2 = reader2.next();
+                let Some(rec1_o) = n1 else { break };
+                let rec1 = match rec1_o {
+                    Ok(rec1) => rec1,
+                    Err(_) => {
+                        let _ = tx.send(ReaderMsg::ParseError);
+                        return;
+                    }
+                };
+                if let Some(Ok(rec2)) = n2 {
+                    batch.push((rec1.seq().to_vec(), rec2.seq().to_vec()));
+                    if batch.len() >= READER_BATCH_SIZE {
+                        let full =
+                            std::mem::replace(&mut batch, Vec::with_capacity(READER_BATCH_SIZE));
+                        if tx.send(ReaderMsg::Batch(full)).is_err() {
+                            return;
                         }
                     }
-                } else {
-                    return None;
                 }
             }
-        } else {
-            break;
+            if !batch.is_empty() {
+                let _ = tx.send(ReaderMsg::Batch(batch));
+            }
+        });
+        rx
+    };
+
+    for msg in rx {
+        let pairs = match msg {
+            ReaderMsg::Batch(pairs) => pairs,
+            ReaderMsg::ParseError => return None,
+        };
+        // Extract markers for every pair in the batch across rayon workers.
+        // `collect` preserves file order, so the serial dedup fold below stays
+        // byte-identical to processing the pairs one at a time.
+        let extracted: Vec<PairMarkers> = pairs
+            .par_iter()
+            .map(|(seq1, seq2)| extract_pair(seq1, seq2, c, k))
+            .collect();
+        for pm in &extracted {
+            // Moving average over both mates (not just R1) so
+            // asymmetric mate lengths are handled correctly. Mates
+            // shorter than k emit no k-mers, so they are excluded to
+            // avoid biasing the coverage correction and driving
+            // `read_length - k + 1` non-positive in contain.rs.
+            //
+            // Known limitation: for short-insert libraries whose
+            // mates overlap, R2's overlapping markers are deduped
+            // against R1 below, so the full R2 length counted here
+            // slightly overstates the length backing the k-mer
+            // observations, mildly inflating the -u / read-count
+            // estimates. Left as-is: at default c most reads carry
+            // no marker, so weighting length by surviving markers
+            // would itself bias the mean toward longer reads.
+            counter += 1.;
+            for mate_len in [pm.len1, pm.len2] {
+                if mate_len >= k {
+                    len_counter += 1.;
+                    mean_read_length += (mate_len as f64 - mean_read_length) / len_counter;
+                }
+            }
+
+            for km in pm.markers1.iter() {
+                if dedup_fpr == 0. {
+                    dup_removal_lsh_full_exact(
+                        &mut read_sketch.kmer_counts,
+                        &mut kmer_pair_set,
+                        km,
+                        pm.kmer_pair,
+                        &mut num_dup_removed,
+                        no_dedup,
+                        None,
+                    );
+                } else {
+                    dup_removal_lsh_full(
+                        &mut read_sketch.kmer_counts,
+                        &mut kmer_pair_set_approx,
+                        km,
+                        pm.kmer_pair,
+                        &mut num_dup_removed,
+                        no_dedup,
+                    );
+                }
+                //dup_removal_lsh(&mut read_sketch.kmer_counts, &mut kmer_pair_set, km, kmer_pair, &mut num_dup_removed, no_dedup);
+            }
+            for km in pm.markers2.iter() {
+                if pm.markers1.contains(km) {
+                    continue;
+                }
+                if dedup_fpr == 0. {
+                    dup_removal_lsh_full_exact(
+                        &mut read_sketch.kmer_counts,
+                        &mut kmer_pair_set,
+                        km,
+                        pm.kmer_pair,
+                        &mut num_dup_removed,
+                        no_dedup,
+                        None,
+                    );
+                } else {
+                    dup_removal_lsh_full(
+                        &mut read_sketch.kmer_counts,
+                        &mut kmer_pair_set_approx,
+                        km,
+                        pm.kmer_pair,
+                        &mut num_dup_removed,
+                        no_dedup,
+                    );
+                }
+                //dup_removal_lsh(&mut read_sketch.kmer_counts, &mut kmer_pair_set, km, kmer_pair, &mut num_dup_removed, no_dedup);
+            }
         }
     }
     let percent = (num_dup_removed as f64)
@@ -1410,7 +1585,7 @@ pub fn sketch_interleaved_sequences(
         std::process::exit(1);
     }
 
-    let mut reader = reader.unwrap();
+    let reader = reader.unwrap();
     let mut read_sketch = SequencesSketch::new(read_file.to_string(), c, k, true, sample_name, 0.);
     let mut num_dup_removed = 0;
     let mut kmer_pair_set = FxHashSet::default();
@@ -1434,49 +1609,68 @@ pub fn sketch_interleaved_sequences(
     let mut len_counter: f64 = 0.;
     let mut pending: Option<(String, Vec<u8>)> = None;
 
-    while let Some(rec_result) = reader.next() {
-        let rec = match rec_result {
-            Ok(rec) => rec,
-            Err(_) => return None,
+    // Decode interleaved records on a reader thread so IO/decompression overlaps
+    // with the k-mer processing below. Each record's canonical name and owned
+    // sequence are computed on the reader thread and streamed over; a parse
+    // error aborts (mirroring the previous `return None`). The single consumer
+    // preserves file order, so mate pairing and dedup are unchanged.
+    let rx = spawn_fastx_reader(
+        reader,
+        |rec| (base_read_name(rec.id()), rec.seq().to_vec()),
+        true,
+        None,
+    );
+    for msg in rx {
+        let records = match msg {
+            ReaderMsg::Batch(records) => records,
+            ReaderMsg::ParseError => return None,
         };
-        let current_name = base_read_name(rec.id());
-        let current_seq = rec.seq().to_vec();
-
-        if let Some((prev_name, prev_seq)) = pending.take() {
-            if prev_name != current_name {
-                log::error!(
+        // Pair consecutive mates serially (carrying `pending` across batches),
+        // validating that each pair's names match. This is cheap (name compare
+        // plus moving the owned sequences) and keeps the pairing deterministic.
+        let mut mate_pairs: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(records.len() / 2 + 1);
+        for (current_name, current_seq) in records {
+            if let Some((prev_name, prev_seq)) = pending.take() {
+                if prev_name != current_name {
+                    log::error!(
                     "Interleaved file '{}' has non-matching consecutive read names '{}' and '{}'.",
                     read_file,
                     prev_name,
                     current_name
                 );
-                std::process::exit(1);
+                    std::process::exit(1);
+                }
+                mate_pairs.push((prev_seq, current_seq));
+            } else {
+                pending = Some((current_name, current_seq));
             }
-
-            let mut temp_vec1 = vec![];
-            let mut temp_vec2 = vec![];
-            extract_markers(&prev_seq, &mut temp_vec1, c, k);
-            extract_markers(&current_seq, &mut temp_vec2, c, k);
-            let kmer_pair = pair_kmer(&prev_seq, &current_seq);
-
+        }
+        // Extract markers for the paired mates across rayon workers; `collect`
+        // preserves order so the serial dedup fold below stays byte-identical to
+        // processing the pairs one at a time.
+        let extracted: Vec<PairMarkers> = mate_pairs
+            .par_iter()
+            .map(|(seq1, seq2)| extract_pair(seq1, seq2, c, k))
+            .collect();
+        for pm in &extracted {
             counter += 1.;
             // Average over both mates so asymmetric mate lengths are handled
             // correctly; exclude mates shorter than k since they emit no k-mers.
             // Same short-insert overlap limitation as sketch_pair_sequences.
-            for mate_len in [prev_seq.len(), current_seq.len()] {
+            for mate_len in [pm.len1, pm.len2] {
                 if mate_len >= k {
                     len_counter += 1.;
                     mean_read_length += (mate_len as f64 - mean_read_length) / len_counter;
                 }
             }
 
-            for km in temp_vec1.iter() {
+            for km in pm.markers1.iter() {
                 if dedup_fpr == 0. {
                     dup_removal_lsh_full_exact(
                         &mut read_sketch.kmer_counts,
                         &mut kmer_pair_set,
                         km,
-                        kmer_pair,
+                        pm.kmer_pair,
                         &mut num_dup_removed,
                         no_dedup,
                         None,
@@ -1486,14 +1680,14 @@ pub fn sketch_interleaved_sequences(
                         &mut read_sketch.kmer_counts,
                         &mut kmer_pair_set_approx,
                         km,
-                        kmer_pair,
+                        pm.kmer_pair,
                         &mut num_dup_removed,
                         no_dedup,
                     );
                 }
             }
-            for km in temp_vec2.iter() {
-                if temp_vec1.contains(km) {
+            for km in pm.markers2.iter() {
+                if pm.markers1.contains(km) {
                     continue;
                 }
                 if dedup_fpr == 0. {
@@ -1501,7 +1695,7 @@ pub fn sketch_interleaved_sequences(
                         &mut read_sketch.kmer_counts,
                         &mut kmer_pair_set,
                         km,
-                        kmer_pair,
+                        pm.kmer_pair,
                         &mut num_dup_removed,
                         no_dedup,
                         None,
@@ -1511,14 +1705,12 @@ pub fn sketch_interleaved_sequences(
                         &mut read_sketch.kmer_counts,
                         &mut kmer_pair_set_approx,
                         km,
-                        kmer_pair,
+                        pm.kmer_pair,
                         &mut num_dup_removed,
                         no_dedup,
                     );
                 }
             }
-        } else {
-            pending = Some((current_name, current_seq));
         }
     }
 
@@ -1578,26 +1770,39 @@ pub fn sketch_sequences_needle(
         warn!("{} is not a valid fasta/fastq file; skipping.", ref_file);
         return None;
     } else {
-        let mut reader = reader.unwrap();
-        while let Some(record) = reader.next() {
-            if record.is_ok() {
-                let mut vec = vec![];
-                let record =
-                    record.unwrap_or_else(|_| panic!("Invalid record for file {} ", ref_file));
-                let seq = record.seq();
-                let kmer_pair;
-                if seq.len() > 400 {
-                    kmer_pair = None;
-                } else {
-                    kmer_pair = pair_kmer_single(&seq);
-                }
-                extract_markers(&seq, &mut vec, c, k);
-                for km in vec {
+        let reader = reader.unwrap();
+        // Read (and decompress) records on a dedicated thread so that IO
+        // overlaps with the k-mer extraction and dedup below, instead of the
+        // two ping-ponging on one thread. Invalid records are skipped with a
+        // warning, matching the previous behaviour, so the reader does not
+        // abort. Owned sequence bytes are streamed over so the consumer can work
+        // without borrowing the reader's buffer.
+        let rx = spawn_fastx_reader(
+            reader,
+            |record| record.seq().to_vec(),
+            false,
+            Some(format!("File {} is not a valid fasta/fastq file", ref_file)),
+        );
+        for msg in rx {
+            let seqs = match msg {
+                ReaderMsg::Batch(seqs) => seqs,
+                // abort_on_error is false, so ParseError is never sent here.
+                ReaderMsg::ParseError => continue,
+            };
+            // Extract markers for every read in the batch across rayon workers;
+            // `collect` preserves file order so the serial dedup fold below is
+            // byte-identical to processing the reads one at a time.
+            let extracted: Vec<SingleMarkers> = seqs
+                .par_iter()
+                .map(|seq| extract_single(seq, c, k))
+                .collect();
+            for sm in extracted {
+                for km in sm.markers {
                     dup_removal_lsh_full_exact(
                         &mut kmer_map,
                         &mut kmer_to_pair_table,
                         &km,
-                        kmer_pair,
+                        sm.kmer_pair,
                         &mut num_dup_removed,
                         no_dedup,
                         Some(MAX_DEDUP_COUNT),
@@ -1606,9 +1811,7 @@ pub fn sketch_sequences_needle(
                 //moving average
                 counter += 1.;
                 mean_read_length =
-                    mean_read_length + ((seq.len() as f64) - mean_read_length) / counter;
-            } else {
-                warn!("File {} is not a valid fasta/fastq file", ref_file);
+                    mean_read_length + ((sm.seq_len as f64) - mean_read_length) / counter;
             }
         }
     }
