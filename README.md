@@ -162,9 +162,13 @@ The binary is installed as `weebill`. Weebill changes:
 
 Smaller improvements and fixes beyond the headline features above:
 
-- **Concurrent streaming of multiple read inputs** — single-end, paired-end and interleaved read
-  passes are drained concurrently during sketching rather than one input at a time, improving
-  throughput when many read files are given at once.
+- **Multi-threaded read sketching** — sketching a read input now uses threads at two levels. Across
+  inputs, single-end, paired-end and interleaved passes are drained concurrently rather than one at a
+  time. Within a single input, a dedicated reader thread does the IO/decompression while rayon workers
+  extract k-mers from batches of reads in parallel; only the order-dependent dedup fold stays serial,
+  so the sketch is byte-for-byte identical to the single-threaded result (and independent of `-t`).
+  This lets one large read file scale across cores (~2× on 4 threads for a single-end input) where it
+  previously ran the k-mer work on one core regardless of `-t`.
 - **`sketch`/`profile --merge`** — a `--merge` flag on `sketch` and `profile` (distinct from the
   `merge` sub-command) combines all read inputs into one sample sketch; `-S` names it. Used in the
   [pooling example](#pooling-samples-with-profile---merge) above.

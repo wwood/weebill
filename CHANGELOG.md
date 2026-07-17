@@ -5,6 +5,10 @@ changes made in weebill.
 
 ## Unreleased
 
+### Changed
+
+- Read sketching is now multi-threaded *within* a single input, not just across inputs. A dedicated reader thread handles IO/decompression while rayon workers extract k-mers from batched reads in parallel; only the order-dependent dedup fold stays serial and in file order, so sketches remain byte-for-byte identical to the previous single-threaded output and independent of `-t` (verified with `diff -r` of single-end, paired and interleaved sketches and of `profile --merge` output, at 1 and 4 threads). A single large read file now scales across cores (~2× on 4 threads for a single-end input) where it previously did all k-mer work on one core regardless of `--threads`.
+
 ## Version 0.2.0
 
 ### Added
