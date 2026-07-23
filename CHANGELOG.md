@@ -5,6 +5,10 @@ changes made in weebill.
 
 ## Unreleased
 
+### Added
+
+- `profile --apply-unknown <profile.tsv>` converts an existing profile made *without* `-u`/`--estimate-unknown` into the profile `-u` would have produced, without re-profiling. Everything `-u` changes is a per-sample scalar applied to two printed columns (`Eff_cov` is scaled by `read_length/(read_length-k+1) / identity` and relabelled `True_cov`; `Sequence_abundance` is scaled by the estimated covered-bases fraction), while `Taxonomic_abundance` and the ANIs are unchanged. The same pre-sketched sample(s) and the original database are both required on the command line — genome sizes come from the database and the k-mer-count distribution/read length from the sample sketch — so the result matches a real `-u` run to the precision of the input TSV's columns. Works with plain `.syldb`, two-stage `.syl2db` (no dense blocks are decoded) and reference-delta `.sylspr` samples (via `--reference`); the TSV may be gzip-compressed.
+
 ### Changed
 
 - Read sketching is now multi-threaded *within* a single input, not just across inputs. A dedicated reader thread handles IO/decompression while rayon workers extract k-mers from batched reads in parallel; only the order-dependent dedup fold stays serial and in file order, so sketches remain byte-for-byte identical to the previous single-threaded output and independent of `-t` (verified with `diff -r` of single-end, paired and interleaved sketches and of `profile --merge` output, at 1 and 4 threads). A single large read file now scales across cores (~2× on 4 threads for a single-end input) where it previously did all k-mer work on one core regardless of `--threads`.
