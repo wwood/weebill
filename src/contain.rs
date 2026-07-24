@@ -394,18 +394,57 @@ pub fn contain(mut args: ContainArgs, pseudotax_in: bool) {
         .build_global()
         .unwrap();
 
-    let out_writer = match args.out_file_name {
-        Some(ref x) => {
-            let path = Path::new(&x);
-            Box::new(BufWriter::new(File::create(path).unwrap())) as Box<dyn Write + Send>
-        }
-        None => Box::new(BufWriter::new(io::stdout())) as Box<dyn Write + Send>,
-    };
-
     if args.estimate_read_counts {
         args.estimate_unknown = true;
         log::info!("--estimate-read-counts detected, also enabling -u. Sequence_abundance column will be set to estimated read counts, not abundance. This is still experimental.");
     }
+
+    // Validate --apply-unknown BEFORE the output writer is created: `File::create`
+    // below truncates the `-o` path, so any invalid --apply-unknown invocation that
+    // errors out afterwards would first destroy an existing output file (and, when
+    // `-o` is the input TSV itself, the input). All apply-unknown gating therefore
+    // lives here, ahead of output creation.
+    if let Some(tsv) = args.apply_unknown.clone() {
+        if !pseudotax_in {
+            log::error!("--apply-unknown is only supported for `profile` (it rewrites a profile TSV). Exiting.");
+            std::process::exit(1);
+        }
+        if args.merge {
+            log::error!("--apply-unknown cannot be combined with --merge: it rescales an existing per-sample profile TSV, so give the same per-sample inputs used to produce it. Exiting.");
+            std::process::exit(1);
+        }
+        if args.estimate_read_counts {
+            log::error!("--apply-unknown cannot be combined with --estimate-read-counts (the read-count formula differs). Re-run the original profile with --estimate-read-counts instead. Exiting.");
+            std::process::exit(1);
+        }
+        if args.estimate_unknown {
+            log::error!(
+                "--apply-unknown already produces the -u profile; do not also pass -u. Exiting."
+            );
+            std::process::exit(1);
+        }
+        // `-o` pointing at the input TSV would wipe the input before it is read.
+        // Compare canonical paths when both resolve; else a literal comparison.
+        if let Some(out) = &args.out_file_name {
+            let same = match (std::fs::canonicalize(&tsv), std::fs::canonicalize(out)) {
+                (Ok(a), Ok(b)) => a == b,
+                _ => Path::new(&tsv) == Path::new(out),
+            };
+            if same {
+                log::error!(
+                    "--apply-unknown: the output file (-o `{}`) is the same as the input profile TSV; this would overwrite the input before it is read. Write to a different path. Exiting.",
+                    out
+                );
+                std::process::exit(1);
+            }
+        }
+    }
+
+    // NB: the output writer is created further down, AFTER the --apply-unknown
+    // branch. `File::create` truncates the `-o` path, and apply-unknown validates
+    // the input TSV (header, rows, referenced genomes/samples) inside
+    // `apply_unknown_from_tsv`; creating `-o` here would destroy an existing output
+    // file before those checks could reject a bad invocation.
 
     log::info!("Obtaining sketches...");
     let mut genome_sketch_files = vec![];
@@ -685,6 +724,39 @@ pub fn contain(mut args: ContainArgs, pseudotax_in: bool) {
         .collect::<Vec<Vec<&String>>>();
     read_files.extend(read_sketch_files_as_vec);
     let sequence_index_vec = (0..read_files.len()).collect::<Vec<usize>>();
+
+    // --apply-unknown: rescale an existing (non-`-u`) profile TSV into the profile
+    // `-u` would have produced, without re-profiling. Everything `-u` changes is a
+    // per-sample scalar applied to two printed columns (see `estimate_true_cov` /
+    // `estimate_covered_bases`), so we only need the sample sketches (k-mer identity
+    // + read length) and the database (per-genome sizes) -- both required here.
+    // `apply_unknown_from_tsv` fully validates and reads the input TSV before it
+    // creates `-o`, so a rejected invocation never truncates an existing output.
+    if let Some(tsv_path) = args.apply_unknown.clone() {
+        apply_unknown_from_tsv(
+            &args,
+            &tsv_path,
+            &two_stage_db,
+            &genome_sketches,
+            &read_files,
+            read_sketch_files.len(),
+            ref_db.as_ref(),
+            effective_genome_c,
+            db_k,
+        );
+        log::info!("sylph finished.");
+        return;
+    }
+
+    // Created only now (after the --apply-unknown early return): `File::create`
+    // truncates `-o`, so it must not run before apply-unknown's input validation.
+    let out_writer = match args.out_file_name {
+        Some(ref x) => {
+            let path = Path::new(&x);
+            Box::new(BufWriter::new(File::create(path).unwrap())) as Box<dyn Write + Send>
+        }
+        None => Box::new(BufWriter::new(io::stdout())) as Box<dyn Write + Send>,
+    };
     let out_writer: Mutex<Box<dyn Write + Send>> = Mutex::new(out_writer);
 
     let chunks = get_chunks(&sequence_index_vec, step);
@@ -1019,6 +1091,293 @@ fn estimate_true_cov(
         for res in results.iter_mut() {
             res.final_est_cov = res.final_est_cov / id * multiplier;
         }
+    }
+}
+
+/// Per-sample scalars needed to turn a non-`-u` profile into the `-u` profile.
+struct UnknownScalars {
+    /// `multiplier / id` -- the factor `estimate_true_cov` applies uniformly to
+    /// every genome's `final_est_cov` (Eff_cov -> True_cov).
+    cov_scale: f64,
+    /// `c * (sum of sample k-mer counts) * multiplier` -- the denominator of
+    /// `estimate_covered_bases` (independent of which genomes were detected).
+    tentative_bases: f64,
+}
+
+/// Recompute the per-sample `-u` scalars from a sample sketch, mirroring exactly
+/// what `process_sample` does when `estimate_unknown` is set: the k-mer identity
+/// (`-I` override or `get_kmer_identity`), the read-length multiplier, and the
+/// `estimate_covered_bases` denominator.
+fn unknown_scalars_for_sample(args: &ContainArgs, sketch: &SequencesSketch) -> UnknownScalars {
+    let id = if let Some(seq_id) = args.seq_id {
+        (seq_id / 100.).powf(sketch.k as f64)
+    } else {
+        // With estimate_unknown effectively on, get_kmer_identity always returns Some.
+        get_kmer_identity(sketch, true).unwrap()
+    };
+    let read_length = sketch.mean_read_length;
+    let multiplier = read_length / (read_length - sketch.k as f64 + 1.);
+    let total_counts: usize = sketch.kmer_counts.values().map(|c| *c as usize).sum();
+    UnknownScalars {
+        cov_scale: multiplier / id,
+        tentative_bases: sketch.c as f64 * total_counts as f64 * multiplier,
+    }
+}
+
+/// `profile --apply-unknown`: rewrite an existing (non-`-u`) profile TSV into the
+/// profile `-u` would have produced, without re-profiling.
+///
+/// Everything `-u` changes is a per-sample scalar applied to two printed columns
+/// (see [`estimate_true_cov`]/[`estimate_covered_bases`]): `Eff_cov` is scaled by
+/// `multiplier/id` (and relabelled `True_cov`), and `Sequence_abundance` is scaled
+/// by the estimated fraction of covered bases. `Taxonomic_abundance` and the ANIs
+/// are unchanged. We therefore only need the sample sketches (for `id`, read
+/// length and total k-mer counts) and the database (for each detected genome's
+/// size, `gn_size`) -- both are required on the command line.
+///
+/// Because the only per-genome input is the already-rounded `Eff_cov` printed in
+/// the TSV (not the full-precision internal value a real `-u` run rescales), the
+/// output is not guaranteed to be bit-for-bit identical to a real `-u` run:
+/// individual `True_cov`/`Sequence_abundance` cells may differ by a unit in the
+/// last printed place (the `Sequence_abundance` scalar can drift a little more, as
+/// it sums the rounded per-row coverage across all rows).
+///
+/// The output file (`-o`) is created only after every input check has passed and
+/// the whole TSV has been read, so a rejected invocation never truncates an
+/// existing output.
+#[allow(clippy::too_many_arguments)]
+fn apply_unknown_from_tsv(
+    args: &ContainArgs,
+    tsv_path: &str,
+    two_stage_db: &Option<TwoStageDb>,
+    genome_sketches: &[GenomeSketch],
+    read_files: &[Vec<&String>],
+    n_sketch_files: usize,
+    ref_db: Option<&crate::refdelta::RefIndex>,
+    effective_genome_c: usize,
+    db_k: usize,
+) {
+    // Genome_file column -> genome size, from the database (never the TSV).
+    // A profile TSV identifies each detected genome only by its `Genome_file`
+    // (source fasta path). With `--individual-records` several genome sketches
+    // share one fasta and are disambiguated only by `Contig_name`, so keying by
+    // `Genome_file` alone would collide and yield wrong sizes for all but one
+    // record. Rather than silently mis-scale, refuse such a database: build the
+    // map and croak on the first duplicate name.
+    let db_genome_sizes: Vec<(String, usize)> = match two_stage_db {
+        Some(db) => db
+            .genome_sizes()
+            .into_iter()
+            .map(|(name, size)| (name.to_string(), size))
+            .collect(),
+        None => genome_sketches
+            .iter()
+            .map(|gs| (gs.file_name.clone(), gs.gn_size))
+            .collect(),
+    };
+    let mut gn_size_map: FxHashMap<String, usize> = FxHashMap::default();
+    for (name, size) in db_genome_sizes {
+        if gn_size_map.insert(name.clone(), size).is_some() {
+            log::error!(
+                "--apply-unknown: the database contains multiple genomes with the same Genome_file `{}` (an --individual-records database). A profile TSV identifies genomes by Genome_file alone, so their sizes cannot be told apart; --apply-unknown does not support such databases. Re-run the original profile with -u instead. Exiting.",
+                name
+            );
+            std::process::exit(1);
+        }
+    }
+
+    // Per-sample scalars, keyed by the Sample_file value each sketch prints
+    // (sample_name if set, else file_name -- matching `AniResult::seq_name`).
+    let total = read_files.len();
+    let mut scalars: FxHashMap<String, UnknownScalars> = FxHashMap::default();
+    for (j, read_file) in read_files.iter().enumerate() {
+        let is_sketch = j >= total - n_sketch_files;
+        let sketch = get_seq_sketch(args, read_file, is_sketch, ref_db, effective_genome_c, db_k);
+        let Some(sketch) = sketch else {
+            log::error!(
+                "--apply-unknown: sample `{}` could not be loaded/sketched. Exiting.",
+                read_file[0]
+            );
+            std::process::exit(1);
+        };
+        let seq_name = sketch
+            .sample_name
+            .clone()
+            .unwrap_or_else(|| sketch.file_name.clone());
+        // Two inputs printing the same Sample_file (e.g. the same --sample-name, or
+        // the same read path from different directories) map to indistinguishable
+        // TSV rows, so their scalars would silently overwrite each other and rescale
+        // one sample's rows with the other's read-length/count distribution. A real
+        // -u run processes each input separately; refuse rather than mis-scale.
+        if scalars
+            .insert(seq_name.clone(), unknown_scalars_for_sample(args, &sketch))
+            .is_some()
+        {
+            log::error!(
+                "--apply-unknown: two sample inputs print the same Sample_file `{}`; their rows in the profile TSV cannot be told apart. Give each a distinct sample so their -u scalars do not collide. Exiting.",
+                seq_name
+            );
+            std::process::exit(1);
+        }
+    }
+
+    // Read the whole TSV (profiles are small) so we can sum covered bases per
+    // sample before rescaling.
+    let file = File::open(tsv_path).unwrap_or_else(|e| {
+        log::error!(
+            "--apply-unknown: could not open profile TSV `{}`: {}. Exiting.",
+            tsv_path,
+            e
+        );
+        std::process::exit(1);
+    });
+    let reader: Box<dyn BufRead> = if tsv_path.ends_with(".gz") {
+        Box::new(BufReader::new(flate2::read::MultiGzDecoder::new(file)))
+    } else {
+        Box::new(BufReader::new(file))
+    };
+    let mut lines = reader.lines();
+
+    let header = match lines.next() {
+        Some(Ok(h)) => h,
+        _ => {
+            log::error!(
+                "--apply-unknown: profile TSV `{}` is empty. Exiting.",
+                tsv_path
+            );
+            std::process::exit(1);
+        }
+    };
+    let cols: Vec<&str> = header.split('\t').collect();
+    // Column layout of a pseudotax profile (see print_header/print_ani_result).
+    const N_COLS: usize = 15;
+    const SEQ_ABUND: usize = 3; // Sequence_abundance
+    const COV: usize = 5; // Eff_cov (or True_cov)
+    if cols.len() != N_COLS
+        || cols[0] != "Sample_file"
+        || cols[1] != "Genome_file"
+        || cols[SEQ_ABUND] != "Sequence_abundance"
+    {
+        log::error!(
+            "--apply-unknown: `{}` is not a `profile` TSV (expected {} columns starting Sample_file/Genome_file). Exiting.",
+            tsv_path,
+            N_COLS
+        );
+        std::process::exit(1);
+    }
+    if cols[COV] == "True_cov" {
+        log::error!(
+            "--apply-unknown: `{}` was already produced with -u (True_cov column); it must be a profile made WITHOUT -u. Exiting.",
+            tsv_path
+        );
+        std::process::exit(1);
+    }
+
+    // Pass 1: keep rows, and sum gn_size * Eff_cov per sample.
+    let rows: Vec<Vec<String>> = lines
+        .map(|l| {
+            l.unwrap_or_else(|e| {
+                log::error!(
+                    "--apply-unknown: error reading `{}`: {}. Exiting.",
+                    tsv_path,
+                    e
+                );
+                std::process::exit(1);
+            })
+        })
+        .filter(|l| !l.is_empty())
+        .map(|l| l.split('\t').map(|s| s.to_string()).collect())
+        .collect();
+
+    let mut covered_bases: FxHashMap<String, f64> = FxHashMap::default();
+    for row in rows.iter() {
+        if row.len() != N_COLS {
+            log::error!(
+                "--apply-unknown: malformed row in `{}` (expected {} columns): {:?}. Exiting.",
+                tsv_path,
+                N_COLS,
+                row
+            );
+            std::process::exit(1);
+        }
+        let sample = &row[0];
+        let genome = &row[1];
+        if !scalars.contains_key(sample) {
+            log::error!(
+                "--apply-unknown: TSV references sample `{}`, but no matching sample sketch was given on the command line. Exiting.",
+                sample
+            );
+            std::process::exit(1);
+        }
+        let gn_size = *gn_size_map.get(genome).unwrap_or_else(|| {
+            log::error!(
+                "--apply-unknown: genome `{}` from the TSV is not in the given database, so its size is unknown. Exiting.",
+                genome
+            );
+            std::process::exit(1);
+        });
+        let eff_cov: f64 = row[COV].parse().unwrap_or_else(|_| {
+            log::error!(
+                "--apply-unknown: could not parse Eff_cov value `{}` in `{}`. Exiting.",
+                row[COV],
+                tsv_path
+            );
+            std::process::exit(1);
+        });
+        *covered_bases.entry(sample.clone()).or_insert(0.) += gn_size as f64 * eff_cov;
+    }
+
+    // bases_explained per sample = min( cov_scale * covered_bases / tentative_bases, 1 ).
+    let mut bases_explained: FxHashMap<String, f64> = FxHashMap::default();
+    for (sample, sc) in scalars.iter() {
+        let covered = *covered_bases.get(sample).unwrap_or(&0.);
+        let be = if sc.tentative_bases == 0. {
+            0.
+        } else {
+            f64::min(sc.cov_scale * covered / sc.tentative_bases, 1.)
+        };
+        log::info!(
+            "{} has {:.2}% of reads detected in database by profile",
+            sample,
+            be * 100.
+        );
+        bases_explained.insert(sample.clone(), be);
+    }
+
+    // Pass 2: rescale and print. True_cov = Eff_cov * cov_scale; Sequence_abundance
+    // *= bases_explained; every other column is passed through verbatim.
+    //
+    // Only now -- after every validation above has passed and the whole input TSV
+    // has been read into `rows` -- do we create the output. `File::create`
+    // truncates `-o`, so opening it any earlier would let a rejected invocation
+    // (bad header, unknown genome/sample, duplicate names, ...) destroy an existing
+    // output file before erroring.
+    let mut w: Box<dyn Write> = match &args.out_file_name {
+        Some(x) => {
+            let path = Path::new(x);
+            Box::new(BufWriter::new(File::create(path).unwrap_or_else(|e| {
+                log::error!(
+                    "--apply-unknown: could not create output file `{}`: {}. Exiting.",
+                    x,
+                    e
+                );
+                std::process::exit(1);
+            })))
+        }
+        None => Box::new(BufWriter::new(io::stdout())),
+    };
+    let mut new_header: Vec<&str> = cols.clone();
+    new_header[COV] = "True_cov";
+    writeln!(w, "{}", new_header.join("\t")).expect("Error writing to file");
+    for mut row in rows {
+        let sample = row[0].clone();
+        let sc = &scalars[&sample];
+        let be = bases_explained[&sample];
+        let eff_cov: f64 = row[COV].parse().unwrap();
+        let seq_abund: f64 = row[SEQ_ABUND].parse().unwrap();
+        row[COV] = format!("{:.3}", eff_cov * sc.cov_scale);
+        row[SEQ_ABUND] = format!("{:.4}", seq_abund * be);
+        writeln!(w, "{}", row.join("\t")).expect("Error writing to file");
     }
 }
 

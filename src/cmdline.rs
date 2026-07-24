@@ -507,6 +507,14 @@ pub struct ContainArgs {
     )]
     pub seq_id: Option<f64>,
 
+    #[clap(
+        long = "apply-unknown",
+        help_heading = "ALGORITHM",
+        value_name = "PROFILE_TSV",
+        help = "Convert an existing profile TSV (produced WITHOUT -u) into the profile that -u would have produced, without re-profiling. Give the same pre-sketched sample(s) and the original database on the command line -- both are required, so per-genome sizes come from the database and the sample's k-mer distribution from its sketch. The named TSV's rows are rescaled in place: Eff_cov becomes True_cov and Sequence_abundance is multiplied by the estimated unknown-sequence fraction (Taxonomic_abundance and ANIs are unchanged by -u). Because the inputs are the already-rounded printed columns (not the full-precision internal values), the result matches a real -u run to the precision of the TSV but is not guaranteed to be bit-for-bit identical: individual True_cov/Sequence_abundance cells may differ by a unit in the last printed place."
+    )]
+    pub apply_unknown: Option<String>,
+
     //#[clap(short='l', long="read-length", help_heading = "ALGORITHM", help = "Read length (single-end length for pairs). Only necessary for short-read coverages when using --estimate-unknown. Not needed for long-reads" )]
     //pub read_length: Option<usize>,
     #[clap(

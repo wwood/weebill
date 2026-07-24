@@ -753,6 +753,15 @@ impl TwoStageDb {
         &self.genomes[g as usize].file_name
     }
 
+    /// `(file_name, gn_size)` for every genome. Used by `profile --apply-unknown`
+    /// to look up genome sizes without decoding any dense block.
+    pub fn genome_sizes(&self) -> Vec<(&str, usize)> {
+        self.genomes
+            .iter()
+            .map(|g| (g.file_name.as_str(), g.gn_size))
+            .collect()
+    }
+
     /// End offset of genome `g`'s region (start of the next genome's block, or
     /// the screen index for the last genome). Genomes are stored in ascending
     /// offset, and the index block immediately follows the last dense block.

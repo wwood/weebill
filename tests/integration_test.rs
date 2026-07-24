@@ -2307,3 +2307,258 @@ fn test_corrupt_syl2db_is_rejected() {
     let mut cmd = Command::cargo_bin("weebill").unwrap();
     cmd.arg("inspect").arg(&two).assert().failure();
 }
+
+/// `profile --apply-unknown` rewrites a non-`-u` profile TSV into the profile that
+/// `-u` would have produced, using only the sample sketch and the database. The
+/// result must match a real `-u` run: `Taxonomic_abundance`, `Adjusted_ANI` and
+/// the other columns unchanged, `Eff_cov` relabelled `True_cov` and rescaled, and
+/// `Sequence_abundance` rescaled by the covered-bases fraction. Agreement is to the
+/// precision of the printed columns, so `True_cov` is compared with a tolerance.
+#[serial]
+#[test]
+fn test_profile_apply_unknown() {
+    fresh();
+    let dir = "./tests/results/apply_unknown";
+    let _ = fs::remove_dir_all(dir);
+    fs::create_dir_all(dir).unwrap();
+
+    // Dense (-c 50) database and read sample.
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("sketch")
+        .arg("-c")
+        .arg("50")
+        .arg("./test_files/e.coli-EC590.fasta.gz")
+        .arg("./test_files/e.coli-o157.fasta.gz")
+        .arg("./test_files/e.coli-K12.fasta.gz")
+        .arg("-o")
+        .arg(format!("{}/db", dir))
+        .assert()
+        .success()
+        .code(0);
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("sketch")
+        .arg("-c")
+        .arg("50")
+        .arg("./test_files/o157_reads.fastq.gz")
+        .arg("-d")
+        .arg(dir)
+        .assert()
+        .success()
+        .code(0);
+
+    let db = format!("{}/db.syldb", dir);
+    let sample = format!("{}/o157_reads.fastq.gz.sylsp", dir);
+    let plain = format!("{}/plain.tsv", dir);
+
+    // Baseline profile (no -u) and a real -u profile.
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("profile")
+        .arg(&db)
+        .arg(&sample)
+        .arg("-o")
+        .arg(&plain)
+        .assert()
+        .success()
+        .code(0);
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    let real_u = str::from_utf8(
+        &cmd.arg("profile")
+            .arg("-u")
+            .arg(&db)
+            .arg(&sample)
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .to_string();
+
+    // Convert the plain profile into the -u profile without re-profiling.
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    let applied = str::from_utf8(
+        &cmd.arg("profile")
+            .arg("--apply-unknown")
+            .arg(&plain)
+            .arg(&db)
+            .arg(&sample)
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .to_string();
+
+    // Header must carry the True_cov relabelling.
+    assert!(applied.lines().next().unwrap().contains("True_cov"));
+    assert!(!applied.lines().next().unwrap().contains("\tEff_cov\t"));
+
+    // Compare the two data rows column by column: everything but True_cov must be
+    // byte-identical; True_cov must agree within printed-precision rounding.
+    let parse = |tsv: &str| -> Vec<Vec<String>> {
+        tsv.lines()
+            .skip(1)
+            .filter(|l| !l.is_empty())
+            .map(|l| l.split('\t').map(|s| s.to_string()).collect())
+            .collect()
+    };
+    let real_rows = parse(&real_u);
+    let app_rows = parse(&applied);
+    assert_eq!(real_rows.len(), app_rows.len());
+    assert!(!real_rows.is_empty());
+    const COV: usize = 5; // Eff_cov / True_cov column index
+    for (r, a) in real_rows.iter().zip(app_rows.iter()) {
+        assert_eq!(r.len(), a.len());
+        for i in 0..r.len() {
+            if i == COV {
+                let rv: f64 = r[i].parse().unwrap();
+                let av: f64 = a[i].parse().unwrap();
+                assert!(
+                    (rv - av).abs() <= 0.01,
+                    "True_cov mismatch: real {} vs applied {}",
+                    rv,
+                    av
+                );
+            } else {
+                assert_eq!(r[i], a[i], "column {} differs: {:?} vs {:?}", i, r[i], a[i]);
+            }
+        }
+    }
+
+    // Applying to an already-`-u` profile must be rejected.
+    let u_tsv = format!("{}/real_u.tsv", dir);
+    fs::write(&u_tsv, &real_u).unwrap();
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("profile")
+        .arg("--apply-unknown")
+        .arg(&u_tsv)
+        .arg(&db)
+        .arg(&sample)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("already produced with -u"));
+
+    // The database is required: without any genome input the command must fail.
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("profile")
+        .arg("--apply-unknown")
+        .arg(&plain)
+        .arg(&sample)
+        .assert()
+        .failure();
+
+    // An --individual-records database has several genomes sharing one Genome_file
+    // (e.coli-o157 has two records), which the TSV cannot disambiguate; the size
+    // lookup would collide, so --apply-unknown must reject it rather than mis-scale.
+    let indiv_db = format!("{}/db_indiv", dir);
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("sketch")
+        .arg("-c")
+        .arg("50")
+        .arg("-i")
+        .arg("./test_files/e.coli-EC590.fasta.gz")
+        .arg("./test_files/e.coli-o157.fasta.gz")
+        .arg("./test_files/e.coli-K12.fasta.gz")
+        .arg("-o")
+        .arg(&indiv_db)
+        .assert()
+        .success()
+        .code(0);
+    let indiv_db = format!("{}.syldb", indiv_db);
+    // Profile against the individual-records db so the TSV matches it, then convert.
+    let indiv_plain = format!("{}/indiv_plain.tsv", dir);
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("profile")
+        .arg(&indiv_db)
+        .arg(&sample)
+        .arg("-o")
+        .arg(&indiv_plain)
+        .assert()
+        .success()
+        .code(0);
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("profile")
+        .arg("--apply-unknown")
+        .arg(&indiv_plain)
+        .arg(&indiv_db)
+        .arg(&sample)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("individual-records"));
+
+    // -o must not point at the input TSV: the output is truncated before the input
+    // is read, so this would destroy the profile. It must be rejected up front, and
+    // the input left intact.
+    let before = fs::read(&plain).unwrap();
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("profile")
+        .arg("--apply-unknown")
+        .arg(&plain)
+        .arg(&db)
+        .arg(&sample)
+        .arg("-o")
+        .arg(&plain)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("same as the input"));
+    assert_eq!(fs::read(&plain).unwrap(), before, "input TSV was modified");
+
+    // Two inputs printing the same Sample_file (here, the same sample sketch given
+    // twice) map to indistinguishable TSV rows; their scalars would collide, so
+    // this must be rejected rather than silently rescaled with one input's stats.
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("profile")
+        .arg("--apply-unknown")
+        .arg(&plain)
+        .arg(&db)
+        .arg(&sample)
+        .arg(&sample)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("same Sample_file"));
+
+    // An --apply-unknown invocation that is invalid for a reason OTHER than the
+    // paths (here `query`, which does not support it) must still be rejected before
+    // the -o file is created -- otherwise `File::create` truncates an existing
+    // output first. The pre-existing output must survive untouched.
+    let existing = format!("{}/existing_output.tsv", dir);
+    fs::write(&existing, b"PRECIOUS EXISTING OUTPUT\n").unwrap();
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("query")
+        .arg("--apply-unknown")
+        .arg(&plain)
+        .arg(&db)
+        .arg(&sample)
+        .arg("-o")
+        .arg(&existing)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("only supported for `profile`"));
+    assert_eq!(
+        fs::read(&existing).unwrap(),
+        b"PRECIOUS EXISTING OUTPUT\n",
+        "output file was truncated before the invocation was rejected"
+    );
+
+    // The same must hold when the rejection comes from validating the INPUT TSV
+    // (here an already-`-u` profile), which happens inside apply_unknown_from_tsv:
+    // the -o file is created only after the input is accepted, so a bad input must
+    // not truncate a pre-existing output.
+    let existing2 = format!("{}/existing_output2.tsv", dir);
+    fs::write(&existing2, b"PRECIOUS EXISTING OUTPUT 2\n").unwrap();
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("profile")
+        .arg("--apply-unknown")
+        .arg(&u_tsv)
+        .arg(&db)
+        .arg(&sample)
+        .arg("-o")
+        .arg(&existing2)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("already produced with -u"));
+    assert_eq!(
+        fs::read(&existing2).unwrap(),
+        b"PRECIOUS EXISTING OUTPUT 2\n",
+        "output file was truncated before the input TSV was rejected"
+    );
+}
