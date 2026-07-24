@@ -176,7 +176,11 @@ Smaller improvements and fixes beyond the headline features above:
   recoverable from the sample sketch (k-mer-count distribution + read length) plus the database
   (genome sizes). Pass the original TSV, the same pre-sketched sample(s) and the original database
   (both required): `weebill profile --apply-unknown profile.tsv gtdb.syl2db sample.sylspr --reference gtdb.sylref`.
-  The result matches a real `-u` run to the precision of the input TSV.
+  The result matches a real `-u` run to the precision of the input TSV, but is **not guaranteed to be
+  bit-for-bit identical**: `--apply-unknown` can only read the already-rounded columns printed in the
+  TSV (e.g. `Eff_cov` at 3 decimal places), whereas a real `-u` run rescales the full-precision internal
+  values, so individual `True_cov`/`Sequence_abundance` cells may differ by a unit in the last printed
+  place (the `Sequence_abundance` scalar can drift slightly more, as it sums the rounded per-row coverage).
 - **`sketch`/`profile --merge`** — a `--merge` flag on `sketch` and `profile` (distinct from the
   `merge` sub-command) combines all read inputs into one sample sketch; `-S` names it. Used in the
   [pooling example](#pooling-samples-with-profile---merge) above.

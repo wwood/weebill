@@ -1125,6 +1125,13 @@ fn unknown_scalars_for_sample(args: &ContainArgs, sketch: &SequencesSketch) -> U
 /// are unchanged. We therefore only need the sample sketches (for `id`, read
 /// length and total k-mer counts) and the database (for each detected genome's
 /// size, `gn_size`) -- both are required on the command line.
+///
+/// Because the only per-genome input is the already-rounded `Eff_cov` printed in
+/// the TSV (not the full-precision internal value a real `-u` run rescales), the
+/// output is not guaranteed to be bit-for-bit identical to a real `-u` run:
+/// individual `True_cov`/`Sequence_abundance` cells may differ by a unit in the
+/// last printed place (the `Sequence_abundance` scalar can drift a little more, as
+/// it sums the rounded per-row coverage across all rows).
 #[allow(clippy::too_many_arguments)]
 fn apply_unknown_from_tsv(
     args: &ContainArgs,
