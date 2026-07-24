@@ -2538,4 +2538,27 @@ fn test_profile_apply_unknown() {
         b"PRECIOUS EXISTING OUTPUT\n",
         "output file was truncated before the invocation was rejected"
     );
+
+    // The same must hold when the rejection comes from validating the INPUT TSV
+    // (here an already-`-u` profile), which happens inside apply_unknown_from_tsv:
+    // the -o file is created only after the input is accepted, so a bad input must
+    // not truncate a pre-existing output.
+    let existing2 = format!("{}/existing_output2.tsv", dir);
+    fs::write(&existing2, b"PRECIOUS EXISTING OUTPUT 2\n").unwrap();
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("profile")
+        .arg("--apply-unknown")
+        .arg(&u_tsv)
+        .arg(&db)
+        .arg(&sample)
+        .arg("-o")
+        .arg(&existing2)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("already produced with -u"));
+    assert_eq!(
+        fs::read(&existing2).unwrap(),
+        b"PRECIOUS EXISTING OUTPUT 2\n",
+        "output file was truncated before the input TSV was rejected"
+    );
 }

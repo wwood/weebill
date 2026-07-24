@@ -440,13 +440,11 @@ pub fn contain(mut args: ContainArgs, pseudotax_in: bool) {
         }
     }
 
-    let out_writer = match args.out_file_name {
-        Some(ref x) => {
-            let path = Path::new(&x);
-            Box::new(BufWriter::new(File::create(path).unwrap())) as Box<dyn Write + Send>
-        }
-        None => Box::new(BufWriter::new(io::stdout())) as Box<dyn Write + Send>,
-    };
+    // NB: the output writer is created further down, AFTER the --apply-unknown
+    // branch. `File::create` truncates the `-o` path, and apply-unknown validates
+    // the input TSV (header, rows, referenced genomes/samples) inside
+    // `apply_unknown_from_tsv`; creating `-o` here would destroy an existing output
+    // file before those checks could reject a bad invocation.
 
     log::info!("Obtaining sketches...");
     let mut genome_sketch_files = vec![];
@@ -726,13 +724,14 @@ pub fn contain(mut args: ContainArgs, pseudotax_in: bool) {
         .collect::<Vec<Vec<&String>>>();
     read_files.extend(read_sketch_files_as_vec);
     let sequence_index_vec = (0..read_files.len()).collect::<Vec<usize>>();
-    let out_writer: Mutex<Box<dyn Write + Send>> = Mutex::new(out_writer);
 
     // --apply-unknown: rescale an existing (non-`-u`) profile TSV into the profile
     // `-u` would have produced, without re-profiling. Everything `-u` changes is a
     // per-sample scalar applied to two printed columns (see `estimate_true_cov` /
     // `estimate_covered_bases`), so we only need the sample sketches (k-mer identity
     // + read length) and the database (per-genome sizes) -- both required here.
+    // `apply_unknown_from_tsv` fully validates and reads the input TSV before it
+    // creates `-o`, so a rejected invocation never truncates an existing output.
     if let Some(tsv_path) = args.apply_unknown.clone() {
         apply_unknown_from_tsv(
             &args,
@@ -744,11 +743,21 @@ pub fn contain(mut args: ContainArgs, pseudotax_in: bool) {
             ref_db.as_ref(),
             effective_genome_c,
             db_k,
-            &out_writer,
         );
         log::info!("sylph finished.");
         return;
     }
+
+    // Created only now (after the --apply-unknown early return): `File::create`
+    // truncates `-o`, so it must not run before apply-unknown's input validation.
+    let out_writer = match args.out_file_name {
+        Some(ref x) => {
+            let path = Path::new(&x);
+            Box::new(BufWriter::new(File::create(path).unwrap())) as Box<dyn Write + Send>
+        }
+        None => Box::new(BufWriter::new(io::stdout())) as Box<dyn Write + Send>,
+    };
+    let out_writer: Mutex<Box<dyn Write + Send>> = Mutex::new(out_writer);
 
     let chunks = get_chunks(&sequence_index_vec, step);
 
@@ -1132,6 +1141,10 @@ fn unknown_scalars_for_sample(args: &ContainArgs, sketch: &SequencesSketch) -> U
 /// individual `True_cov`/`Sequence_abundance` cells may differ by a unit in the
 /// last printed place (the `Sequence_abundance` scalar can drift a little more, as
 /// it sums the rounded per-row coverage across all rows).
+///
+/// The output file (`-o`) is created only after every input check has passed and
+/// the whole TSV has been read, so a rejected invocation never truncates an
+/// existing output.
 #[allow(clippy::too_many_arguments)]
 fn apply_unknown_from_tsv(
     args: &ContainArgs,
@@ -1143,7 +1156,6 @@ fn apply_unknown_from_tsv(
     ref_db: Option<&crate::refdelta::RefIndex>,
     effective_genome_c: usize,
     db_k: usize,
-    out_writer: &Mutex<Box<dyn Write + Send>>,
 ) {
     // Genome_file column -> genome size, from the database (never the TSV).
     // A profile TSV identifies each detected genome only by its `Genome_file`
@@ -1334,9 +1346,28 @@ fn apply_unknown_from_tsv(
 
     // Pass 2: rescale and print. True_cov = Eff_cov * cov_scale; Sequence_abundance
     // *= bases_explained; every other column is passed through verbatim.
+    //
+    // Only now -- after every validation above has passed and the whole input TSV
+    // has been read into `rows` -- do we create the output. `File::create`
+    // truncates `-o`, so opening it any earlier would let a rejected invocation
+    // (bad header, unknown genome/sample, duplicate names, ...) destroy an existing
+    // output file before erroring.
+    let mut w: Box<dyn Write> = match &args.out_file_name {
+        Some(x) => {
+            let path = Path::new(x);
+            Box::new(BufWriter::new(File::create(path).unwrap_or_else(|e| {
+                log::error!(
+                    "--apply-unknown: could not create output file `{}`: {}. Exiting.",
+                    x,
+                    e
+                );
+                std::process::exit(1);
+            })))
+        }
+        None => Box::new(BufWriter::new(io::stdout())),
+    };
     let mut new_header: Vec<&str> = cols.clone();
     new_header[COV] = "True_cov";
-    let mut w = out_writer.lock().unwrap();
     writeln!(w, "{}", new_header.join("\t")).expect("Error writing to file");
     for mut row in rows {
         let sample = row[0].clone();
