@@ -394,6 +394,24 @@ pub fn contain(mut args: ContainArgs, pseudotax_in: bool) {
         .build_global()
         .unwrap();
 
+    // --apply-unknown reads the input TSV, but `File::create` below truncates the
+    // output first -- so `-o` pointing at the same file would wipe the input before
+    // it is read. Reject that here, before the output is created. Compare canonical
+    // paths when both resolve; otherwise fall back to a literal path comparison.
+    if let (Some(tsv), Some(out)) = (&args.apply_unknown, &args.out_file_name) {
+        let same = match (std::fs::canonicalize(tsv), std::fs::canonicalize(out)) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => Path::new(tsv) == Path::new(out),
+        };
+        if same {
+            log::error!(
+                "--apply-unknown: the output file (-o `{}`) is the same as the input profile TSV; this would overwrite the input before it is read. Write to a different path. Exiting.",
+                out
+            );
+            std::process::exit(1);
+        }
+    }
+
     let out_writer = match args.out_file_name {
         Some(ref x) => {
             let path = Path::new(&x);
@@ -1165,7 +1183,21 @@ fn apply_unknown_from_tsv(
             .sample_name
             .clone()
             .unwrap_or_else(|| sketch.file_name.clone());
-        scalars.insert(seq_name, unknown_scalars_for_sample(args, &sketch));
+        // Two inputs printing the same Sample_file (e.g. the same --sample-name, or
+        // the same read path from different directories) map to indistinguishable
+        // TSV rows, so their scalars would silently overwrite each other and rescale
+        // one sample's rows with the other's read-length/count distribution. A real
+        // -u run processes each input separately; refuse rather than mis-scale.
+        if scalars
+            .insert(seq_name.clone(), unknown_scalars_for_sample(args, &sketch))
+            .is_some()
+        {
+            log::error!(
+                "--apply-unknown: two sample inputs print the same Sample_file `{}`; their rows in the profile TSV cannot be told apart. Give each a distinct sample so their -u scalars do not collide. Exiting.",
+                seq_name
+            );
+            std::process::exit(1);
+        }
     }
 
     // Read the whole TSV (profiles are small) so we can sum covered bases per

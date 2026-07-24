@@ -2484,4 +2484,35 @@ fn test_profile_apply_unknown() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("individual-records"));
+
+    // -o must not point at the input TSV: the output is truncated before the input
+    // is read, so this would destroy the profile. It must be rejected up front, and
+    // the input left intact.
+    let before = fs::read(&plain).unwrap();
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("profile")
+        .arg("--apply-unknown")
+        .arg(&plain)
+        .arg(&db)
+        .arg(&sample)
+        .arg("-o")
+        .arg(&plain)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("same as the input"));
+    assert_eq!(fs::read(&plain).unwrap(), before, "input TSV was modified");
+
+    // Two inputs printing the same Sample_file (here, the same sample sketch given
+    // twice) map to indistinguishable TSV rows; their scalars would collide, so
+    // this must be rejected rather than silently rescaled with one input's stats.
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("profile")
+        .arg("--apply-unknown")
+        .arg(&plain)
+        .arg(&db)
+        .arg(&sample)
+        .arg(&sample)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("same Sample_file"));
 }
