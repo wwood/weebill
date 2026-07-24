@@ -2445,4 +2445,43 @@ fn test_profile_apply_unknown() {
         .arg(&sample)
         .assert()
         .failure();
+
+    // An --individual-records database has several genomes sharing one Genome_file
+    // (e.coli-o157 has two records), which the TSV cannot disambiguate; the size
+    // lookup would collide, so --apply-unknown must reject it rather than mis-scale.
+    let indiv_db = format!("{}/db_indiv", dir);
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("sketch")
+        .arg("-c")
+        .arg("50")
+        .arg("-i")
+        .arg("./test_files/e.coli-EC590.fasta.gz")
+        .arg("./test_files/e.coli-o157.fasta.gz")
+        .arg("./test_files/e.coli-K12.fasta.gz")
+        .arg("-o")
+        .arg(&indiv_db)
+        .assert()
+        .success()
+        .code(0);
+    let indiv_db = format!("{}.syldb", indiv_db);
+    // Profile against the individual-records db so the TSV matches it, then convert.
+    let indiv_plain = format!("{}/indiv_plain.tsv", dir);
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("profile")
+        .arg(&indiv_db)
+        .arg(&sample)
+        .arg("-o")
+        .arg(&indiv_plain)
+        .assert()
+        .success()
+        .code(0);
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("profile")
+        .arg("--apply-unknown")
+        .arg(&indiv_plain)
+        .arg(&indiv_db)
+        .arg(&sample)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("individual-records"));
 }

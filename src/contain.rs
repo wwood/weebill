@@ -1119,7 +1119,13 @@ fn apply_unknown_from_tsv(
     out_writer: &Mutex<Box<dyn Write + Send>>,
 ) {
     // Genome_file column -> genome size, from the database (never the TSV).
-    let gn_size_map: FxHashMap<String, usize> = match two_stage_db {
+    // A profile TSV identifies each detected genome only by its `Genome_file`
+    // (source fasta path). With `--individual-records` several genome sketches
+    // share one fasta and are disambiguated only by `Contig_name`, so keying by
+    // `Genome_file` alone would collide and yield wrong sizes for all but one
+    // record. Rather than silently mis-scale, refuse such a database: build the
+    // map and croak on the first duplicate name.
+    let db_genome_sizes: Vec<(String, usize)> = match two_stage_db {
         Some(db) => db
             .genome_sizes()
             .into_iter()
@@ -1130,6 +1136,16 @@ fn apply_unknown_from_tsv(
             .map(|gs| (gs.file_name.clone(), gs.gn_size))
             .collect(),
     };
+    let mut gn_size_map: FxHashMap<String, usize> = FxHashMap::default();
+    for (name, size) in db_genome_sizes {
+        if gn_size_map.insert(name.clone(), size).is_some() {
+            log::error!(
+                "--apply-unknown: the database contains multiple genomes with the same Genome_file `{}` (an --individual-records database). A profile TSV identifies genomes by Genome_file alone, so their sizes cannot be told apart; --apply-unknown does not support such databases. Re-run the original profile with -u instead. Exiting.",
+                name
+            );
+            std::process::exit(1);
+        }
+    }
 
     // Per-sample scalars, keyed by the Sample_file value each sketch prints
     // (sample_name if set, else file_name -- matching `AniResult::seq_name`).
