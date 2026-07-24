@@ -394,38 +394,17 @@ pub fn contain(mut args: ContainArgs, pseudotax_in: bool) {
         .build_global()
         .unwrap();
 
-    // --apply-unknown reads the input TSV, but `File::create` below truncates the
-    // output first -- so `-o` pointing at the same file would wipe the input before
-    // it is read. Reject that here, before the output is created. Compare canonical
-    // paths when both resolve; otherwise fall back to a literal path comparison.
-    if let (Some(tsv), Some(out)) = (&args.apply_unknown, &args.out_file_name) {
-        let same = match (std::fs::canonicalize(tsv), std::fs::canonicalize(out)) {
-            (Ok(a), Ok(b)) => a == b,
-            _ => Path::new(tsv) == Path::new(out),
-        };
-        if same {
-            log::error!(
-                "--apply-unknown: the output file (-o `{}`) is the same as the input profile TSV; this would overwrite the input before it is read. Write to a different path. Exiting.",
-                out
-            );
-            std::process::exit(1);
-        }
-    }
-
-    let out_writer = match args.out_file_name {
-        Some(ref x) => {
-            let path = Path::new(&x);
-            Box::new(BufWriter::new(File::create(path).unwrap())) as Box<dyn Write + Send>
-        }
-        None => Box::new(BufWriter::new(io::stdout())) as Box<dyn Write + Send>,
-    };
-
     if args.estimate_read_counts {
         args.estimate_unknown = true;
         log::info!("--estimate-read-counts detected, also enabling -u. Sequence_abundance column will be set to estimated read counts, not abundance. This is still experimental.");
     }
 
-    if args.apply_unknown.is_some() {
+    // Validate --apply-unknown BEFORE the output writer is created: `File::create`
+    // below truncates the `-o` path, so any invalid --apply-unknown invocation that
+    // errors out afterwards would first destroy an existing output file (and, when
+    // `-o` is the input TSV itself, the input). All apply-unknown gating therefore
+    // lives here, ahead of output creation.
+    if let Some(tsv) = args.apply_unknown.clone() {
         if !pseudotax_in {
             log::error!("--apply-unknown is only supported for `profile` (it rewrites a profile TSV). Exiting.");
             std::process::exit(1);
@@ -444,7 +423,30 @@ pub fn contain(mut args: ContainArgs, pseudotax_in: bool) {
             );
             std::process::exit(1);
         }
+        // `-o` pointing at the input TSV would wipe the input before it is read.
+        // Compare canonical paths when both resolve; else a literal comparison.
+        if let Some(out) = &args.out_file_name {
+            let same = match (std::fs::canonicalize(&tsv), std::fs::canonicalize(out)) {
+                (Ok(a), Ok(b)) => a == b,
+                _ => Path::new(&tsv) == Path::new(out),
+            };
+            if same {
+                log::error!(
+                    "--apply-unknown: the output file (-o `{}`) is the same as the input profile TSV; this would overwrite the input before it is read. Write to a different path. Exiting.",
+                    out
+                );
+                std::process::exit(1);
+            }
+        }
     }
+
+    let out_writer = match args.out_file_name {
+        Some(ref x) => {
+            let path = Path::new(&x);
+            Box::new(BufWriter::new(File::create(path).unwrap())) as Box<dyn Write + Send>
+        }
+        None => Box::new(BufWriter::new(io::stdout())) as Box<dyn Write + Send>,
+    };
 
     log::info!("Obtaining sketches...");
     let mut genome_sketch_files = vec![];

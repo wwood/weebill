@@ -2515,4 +2515,27 @@ fn test_profile_apply_unknown() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("same Sample_file"));
+
+    // An --apply-unknown invocation that is invalid for a reason OTHER than the
+    // paths (here `query`, which does not support it) must still be rejected before
+    // the -o file is created -- otherwise `File::create` truncates an existing
+    // output first. The pre-existing output must survive untouched.
+    let existing = format!("{}/existing_output.tsv", dir);
+    fs::write(&existing, b"PRECIOUS EXISTING OUTPUT\n").unwrap();
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("query")
+        .arg("--apply-unknown")
+        .arg(&plain)
+        .arg(&db)
+        .arg(&sample)
+        .arg("-o")
+        .arg(&existing)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("only supported for `profile`"));
+    assert_eq!(
+        fs::read(&existing).unwrap(),
+        b"PRECIOUS EXISTING OUTPUT\n",
+        "output file was truncated before the invocation was rejected"
+    );
 }
