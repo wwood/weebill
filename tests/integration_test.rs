@@ -1209,7 +1209,10 @@ fn test_two_stage_profile_raw_reads() {
         "raw-read two-stage profile differs from the pre-sketched one"
     );
 
-    // The same reads given positionally rather than with -r.
+    // The same reads given positionally rather than with -r. Only raw *fastq* is
+    // taken as a sample this way: a positional fasta is a genome input, which
+    // alongside a .syl2db leaves no read input at all, so raw fasta reads must be
+    // given with -r (as the README says).
     assert_eq!(
         rows_without_sample(&profile_of(&[
             "./test_files/o157_reads.fastq.gz",
@@ -1219,6 +1222,13 @@ fn test_two_stage_profile_raw_reads() {
         rows_without_sample(&raw),
         "positional raw reads differ from -r"
     );
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("profile")
+        .arg("--two-stage")
+        .arg(&two_stage_db)
+        .arg("./test_files/e.coli-K12.fasta.gz")
+        .assert()
+        .failure();
 
     // Raw paired-end reads (-1/-2) are sketched and profiled too.
     let paired = profile_of(&[
