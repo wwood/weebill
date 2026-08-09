@@ -14,6 +14,7 @@ Weebill is currently in development and is experimental. Efforts are made to con
 - [Installation](#installation)
 - [Usage examples](#usage-examples)
   - [From reads to a profile (two-stage)](#from-reads-to-a-profile-two-stage)
+  - [Profiling raw reads directly (no sketch files)](#profiling-raw-reads-directly-no-sketch-files)
   - [Pooling samples with `profile --merge`](#pooling-samples-with-profile---merge)
   - [Reference-delta samples with `profile --reference`](#reference-delta-samples-with-profile---reference)
 - [Changes in the weebill fork](#changes-in-the-weebill-fork)
@@ -79,9 +80,50 @@ weebill profile --two-stage gtdb.syl2db sketches/*.sylspc > profile.tsv
 ```
 
 Compressed sample sketches are smaller on disk and are read transparently by `profile`,
-`query`, and `inspect`. `profile` also accepts raw fastq/fasta directly and will sketch them on
-the fly, e.g. `weebill profile --two-stage gtdb.syl2db -r sampleA.fastq.gz`. Swap `profile` for
-`query` (against `gtdb.syldb`) to get nearest-neighbour containment ANI instead of a profile.
+`query`, and `inspect`. If you do not need the sketches themselves, steps 3 and 4 can be collapsed
+into one command — see [profiling raw reads directly](#profiling-raw-reads-directly-no-sketch-files)
+below. Swap `profile` for `query` (against `gtdb.syldb`) to get nearest-neighbour containment ANI
+instead of a profile.
+
+### Profiling raw reads directly (no sketch files)
+
+`profile --two-stage` accepts raw fastq/fasta reads directly and sketches them in memory, so no
+`.sylspc` files are written. This is the shortest everyday route from reads to a profile, and is the
+one to use when a sample is profiled once and its sketch would just be thrown away. All read input
+styles work, and each input becomes its own sample (its own set of rows in the output):
+
+```sh
+# single-end (repeat -r for more samples; -t sets threads)
+weebill profile --two-stage gtdb.syl2db -r sampleA.fastq.gz -r sampleB.fastq.gz -t 16 > profile.tsv
+
+# paired-end (-1/-2 pair up positionally)
+weebill profile --two-stage gtdb.syl2db -1 sampleA_1.fq.gz -2 sampleA_2.fq.gz > profile.tsv
+
+# interleaved paired-end
+weebill profile --two-stage gtdb.syl2db --interleaved sampleA.fq.gz > profile.tsv
+
+# mix raw reads and pre-sketched samples in one run
+weebill profile --two-stage gtdb.syl2db -r sampleA.fastq.gz sketches/sampleB.sylspc > profile.tsv
+```
+
+Raw fastq/fasta can also be given positionally (`weebill profile --two-stage gtdb.syl2db
+sampleA.fastq.gz`); `-r`/`-1`/`-2`/`--interleaved` are clearer and are the only way to specify
+paired input. Everything else behaves as with pre-sketched samples: `-u`/`--estimate-unknown`,
+`--merge`/`-S` (see [pooling](#pooling-samples-with-profile---merge)) and `-o` all apply. Passing a
+`.syl2db` implies `--two-stage`, so the flag is optional when the database is a two-stage one.
+
+Two things to watch when sketching on the fly:
+
+- **`-c` must be no larger than the database's dense `-c`.** Reads are sketched with `profile`'s own
+  `-c` (default `200`) and `-k` (default `31`), which are ignored for pre-sketched inputs. If the
+  database is denser than the sample — e.g. a `-c 50` database with the default `-c 200` — that
+  sample is *skipped* with an error logged to stderr, and the run still exits 0 with no rows for it.
+  Pass a matching or smaller `-c` (e.g. `-c 50` for a `-c 50` database); `weebill inspect
+  gtdb.syl2db` reports the database's values.
+- **The sketch is not kept.** Reads are re-sketched on every run, which dominates the runtime for
+  large fastq files. If a sample will be profiled more than once (different databases, re-runs,
+  `query` as well as `profile`), sketch it to disk first with `weebill sketch
+  --compressed-database` as in the [workflow above](#from-reads-to-a-profile-two-stage).
 
 ### Pooling samples with `profile --merge`
 

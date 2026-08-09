@@ -5,6 +5,10 @@ changes made in weebill.
 
 ## Unreleased
 
+### Documentation
+
+- The README now documents profiling raw reads directly with `profile --two-stage` (sketching on the fly, no `.sylspc` files) as an everyday workflow, covering single-end (`-r`), paired-end (`-1`/`-2`), interleaved and positional inputs, that a `.syl2db` implies `--two-stage`, and the two caveats: `profile`'s `-c` must be no larger than the database's dense `-c` (otherwise the sample is skipped with an error but the run still exits 0), and the on-the-fly sketch is not kept, so samples profiled more than once are better sketched to disk first. Behaviour is unchanged; a test now covers the raw-read path.
+
 ## Version 0.3.0
 
 ### Added
