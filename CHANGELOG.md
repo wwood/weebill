@@ -5,6 +5,10 @@ changes made in weebill.
 
 ## Unreleased
 
+### Added
+
+- `weebill db-add` adds new genomes to an existing two-stage database (`.syl2db`) without rebuilding it from its source `.syldb`. The new genomes come from pre-sketched databases (`*.syldb`/`*.syldbc`) and/or raw FASTAs given with `-g`, which are sketched here at the existing database's own `-c`/`-k`/`--min-spacing` so they are directly comparable. Because every genome's dense block is independently Golomb-Rice coded and self-delimiting, the existing blocks are copied through byte for byte and the new ones appended; only the stage-1 screen index is rebuilt, since its pooled MPHF cannot absorb new keys. The result is exactly what a `db-convert` of all the genomes together would produce — same metadata, same dense blocks, same screen results — verified against it in the tests. Updates are in place by default (written to a sibling temp file and renamed, so an interrupted run leaves the original intact) or to a separate `-o` output. Adding a genome whose file name is already in the database is an error, since a `.syl2db` identifies genomes by that name alone; `--skip-existing` ignores such genomes instead, making a repeated add a no-op. Mismatched `-c`/`-k`, genomes sketched with `--disable-profiling`, and a database that fails its checksum (unless `--no-verify`) are all refused before anything is written.
+
 ## Version 0.3.0
 
 ### Added

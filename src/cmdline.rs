@@ -40,13 +40,65 @@ pub enum Mode {
     ///Convert a standard database (.syldb) into a two-stage seekable database (.syl2db) for `profile --two-stage`.
     #[clap(arg_required_else_help = true, display_order = 7)]
     DbConvert(DbConvertArgs),
+    ///Add new genomes to an existing two-stage database (.syl2db) without rebuilding it from scratch.
+    #[clap(arg_required_else_help = true, display_order = 7)]
+    DbAdd(DbAddArgs),
+}
+
+#[derive(Args)]
+pub struct DbAddArgs {
+    #[clap(
+        short = 'D',
+        long = "database",
+        help = "Existing two-stage database (*.syl2db) to add genomes to"
+    )]
+    pub database: String,
+    #[clap(
+        multiple = true,
+        help = "Genome database sketches (*.syldb/*.syldbc) whose genomes are added. They must have been sketched with the same -c and -k as the existing database."
+    )]
+    pub files: Vec<String>,
+    #[clap(
+        multiple = true,
+        short = 'g',
+        long = "genomes",
+        help = "Genomes in fasta format, sketched here at the existing database's -c and -k"
+    )]
+    pub genomes: Vec<String>,
+    #[clap(
+        short = 'o',
+        long = "output",
+        help = "Write the grown database here (.syl2db appended) instead of updating --database in place. In-place updates are written to a temporary file and renamed, so an interrupted run leaves the original intact."
+    )]
+    pub output: Option<String>,
+    #[clap(
+        long = "skip-existing",
+        help = "Silently skip genomes whose file name is already in the database instead of exiting with an error"
+    )]
+    pub skip_existing: bool,
+    #[clap(
+        long = "no-verify",
+        help = "Skip the whole-file checksum verification of the existing database. Verifying reads it end to end (growing it otherwise only reads each dense block once anyway), and refusing to build on a corrupt database is usually what you want."
+    )]
+    pub no_verify: bool,
+    #[clap(
+        long = "min-spacing",
+        help = "Minimum spacing between selected k-mers when sketching -g genomes. Default: the value the existing database's genomes were sketched with, so the added genomes match."
+    )]
+    pub min_spacing_kmer: Option<usize>,
+    #[clap(short, default_value_t = 3, help = "Number of threads")]
+    pub threads: usize,
+    #[clap(long = "trace", help = "Trace output")]
+    pub trace: bool,
+    #[clap(long = "debug", help = "Debug output")]
+    pub debug: bool,
 }
 
 #[derive(Args)]
 pub struct DbConvertArgs {
     #[clap(
         multiple = true,
-        help = "Standard genome database sketches (*.syldb) to convert"
+        help = "Standard genome database sketches (*.syldb, or compressed *.syldbc) to convert"
     )]
     pub files: Vec<String>,
     #[clap(

@@ -15,6 +15,7 @@ Weebill is currently in development and is experimental. Efforts are made to con
 - [Usage examples](#usage-examples)
   - [From reads to a profile (two-stage)](#from-reads-to-a-profile-two-stage)
   - [Pre-sketching samples](#pre-sketching-samples)
+  - [Adding genomes to a `.syl2db`](#adding-genomes-to-a-syl2db)
   - [Pooling samples with `profile --merge`](#pooling-samples-with-profile---merge)
   - [Reference-delta samples with `profile --reference`](#reference-delta-samples-with-profile---reference)
 - [Changes in the weebill fork](#changes-in-the-weebill-fork)
@@ -121,6 +122,30 @@ transparently by `profile`, `query`, and `inspect`. A pre-sketched sample carrie
 `-c 200` or smaller for a `-c 200` database). Swap `profile` for `query` (against `gtdb.syldb`) to
 get nearest-neighbour containment ANI instead of a profile.
 
+### Adding genomes to a `.syl2db`
+
+`db-add` grows an existing two-stage database in place rather than re-running `db-convert` on
+the whole (possibly hundreds of thousands of genomes) source database. New genomes come from
+pre-sketched `.syldb` files and/or raw FASTAs, which are sketched at the existing database's own
+`-c`/`-k`:
+
+```sh
+# from a pre-sketched database (must match the existing -c/-k)
+weebill sketch -g new_genomes/*.fa -c 200 -o new_genomes
+weebill db-add -D gtdb.syl2db new_genomes.syldb
+
+# or straight from fastas, sketched here to match gtdb.syl2db
+weebill db-add -D gtdb.syl2db -g new_genomes/*.fa
+
+# write to a new file instead of updating gtdb.syl2db in place
+weebill db-add -D gtdb.syl2db -g new_genomes/*.fa -o gtdb_plus
+```
+
+The result is what converting all the genomes at once would have produced. Genomes are keyed by
+file name, so re-adding one is an error (`--skip-existing` ignores those already present), and
+in-place updates go through a temp file and a rename so an interrupted run leaves the original
+database intact.
+
 ### Pooling samples with `profile --merge`
 
 `--merge` combines several read inputs — any mix of pre-sketched samples and raw reads — into a
@@ -168,6 +193,11 @@ The binary is installed as `weebill`. Weebill changes:
 
 - **Lighter weight profiling** - the `profile` command can use a "2 stage" profiling approach which is
 ~7–27× faster and uses ~6× less RAM (a flat ~4.4 GB vs the whole ~26 GB database) than standard sylph profiling (when input is sketches - FASTA/FASTQ inputs are also faster but more modestly). The on-disk database is also ~22% smaller. The profiles produced are effectively identical to standard sylph profiling, and the speed/RAM boost means that choosing smaller `c` values is more computationally feasible. To use this mode, see `weebill db-convert` and `weebill profile --two-stage`.
+- **Growable two-stage databases** — `weebill db-add` adds genomes to an existing `.syl2db`
+  without rebuilding it. Each genome's dense block is independently coded, so the existing blocks
+  are copied through byte for byte and the new ones appended; only the small stage-1 screen index
+  is rebuilt (its pooled MPHF cannot absorb new keys). The result is identical to converting all
+  the genomes at once. See [Adding genomes to a `.syl2db`](#adding-genomes-to-a-syl2db).
 - **Compressed sketches** — `weebill sketch --compressed-output`/`--compressed-database` write
   `.sylspc` samples and `.syldbc` databases (~55% smaller samples, ~30%+ smaller databases). Hashes
   are sorted, delta-encoded and Golomb–Rice coded, then wrapped in a zstd frame. `query`, `profile`,

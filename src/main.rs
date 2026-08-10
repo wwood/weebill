@@ -34,5 +34,6 @@ fn main() {
         Mode::RefBuild(args) => refdelta::run_ref_build(args),
         Mode::RefCompress(args) => refdelta::run_ref_compress(args),
         Mode::DbConvert(args) => twostage_db::run_db_convert(args),
+        Mode::DbAdd(args) => twostage_db::run_db_add(args),
     }
 }
