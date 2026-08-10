@@ -1194,17 +1194,9 @@ pub fn run_db_add(args: DbAddArgs) {
         let sketched: Vec<GenomeSketch> = args
             .genomes
             .par_iter()
-            .flat_map(|g| {
-                if args.individual {
-                    crate::sketch::sketch_genome_individual(db.c, db.k, g, min_spacing, true)
-                } else {
-                    crate::sketch::sketch_genome(db.c, db.k, g, min_spacing, true)
-                        .into_iter()
-                        .collect()
-                }
-            })
+            .filter_map(|g| crate::sketch::sketch_genome(db.c, db.k, g, min_spacing, true))
             .collect();
-        if sketched.len() < args.genomes.len() && !args.individual {
+        if sketched.len() < args.genomes.len() {
             warn!(
                 "Only {} of {} genome fasta(s) could be sketched; the rest were skipped",
                 sketched.len(),
@@ -1260,11 +1252,9 @@ pub fn run_db_add(args: DbAddArgs) {
             );
             std::process::exit(1);
         }
-        // Individual-records genomes legitimately repeat a file name across records,
-        // so only flag a repeat when the inputs are whole-genome sketches.
-        if !args.individual && !seen_new.insert(s.file_name.clone()) {
+        if !seen_new.insert(s.file_name.clone()) {
             error!(
-                "Genome '{}' appears more than once in the genomes to add; each genome must be distinct. If these are individual records of one fasta, pass -i/--individual-records. Exiting",
+                "Genome '{}' appears more than once in the genomes to add; each genome must be distinct. Exiting",
                 s.file_name
             );
             std::process::exit(1);
@@ -1308,13 +1298,16 @@ pub fn run_db_add(args: DbAddArgs) {
             std::fs::create_dir_all(parent).ok();
         }
     }
-    let in_place = std::fs::canonicalize(&out).ok().is_some_and(|o| {
-        std::fs::canonicalize(&args.database)
-            .ok()
-            .is_some_and(|d| d == o)
-    });
+    // Never truncate an existing output directly. Besides making replacement
+    // atomic, this protects the source when `-o` is a hard link or symlink to it:
+    // path canonicalization alone cannot identify hard links.
+    let replace_existing = Path::new(&out).exists();
     let tmp = format!("{}.tmp{}", out, std::process::id());
-    let write_path = if in_place { tmp.clone() } else { out.clone() };
+    let write_path = if replace_existing {
+        tmp.clone()
+    } else {
+        out.clone()
+    };
 
     info!(
         "Adding {} genome(s) to {} existing -> {} ({} genomes total)",
@@ -1359,7 +1352,7 @@ pub fn run_db_add(args: DbAddArgs) {
         error!("Failed to write {}: {}. Exiting", write_path, e);
         std::process::exit(1);
     }
-    if in_place {
+    if replace_existing {
         if let Err(e) = std::fs::rename(&tmp, &out) {
             let _ = std::fs::remove_file(&tmp);
             error!("Could not replace {} with the grown database: {}", out, e);

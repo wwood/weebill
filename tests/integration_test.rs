@@ -1423,6 +1423,32 @@ fn test_two_stage_db_add() {
         "db-add -g detected a different genome set from a single db-convert"
     );
 
+    // An existing -o may be a hard link to the input. It must be replaced through
+    // a temporary file rather than opened directly, which would truncate the input
+    // database through the shared inode before its blocks can be copied.
+    let hardlink_out = format!("{}/hardlink-output.syl2db", dir);
+    fs::hard_link(&base, &hardlink_out).unwrap();
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("db-add")
+        .arg("-D")
+        .arg(&base)
+        .arg(format!("{}/db_third.syldb", dir))
+        .arg("-o")
+        .arg(&hardlink_out)
+        .assert()
+        .success()
+        .code(0);
+    assert_eq!(
+        fs::read(&base).unwrap(),
+        base_bytes,
+        "db-add through a hard-linked -o modified the input database"
+    );
+    assert_eq!(
+        detected_genomes(&profile(&hardlink_out)),
+        detected_genomes(&reference),
+        "db-add through a hard-linked -o produced the wrong genomes"
+    );
+
     // A genome already present is an error by default, and a no-op with
     // --skip-existing (which must leave the database byte-identical).
     let mut cmd = Command::cargo_bin("weebill").unwrap();
@@ -1516,135 +1542,6 @@ fn test_two_stage_db_add() {
         detected_genomes(&profile(&format!("{}/from_syldbc.syl2db", dir))),
         detected_genomes(&reference),
         "db-add from a .syldbc detected a different genome set"
-    );
-}
-
-/// `db-add` on an `--individual-records` database keeps per-record genomes distinct:
-/// several records share one `file_name`, so the duplicate-name guard must not fire
-/// on them, and the added records must be detected individually.
-#[serial]
-#[test]
-fn test_two_stage_db_add_individual_records() {
-    fresh();
-    let dir = "./tests/results/two_stage_db_add_indiv";
-    let _ = fs::remove_dir_all(dir);
-    fs::create_dir_all(dir).unwrap();
-
-    // e.coli-o157 has more than one record, so its records share a file name.
-    let mut cmd = Command::cargo_bin("weebill").unwrap();
-    cmd.arg("sketch")
-        .arg("-c")
-        .arg("50")
-        .arg("-i")
-        .arg("./test_files/e.coli-K12.fasta.gz")
-        .arg("-o")
-        .arg(format!("{}/db_k12", dir))
-        .assert()
-        .success()
-        .code(0);
-    let mut cmd = Command::cargo_bin("weebill").unwrap();
-    cmd.arg("sketch")
-        .arg("-c")
-        .arg("50")
-        .arg("./test_files/o157_reads.fastq.gz")
-        .arg("-d")
-        .arg(dir)
-        .assert()
-        .success()
-        .code(0);
-    let sample = format!("{}/o157_reads.fastq.gz.sylsp", dir);
-
-    let mut cmd = Command::cargo_bin("weebill").unwrap();
-    cmd.arg("db-convert")
-        .arg(format!("{}/db_k12.syldb", dir))
-        .arg("--screen-c")
-        .arg("200")
-        .arg("-o")
-        .arg(format!("{}/db2", dir))
-        .assert()
-        .success()
-        .code(0);
-    let db2 = format!("{}/db2.syl2db", dir);
-
-    // Add o157's individual records straight from the fasta.
-    let mut cmd = Command::cargo_bin("weebill").unwrap();
-    cmd.arg("db-add")
-        .arg("-D")
-        .arg(&db2)
-        .arg("-i")
-        .arg("-g")
-        .arg("./test_files/e.coli-o157.fasta.gz")
-        .assert()
-        .success()
-        .code(0);
-
-    let mut cmd = Command::cargo_bin("weebill").unwrap();
-    let out = cmd
-        .arg("profile")
-        .arg("--two-stage")
-        .arg(&db2)
-        .arg(&sample)
-        .output()
-        .expect("Output failed");
-    assert!(out.status.success());
-    let out = str::from_utf8(&out.stdout).expect("not UTF-8");
-    assert!(out.contains("e.coli-o157.fasta.gz"));
-
-    // Same genome set as converting an --individual-records database of both fastas
-    // in one go.
-    let mut cmd = Command::cargo_bin("weebill").unwrap();
-    cmd.arg("sketch")
-        .arg("-c")
-        .arg("50")
-        .arg("-i")
-        .arg("./test_files/e.coli-K12.fasta.gz")
-        .arg("./test_files/e.coli-o157.fasta.gz")
-        .arg("-o")
-        .arg(format!("{}/db_both", dir))
-        .assert()
-        .success()
-        .code(0);
-    let mut cmd = Command::cargo_bin("weebill").unwrap();
-    cmd.arg("db-convert")
-        .arg(format!("{}/db_both.syldb", dir))
-        .arg("--screen-c")
-        .arg("200")
-        .arg("-o")
-        .arg(format!("{}/both2", dir))
-        .assert()
-        .success()
-        .code(0);
-    let mut cmd = Command::cargo_bin("weebill").unwrap();
-    let both = cmd
-        .arg("profile")
-        .arg("--two-stage")
-        .arg(format!("{}/both2.syl2db", dir))
-        .arg(&sample)
-        .output()
-        .expect("Output failed");
-    assert!(both.status.success());
-    let both = str::from_utf8(&both.stdout).expect("not UTF-8");
-
-    // Per-record key = genome_file (col 2) + contig name (last col).
-    let per_record = |tsv: &str| -> Vec<String> {
-        let mut v: Vec<String> = tsv
-            .lines()
-            .skip(1)
-            .filter_map(|l| {
-                let cols: Vec<&str> = l.split('\t').collect();
-                if cols.len() < 2 {
-                    return None;
-                }
-                Some(format!("{}\t{}", cols[1], cols[cols.len() - 1]))
-            })
-            .collect();
-        v.sort();
-        v
-    };
-    assert_eq!(
-        per_record(out),
-        per_record(both),
-        "db-add -i lost or merged individual records"
     );
 }
 

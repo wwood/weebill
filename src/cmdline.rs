@@ -82,12 +82,6 @@ pub struct DbAddArgs {
     )]
     pub no_verify: bool,
     #[clap(
-        short,
-        long = "individual-records",
-        help = "Use individual records (contigs) of the -g fastas as separate genomes, matching a database built by `sketch --individual-records`"
-    )]
-    pub individual: bool,
-    #[clap(
         long = "min-spacing",
         help = "Minimum spacing between selected k-mers when sketching -g genomes. Default: the value the existing database's genomes were sketched with, so the added genomes match."
     )]
