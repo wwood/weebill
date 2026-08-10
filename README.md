@@ -14,6 +14,7 @@ Weebill is currently in development and is experimental. Efforts are made to con
 - [Installation](#installation)
 - [Usage examples](#usage-examples)
   - [From reads to a profile (two-stage)](#from-reads-to-a-profile-two-stage)
+  - [Pre-sketching samples](#pre-sketching-samples)
   - [Adding genomes to a `.syl2db`](#adding-genomes-to-a-syl2db)
   - [Pooling samples with `profile --merge`](#pooling-samples-with-profile---merge)
   - [Reference-delta samples with `profile --reference`](#reference-delta-samples-with-profile---reference)
@@ -57,27 +58,69 @@ parallelise.
 
 ### From reads to a profile (two-stage)
 
-This is the recommended everyday workflow. Sketch the genomes once, convert the database into a
-two-stage seekable database (`.syl2db`), sketch your reads into compressed sample sketches, then
-profile with `--two-stage` — which is much faster and uses far less RAM than a standard profile
-(see [Changes in the weebill fork](#changes-in-the-weebill-fork)).
+This is the recommended everyday workflow: build the two-stage database once, then profile reads
+straight against it. `profile --two-stage` takes raw fastq and sketches it in memory, so no sample
+sketch files are needed — and two-stage profiling is much faster and uses far less RAM than a
+standard profile (see [Changes in the weebill fork](#changes-in-the-weebill-fork)).
 
 ```sh
-# 1. Sketch a genome database (standard .syldb; db-convert reads this format)
+# 1. Get a standard database sketch (.syldb) -- ONCE.
+#    Either download a pre-built one (e.g. GTDB) from the sylph pre-built databases page:
+#      https://sylph-docs.github.io/pre%E2%80%90built-databases/
+#    or sketch your own genomes:
 weebill sketch -g genomes/*.fa -o gtdb
 
-# 2. Convert it into a two-stage seekable database (-> gtdb.syl2db)
+# 2. Convert it into a two-stage seekable database (-> gtdb.syl2db) -- ONCE.
 weebill db-convert gtdb.syldb -o gtdb
 
-# 3. Sketch metagenome reads into compressed sample sketches (-> sketches/*.sylspc)
-#    single-end (one .sylspc per input file):
+# 3. Profile reads directly: relative abundance + ANI per detected species (TSV to stdout).
+#    single-end (repeat -r for more samples; -t sets threads):
+weebill profile --two-stage gtdb.syl2db -r sampleA.fastq.gz -r sampleB.fastq.gz -t 16 > profile.tsv
+#    paired-end (-1/-2 pair up positionally):
+weebill profile --two-stage gtdb.syl2db -1 sampleA_1.fq.gz -2 sampleA_2.fq.gz > profile.tsv
+#    interleaved paired-end:
+weebill profile --two-stage gtdb.syl2db --interleaved sampleA.fq.gz > profile.tsv
+```
+
+Each read input becomes its own sample (its own set of rows in the output). Raw *fastq* may also be
+given positionally (`weebill profile --two-stage gtdb.syl2db sampleA.fastq.gz`), but a positional
+*fasta* is read as a genome rather than a sample, so raw fasta reads must be given with `-r`;
+`-r`/`-1`/`-2`/`--interleaved` are unambiguous and are the only way to specify paired input.
+Passing a `.syl2db` implies `--two-stage`, so the flag is optional when the database is a two-stage
+one. `-u`/`--estimate-unknown`, `--merge`/`-S` (see
+[pooling](#pooling-samples-with-profile---merge)) and `-o` all apply as usual.
+
+One thing to watch when sketching on the fly: **`-c` must be no larger than the database's dense
+`-c`.** Reads are sketched with `profile`'s own `-c` (default `200`) and `-k` (default `31`), which
+are ignored for pre-sketched inputs. The pre-built sylph databases and `weebill sketch`'s default are
+`-c 200`, so the default matches; but with a denser database — e.g. `-c 50` — the default `-c 200`
+*skips* that sample, logging an error to stderr while the run still exits 0 with no rows for it. Pass
+a matching or smaller `-c` (e.g. `-c 50` for a `-c 50` database); `weebill inspect gtdb.syl2db`
+reports the database's `c` and `k`.
+
+### Pre-sketching samples
+
+Sketching reads is the slowest part of the run above, and profiling raw reads repeats it every time.
+If a sample will be profiled more than once — against several databases, in re-runs, or with `query`
+as well as `profile` — sketch it to disk once instead, and pass the sketches to `profile` in place of
+the reads:
+
+```sh
+# Sketch metagenome reads into compressed sample sketches (-> sketches/*.sylspc)
+#   single-end (one .sylspc per input file):
 weebill sketch -r sampleA.fastq.gz -r sampleB.fastq.gz --compressed-database sketches/
-#    paired-end:
+#   paired-end:
 weebill sketch -1 sampleA_1.fq.gz -2 sampleA_2.fq.gz --compressed-database sketches/
 
-# 4. Two-stage taxonomic profile: relative abundance + ANI per detected species (TSV to stdout)
+# Profile the sketches (raw reads and sketches can be mixed in one run)
 weebill profile --two-stage gtdb.syl2db sketches/*.sylspc > profile.tsv
 ```
+
+Compressed sample sketches are smaller on disk than the legacy `.sylsp` format and are read
+transparently by `profile`, `query`, and `inspect`. A pre-sketched sample carries its own `-c`, so
+`profile`'s `-c` does not apply to it; it must still be no sparser than the database (sketch with
+`-c 200` or smaller for a `-c 200` database). Swap `profile` for `query` (against `gtdb.syldb`) to
+get nearest-neighbour containment ANI instead of a profile.
 
 ### Adding genomes to a `.syl2db`
 
@@ -102,11 +145,6 @@ The result is what converting all the genomes at once would have produced. Genom
 file name, so re-adding one is an error (`--skip-existing` ignores those already present), and
 in-place updates go through a temp file and a rename so an interrupted run leaves the original
 database intact.
-
-Compressed sample sketches are smaller on disk and are read transparently by `profile`,
-`query`, and `inspect`. `profile` also accepts raw fastq/fasta directly and will sketch them on
-the fly, e.g. `weebill profile --two-stage gtdb.syl2db -r sampleA.fastq.gz`. Swap `profile` for
-`query` (against `gtdb.syldb`) to get nearest-neighbour containment ANI instead of a profile.
 
 ### Pooling samples with `profile --merge`
 

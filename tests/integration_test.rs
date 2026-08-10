@@ -1123,6 +1123,170 @@ fn test_two_stage_db_convert_and_profile() {
         .failure();
 }
 
+/// `profile --two-stage` against a .syl2db with RAW reads (no pre-sketched sample):
+/// the reads are sketched in memory and must give exactly the profile that the
+/// equivalent pre-sketched sample gives. This is the documented "reads straight to
+/// a profile" route in the README, so it is covered for both single-end and
+/// paired-end input, along with the -c guard it depends on.
+#[serial]
+#[test]
+fn test_two_stage_profile_raw_reads() {
+    fresh();
+    let dir = "./tests/results/two_stage_raw_reads";
+    let _ = fs::remove_dir_all(dir);
+    fs::create_dir_all(dir).unwrap();
+
+    // Dense (-c 50) database -> two-stage db.
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("sketch")
+        .arg("-c")
+        .arg("50")
+        .arg("./test_files/e.coli-EC590.fasta.gz")
+        .arg("./test_files/e.coli-o157.fasta.gz")
+        .arg("./test_files/e.coli-K12.fasta.gz")
+        .arg("-o")
+        .arg(format!("{}/db_c50", dir))
+        .assert()
+        .success()
+        .code(0);
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("db-convert")
+        .arg(format!("{}/db_c50.syldb", dir))
+        .arg("-o")
+        .arg(format!("{}/db2", dir))
+        .assert()
+        .success()
+        .code(0);
+    let two_stage_db = format!("{}/db2.syl2db", dir);
+
+    // The same reads, pre-sketched at the database's -c.
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("sketch")
+        .arg("-c")
+        .arg("50")
+        .arg("./test_files/o157_reads.fastq.gz")
+        .arg("-d")
+        .arg(dir)
+        .assert()
+        .success()
+        .code(0);
+    let sample = format!("{}/o157_reads.fastq.gz.sylsp", dir);
+
+    // Rows minus the Sample_file column, which names the sketch for a pre-sketched
+    // input and the fastq for a raw one.
+    let rows_without_sample = |tsv: &str| -> Vec<String> {
+        let mut v: Vec<String> = tsv
+            .lines()
+            .skip(1)
+            .map(|l| l.splitn(2, '\t').nth(1).unwrap_or("").to_string())
+            .collect();
+        v.sort();
+        v
+    };
+
+    let profile_of = |args: &[&str]| -> String {
+        let mut cmd = Command::cargo_bin("weebill").unwrap();
+        let output = cmd
+            .arg("profile")
+            .arg("--two-stage")
+            .arg(&two_stage_db)
+            .args(args)
+            .output()
+            .expect("Output failed");
+        assert!(output.status.success());
+        str::from_utf8(&output.stdout)
+            .expect("not UTF-8")
+            .to_string()
+    };
+
+    // Raw single-end reads, sketched on the fly at the database's -c.
+    let raw = profile_of(&["-r", "./test_files/o157_reads.fastq.gz", "-c", "50"]);
+    assert!(raw.contains("e.coli-o157.fasta.gz"));
+    let presketched = profile_of(&[&sample]);
+    assert_eq!(
+        rows_without_sample(&raw),
+        rows_without_sample(&presketched),
+        "raw-read two-stage profile differs from the pre-sketched one"
+    );
+
+    // The same reads given positionally rather than with -r. Only raw *fastq* is
+    // taken as a sample this way: a positional fasta is a genome input, which
+    // alongside a .syl2db leaves no read input at all, so raw fasta reads must be
+    // given with -r (as the README says).
+    assert_eq!(
+        rows_without_sample(&profile_of(&[
+            "./test_files/o157_reads.fastq.gz",
+            "-c",
+            "50"
+        ])),
+        rows_without_sample(&raw),
+        "positional raw reads differ from -r"
+    );
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("profile")
+        .arg("--two-stage")
+        .arg(&two_stage_db)
+        .arg("./test_files/e.coli-K12.fasta.gz")
+        .assert()
+        .failure();
+
+    // Raw paired-end reads (-1/-2) are sketched and profiled too.
+    let paired = profile_of(&[
+        "-1",
+        "./test_files/k12_R1.fq",
+        "-2",
+        "./test_files/k12_R2.fq",
+        "-c",
+        "50",
+    ]);
+    assert!(
+        paired.contains("e.coli-K12.fasta.gz"),
+        "paired raw reads did not detect K12: {}",
+        paired
+    );
+
+    // A .syl2db implies --two-stage, so the flag is optional.
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    let output = cmd
+        .arg("profile")
+        .arg(&two_stage_db)
+        .arg("-r")
+        .arg("./test_files/o157_reads.fastq.gz")
+        .arg("-c")
+        .arg("50")
+        .output()
+        .expect("Output failed");
+    assert!(output.status.success());
+    assert_eq!(
+        rows_without_sample(str::from_utf8(&output.stdout).expect("not UTF-8")),
+        rows_without_sample(&raw),
+        "omitting --two-stage for a .syl2db changed the profile"
+    );
+
+    // A sample sketched sparser than the database's dense -c cannot be compared
+    // against it: the run succeeds but that sample contributes no rows (README
+    // documents passing a matching -c).
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    let output = cmd
+        .arg("profile")
+        .arg("--two-stage")
+        .arg(&two_stage_db)
+        .arg("-r")
+        .arg("./test_files/o157_reads.fastq.gz")
+        .arg("-c")
+        .arg("200")
+        .output()
+        .expect("Output failed");
+    assert!(output.status.success());
+    let too_sparse = str::from_utf8(&output.stdout).expect("not UTF-8");
+    assert_eq!(
+        too_sparse.lines().count(),
+        1,
+        "expected a header-only profile when -c exceeds the database -c, got: {}",
+        too_sparse
+    );
+}
+
 #[serial]
 #[test]
 fn test_two_stage_individual_records() {
