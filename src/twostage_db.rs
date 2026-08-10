@@ -1323,14 +1323,24 @@ pub fn run_db_add(args: DbAddArgs) {
     // rebuilt from every genome's sparse k-mers, which is why the copied blocks are
     // still decoded on the way past.
     let result = (|| -> io::Result<()> {
-        let w = BufWriter::with_capacity(1 << 20, File::create(&write_path)?);
+        let replacement_permissions = if replace_existing {
+            Some(std::fs::metadata(&out)?.permissions())
+        } else {
+            None
+        };
+        let file = File::create(&write_path)?;
+        if let Some(permissions) = replacement_permissions {
+            file.set_permissions(permissions)?;
+        }
+        let w = BufWriter::with_capacity(1 << 20, file);
         let mut builder = DbBuilder::new(w, db.c, db.k, db.screen_c)?;
         // Chunked so the reads/decodes of a chunk run in parallel while the writer
-        // stays sequential (block order defines the footer offsets), without holding
-        // the whole body in RAM.
-        const COPY_CHUNK: usize = 1024;
-        for chunk_start in (0..db.len()).step_by(COPY_CHUNK) {
-            let chunk_end = (chunk_start + COPY_CHUNK).min(db.len());
+        // stays sequential (block order defines the footer offsets). Keeping at most
+        // one decoded block per Rayon worker bounds transient dense-block memory by
+        // the requested concurrency rather than an arbitrary genome count.
+        let copy_chunk = rayon::current_num_threads().max(1);
+        for chunk_start in (0..db.len()).step_by(copy_chunk) {
+            let chunk_end = (chunk_start + copy_chunk).min(db.len());
             let decoded: Vec<io::Result<(Vec<u8>, Vec<u64>)>> = (chunk_start..chunk_end)
                 .into_par_iter()
                 .map(|g| db.raw_block_and_sparse(g as u32, db.screen_c))

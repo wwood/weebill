@@ -2,6 +2,7 @@ use assert_cmd::prelude::*; // Add methods on commands
 use predicates::prelude::predicate;
 use serial_test::serial;
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
 use std::str; // Run programs
@@ -1592,6 +1593,7 @@ fn test_two_stage_db_add() {
     // database through the shared inode before its blocks can be copied.
     let hardlink_out = format!("{}/hardlink-output.syl2db", dir);
     fs::hard_link(&base, &hardlink_out).unwrap();
+    fs::set_permissions(&base, fs::Permissions::from_mode(0o640)).unwrap();
     let mut cmd = Command::cargo_bin("weebill").unwrap();
     cmd.arg("db-add")
         .arg("-D")
@@ -1606,6 +1608,11 @@ fn test_two_stage_db_add() {
         fs::read(&base).unwrap(),
         base_bytes,
         "db-add through a hard-linked -o modified the input database"
+    );
+    assert_eq!(
+        fs::metadata(&hardlink_out).unwrap().permissions().mode() & 0o777,
+        0o640,
+        "db-add did not preserve permissions when replacing an existing output"
     );
     assert_eq!(
         detected_genomes(&profile(&hardlink_out)),
