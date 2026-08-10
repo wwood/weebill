@@ -28,7 +28,7 @@ Start here when reading the code:
 | `refdelta/ref_build.rs` | Building and writing `.sylref`; reading via `RefIndex` | `RefDb`, `RefIndex`, `build_refdb`, `write_refdb`, `open_ref_index`, `run_ref_build` |
 | `refdelta/sketch_compress.rs` | Compression of sample sketches into `.sylspr` | `RefCompressTelemetry`, `compress_seq`, `encode_subset`, `find_error_kmers`, `run_ref_compress` |
 | `refdelta/sketch_decompress.rs` | Decompression of `.sylspr` back to sample sketches | `decompress_seq`, `decompress_seq_with_meta`, `decode_subset` |
-| `twostage_db.rs` | Two-stage seekable genome database (`.syl2db`) | `TwoStageDb`, `run_db_convert` |
+| `twostage_db.rs` | Two-stage seekable genome database (`.syl2db`) | `TwoStageDb`, `DbBuilder`, `run_db_convert`, `run_db_add` |
 | `merge.rs` | Merge multiple sample sketches into one | `merge` |
 | `checksum.rs` | Whole-file XXH64 checksums for the seekable databases (`.sylref`, `.syl2db`) | `hash_reader`, `HashingWriter` |
 | `inspect.rs` | YAML metadata inspection of sketch files; verifies every format's checksum | `inspect` |
@@ -71,6 +71,11 @@ seek.
 **`TwoStageDb`** (in `twostage_db`) — the seekable query-time form of a
 `.syl2db` file. Footer holds bincoded sparse `GenomeSketch` subsets; body
 holds Golomb-Rice dense blocks accessed by stored byte offsets.
+`DbBuilder` is the write side: it streams blocks out as they are added (the
+body is never held in RAM) and patches the header's checksum and section
+offsets at the end. Both `db-convert` and `db-add` build through it; `db-add`
+copies existing blocks in verbatim via `push_encoded` and rebuilds only the
+stage-1 index, whose pooled MPHF cannot take new keys.
 
 ### Data flow: build time
 
@@ -166,6 +171,7 @@ varint-delta encoding of genome ids efficient in `.sylspr`.
 | Reference-delta build | `refdelta/ref_build.rs::run_ref_build` |
 | Reference-delta compress/decompress | `refdelta/sketch_compress.rs::run_ref_compress` |
 | Two-stage DB conversion | `twostage_db.rs::run_db_convert` |
+| Adding genomes to a two-stage DB | `twostage_db.rs::run_db_add` |
 | Adding a new output format | Follow the pattern in `compress.rs` (magic, version byte, zstd frame) |
 
 ## Out of Scope

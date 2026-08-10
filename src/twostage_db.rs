@@ -44,6 +44,17 @@
 //! stage-1 screen are decoded (and cached across samples) to reconstruct their
 //! exact `GenomeSketch` for the dense profiling pass.
 //!
+//! ## Adding genomes
+//!
+//! Because each genome's dense block is independent and self-delimiting, growing a
+//! database ([`run_db_add`]) does not have to re-encode anything: the existing
+//! blocks are copied to the new file byte for byte and the new genomes' blocks are
+//! appended after them. Only the stage-1 index has to be rebuilt, since its MPHF is
+//! built over the pooled key set and cannot absorb new keys — and rebuilding it
+//! needs every genome's *sparse* k-mers, which is why the copied blocks are still
+//! decoded on the way past. Both writers share [`DbBuilder`], which streams blocks
+//! out as they are produced instead of assembling the body in RAM.
+//!
 //! ## Integrity
 //!
 //! Profiling only ever touches a few blocks of the file, so a corrupt database is
@@ -52,12 +63,13 @@
 //! instead carries an XXH64 of the rest of the file, checked on demand by
 //! [`TwoStageDb::verify_checksum`] — which `weebill inspect` does.
 
-use crate::cmdline::DbConvertArgs;
+use crate::cmdline::{DbAddArgs, DbConvertArgs};
 use crate::constants::*;
 use crate::types::*;
 use boomphf::Mphf;
-use fxhash::FxHashMap;
+use fxhash::{FxHashMap, FxHashSet};
 use log::*;
+use rayon::prelude::*;
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::FileExt;
@@ -535,90 +547,171 @@ impl ScreenIndex {
 
 // --- writing ----------------------------------------------------------------
 
-/// Re-pack genome sketches into the two-stage seekable layout and write to `w`.
-/// `screen_c` is the (coarser) stage-1 subsampling rate; it must be `>= c`.
-/// Dense blocks are Golomb-Rice coded.
-pub fn write_two_stage_db<W: Write>(
-    mut w: W,
-    sketches: &[GenomeSketch],
-    screen_c: usize,
-) -> io::Result<()> {
-    let c = sketches.first().map(|s| s.c).unwrap_or(0);
-    let k = sketches.first().map(|s| s.k).unwrap_or(0);
-    // FracMinHash threshold for the sparse subsample (same rule as subsample_view).
+/// Golomb-Rice encode one genome's dense region: its `genome_kmers` block, the
+/// pseudotax flag, and (if present) its `pseudotax_tracked_nonused_kmers` block.
+/// The inverse of the closure in [`TwoStageDb::decode_dense`].
+fn encode_dense_block(gs: &GenomeSketch) -> Vec<u8> {
+    let mut block = Vec::new();
+    write_hashes(&mut block, &gs.genome_kmers);
+    match &gs.pseudotax_tracked_nonused_kmers {
+        Some(p) => {
+            block.push(1);
+            write_hashes(&mut block, p);
+        }
+        None => block.push(0),
+    }
+    block
+}
+
+/// The sparse (stage-1 screen) subset of a genome's k-mers: those below the
+/// `screen_c` FracMinHash threshold. Duplicates are kept, so the pooled index
+/// counts a repeated k-mer exactly as a per-genome `get_stats` screen would.
+fn sparse_subset(genome_kmers: &[u64], screen_c: usize) -> Vec<u64> {
     let thresh = if screen_c == 0 {
         u64::MAX
     } else {
         u64::MAX / screen_c as u64
     };
+    genome_kmers
+        .iter()
+        .copied()
+        .filter(|&h| h < thresh)
+        .collect()
+}
 
-    let mut body: Vec<u8> = Vec::new();
-    let mut genomes: Vec<GenomeMeta> = Vec::with_capacity(sketches.len());
-    let mut sparse_per_genome: Vec<Vec<u64>> = Vec::with_capacity(sketches.len());
+/// Streaming writer for the two-stage layout. Each genome's dense block is written
+/// out as it is added, so the body is never held in RAM; only the per-genome
+/// metadata and *sparse* k-mers are accumulated, because the pooled stage-1 index
+/// is built over all of them at the end.
+///
+/// The header records the checksum and the index/footer offsets, none of which are
+/// known until everything has been written, so it starts as placeholders that
+/// [`DbBuilder::finish`] patches — hence the `Seek` bound.
+pub struct DbBuilder<W: Write + Seek> {
+    w: crate::checksum::HashingWriter<W>,
+    /// Absolute file offset of the next byte to be written.
+    pos: u64,
+    c: usize,
+    k: usize,
+    screen_c: usize,
+    genomes: Vec<GenomeMeta>,
+    sparse_per_genome: Vec<Vec<u64>>,
+}
 
-    for gs in sketches {
-        let dense_offset = HEADER_LEN + body.len() as u64;
-        write_hashes(&mut body, &gs.genome_kmers);
-        match &gs.pseudotax_tracked_nonused_kmers {
-            Some(p) => {
-                body.push(1);
-                write_hashes(&mut body, p);
-            }
-            None => body.push(0),
-        }
-        sparse_per_genome.push(
-            gs.genome_kmers
-                .iter()
-                .copied()
-                .filter(|&h| h < thresh)
-                .collect(),
-        );
-        genomes.push(GenomeMeta {
-            file_name: gs.file_name.clone(),
-            first_contig_name: gs.first_contig_name.clone(),
-            gn_size: gs.gn_size,
-            min_spacing: gs.min_spacing,
-            has_pseudotax: gs.pseudotax_tracked_nonused_kmers.is_some(),
-            dense_offset,
-        });
+impl<W: Write + Seek> DbBuilder<W> {
+    pub fn new(mut w: W, c: usize, k: usize, screen_c: usize) -> io::Result<DbBuilder<W>> {
+        w.write_all(MAGIC)?;
+        w.write_all(&[VERSION])?;
+        w.write_all(&0u64.to_le_bytes())?; // checksum, patched by finish()
+        w.write_all(&0u64.to_le_bytes())?; // index offset, patched by finish()
+        w.write_all(&0u64.to_le_bytes())?; // footer offset, patched by finish()
+        Ok(DbBuilder {
+            // Only the body/index/footer are covered by the checksum: the header is
+            // patched afterwards, and every field in it is validated on open anyway.
+            w: crate::checksum::HashingWriter::new(w),
+            pos: HEADER_LEN,
+            c,
+            k,
+            screen_c,
+            genomes: Vec::new(),
+            sparse_per_genome: Vec::new(),
+        })
     }
 
-    // Pooled stage-1 screen index, then footer metadata.
-    let screen_index = ScreenIndex::build(&sparse_per_genome, screen_c, k);
-    drop(sparse_per_genome);
-    let mut index_block: Vec<u8> = Vec::new();
-    screen_index.write_to_vec(&mut index_block)?;
+    /// Append a genome whose dense block is *already* encoded — copied verbatim out
+    /// of an existing database, so it is never decoded and re-encoded. `sparse` is
+    /// its stage-1 subset at this builder's `screen_c` and `meta` its metadata; the
+    /// `dense_offset` in `meta` is ignored and replaced with the offset in this file.
+    pub fn push_encoded(
+        &mut self,
+        block: &[u8],
+        sparse: Vec<u64>,
+        meta: &GenomeMeta,
+    ) -> io::Result<()> {
+        self.w.write_all(block)?;
+        self.genomes.push(GenomeMeta {
+            dense_offset: self.pos,
+            ..meta.clone()
+        });
+        self.pos += block.len() as u64;
+        self.sparse_per_genome.push(sparse);
+        Ok(())
+    }
 
-    let footer = Footer {
-        c,
-        k,
-        screen_c,
-        genomes,
-    };
-    let footer_bytes = bincode::serialize(&footer).map_err(io::Error::other)?;
-    let index_offset = HEADER_LEN + body.len() as u64;
-    let footer_offset = index_offset + index_block.len() as u64;
+    /// Append a genome sketch, encoding its dense block and deriving its stage-1
+    /// sparse subset.
+    pub fn push_sketch(&mut self, gs: &GenomeSketch) -> io::Result<()> {
+        let block = encode_dense_block(gs);
+        let sparse = sparse_subset(&gs.genome_kmers, self.screen_c);
+        self.push_encoded(&block, sparse, &meta_of(gs, 0))
+    }
 
-    // Everything after the header is checksummed, so `inspect` can detect a
-    // truncated or bit-rotted database that a seeking reader would otherwise decode
-    // into a plausible-looking but wrong sketch.
-    let checksum = {
-        let mut h = crate::checksum::HashingWriter::new(io::sink());
-        h.write_all(&body)?;
-        h.write_all(&index_block)?;
-        h.write_all(&footer_bytes)?;
-        h.finish().1
-    };
+    pub fn num_genomes(&self) -> usize {
+        self.genomes.len()
+    }
 
-    w.write_all(MAGIC)?;
-    w.write_all(&[VERSION])?;
-    w.write_all(&checksum.to_le_bytes())?;
-    w.write_all(&index_offset.to_le_bytes())?;
-    w.write_all(&footer_offset.to_le_bytes())?;
-    w.write_all(&body)?;
-    w.write_all(&index_block)?;
-    w.write_all(&footer_bytes)?;
-    Ok(())
+    /// Build the pooled stage-1 index, write it plus the footer, and patch the
+    /// header with the checksum and section offsets.
+    pub fn finish(mut self) -> io::Result<()> {
+        let index_offset = self.pos;
+        let screen_index = ScreenIndex::build(&self.sparse_per_genome, self.screen_c, self.k);
+        self.sparse_per_genome = Vec::new();
+        let mut index_block: Vec<u8> = Vec::new();
+        screen_index.write_to_vec(&mut index_block)?;
+        self.w.write_all(&index_block)?;
+        let footer_offset = index_offset + index_block.len() as u64;
+        drop(index_block);
+
+        let footer = Footer {
+            c: self.c,
+            k: self.k,
+            screen_c: self.screen_c,
+            genomes: self.genomes,
+        };
+        let footer_bytes = bincode::serialize(&footer).map_err(io::Error::other)?;
+        self.w.write_all(&footer_bytes)?;
+
+        // Everything after the header is checksummed, so `inspect` can detect a
+        // truncated or bit-rotted database that a seeking reader would otherwise
+        // decode into a plausible-looking but wrong sketch.
+        let (mut w, checksum) = self.w.finish();
+        w.flush()?;
+        w.seek(SeekFrom::Start(5))?;
+        w.write_all(&checksum.to_le_bytes())?;
+        w.write_all(&index_offset.to_le_bytes())?;
+        w.write_all(&footer_offset.to_le_bytes())?;
+        w.flush()?;
+        Ok(())
+    }
+}
+
+/// Per-genome footer metadata for a sketch, at a given dense-block offset.
+fn meta_of(gs: &GenomeSketch, dense_offset: u64) -> GenomeMeta {
+    GenomeMeta {
+        file_name: gs.file_name.clone(),
+        first_contig_name: gs.first_contig_name.clone(),
+        gn_size: gs.gn_size,
+        min_spacing: gs.min_spacing,
+        has_pseudotax: gs.pseudotax_tracked_nonused_kmers.is_some(),
+        dense_offset,
+    }
+}
+
+/// Re-pack genome sketches into the two-stage seekable layout and write to `w`.
+/// `screen_c` is the (coarser) stage-1 subsampling rate; it must be `>= c`.
+/// Dense blocks are Golomb-Rice coded.
+pub fn write_two_stage_db<W: Write + Seek>(
+    w: W,
+    sketches: &[GenomeSketch],
+    screen_c: usize,
+) -> io::Result<()> {
+    let c = sketches.first().map(|s| s.c).unwrap_or(0);
+    let k = sketches.first().map(|s| s.k).unwrap_or(0);
+    let mut builder = DbBuilder::new(w, c, k, screen_c)?;
+    for gs in sketches {
+        builder.push_sketch(gs)?;
+    }
+    builder.finish()
 }
 
 // --- opened database --------------------------------------------------------
@@ -823,6 +916,35 @@ impl TwoStageDb {
         })
     }
 
+    /// Metadata of genome `g`, as stored in the footer.
+    pub fn genome_meta(&self, g: u32) -> &GenomeMeta {
+        &self.genomes[g as usize]
+    }
+
+    /// Everything needed to copy genome `g` into another database: its dense region
+    /// exactly as it sits on disk (so it is never re-encoded), plus its stage-1
+    /// sparse k-mers at `screen_c`.
+    ///
+    /// The sparse set has to be recovered by decoding the block, because the pooled
+    /// `ScreenIndex` stores only the inverted k-mer → owners mapping and cannot hand
+    /// the per-genome sparse sets back. One positional read serves both.
+    pub fn raw_block_and_sparse(&self, g: u32, screen_c: usize) -> io::Result<(Vec<u8>, Vec<u64>)> {
+        self.with_block(g, |bytes| {
+            // The owned backing hands back everything from the block's start, so trim
+            // to this genome's region; the file backing already reads exactly it.
+            let len = match &self.data {
+                DenseData::Owned(_) => {
+                    (self.block_end(g) - self.genomes[g as usize].dense_offset) as usize
+                }
+                DenseData::File(_) => bytes.len(),
+            };
+            let block = &bytes[..len];
+            let mut cur = block;
+            let gk = read_hashes(&mut cur)?;
+            Ok((block.to_vec(), sparse_subset(&gk, screen_c)))
+        })
+    }
+
     /// Re-hash the whole file and compare against the checksum in its header. This
     /// reads every byte, so it is on-demand (`weebill inspect`) rather than part of
     /// opening the database.
@@ -889,11 +1011,19 @@ pub fn open_file(path: &str) -> io::Result<TwoStageDb> {
 
 // --- CLI handler ------------------------------------------------------------
 
+/// Load every genome sketch from a database, in either the legacy bincode
+/// (`.syldb`) or compressed (`.syldbc`) encoding — detected by content, as
+/// everywhere else, not by extension.
 fn load_genome_sketches(path: &str) -> Vec<GenomeSketch> {
     let file = File::open(path).unwrap_or_else(|_| panic!("Could not open {}", path));
-    let reader = BufReader::with_capacity(10_000_000, file);
-    bincode::deserialize_from(reader)
-        .unwrap_or_else(|_| panic!("{} is not a valid database sketch (.syldb)", path))
+    let mut reader = BufReader::with_capacity(10_000_000, file);
+    if crate::compress::peek_is_compressed(&mut reader).unwrap_or(false) {
+        crate::compress::read_genome_sketches_compressed(&mut reader)
+            .unwrap_or_else(|e| panic!("{} is not a valid compressed database sketch: {}", path, e))
+    } else {
+        bincode::deserialize_from(&mut reader)
+            .unwrap_or_else(|_| panic!("{} is not a valid database sketch (.syldb/.syldbc)", path))
+    }
 }
 
 pub fn run_db_convert(args: DbConvertArgs) {
@@ -978,6 +1108,271 @@ pub fn run_db_convert(args: DbConvertArgs) {
     info!("Wrote two-stage database to {}", out);
 }
 
+/// Resolve the output path for `db-add`, appending the suffix if absent.
+fn suffixed_output(output: &str) -> String {
+    if output.ends_with(TWO_STAGE_DB_SUFFIX) {
+        output.to_string()
+    } else {
+        format!("{}{}", output, TWO_STAGE_DB_SUFFIX)
+    }
+}
+
+pub fn run_db_add(args: DbAddArgs) {
+    let level = if args.trace {
+        log::LevelFilter::Trace
+    } else if args.debug {
+        log::LevelFilter::Debug
+    } else {
+        log::LevelFilter::Info
+    };
+    simple_logger::SimpleLogger::new()
+        .with_level(level)
+        .init()
+        .unwrap();
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(args.threads)
+        .build_global()
+        .ok();
+
+    if args.files.is_empty() && args.genomes.is_empty() {
+        error!(
+            "No genomes to add: give database sketches (*.syldb/*.syldbc) as arguments and/or FASTA files with -g. Exiting"
+        );
+        std::process::exit(1);
+    }
+
+    // Open the existing database first (loading only its stage-1 index + footer), so
+    // its -c/-k/--screen-c dictate what the new genomes must match and a bad
+    // database is reported before anything is sketched or created.
+    info!("Opening two-stage database {}", args.database);
+    let db = open_file(&args.database).unwrap_or_else(|e| {
+        error!("{} is not a valid two-stage database: {}", args.database, e);
+        std::process::exit(1);
+    });
+    if !args.no_verify {
+        info!("Verifying {} before growing it...", args.database);
+        db.verify_checksum().unwrap_or_else(|e| {
+            error!("{}. Refusing to grow a corrupt database; exiting", e);
+            std::process::exit(1);
+        });
+    }
+    info!(
+        "{} holds {} genomes (dense -c {}, -k {}, stage-1 screen -c {})",
+        args.database,
+        db.len(),
+        db.c,
+        db.k,
+        db.screen_c
+    );
+
+    // Collect the new genomes: pre-sketched databases, plus any FASTAs sketched
+    // here at the existing database's -c/-k (so they are directly comparable).
+    let mut new_sketches: Vec<GenomeSketch> = Vec::new();
+    for f in &args.files {
+        info!("Loading genome sketches from {}", f);
+        new_sketches.extend(load_genome_sketches(f));
+    }
+    if !args.genomes.is_empty() {
+        // Default the spacing to whatever the existing genomes used: a mismatch
+        // changes which k-mers a genome contributes, so the added genomes would be
+        // sketched on subtly different terms from the ones they are profiled against.
+        let min_spacing = args.min_spacing_kmer.unwrap_or_else(|| {
+            if db.is_empty() {
+                30
+            } else {
+                db.genome_meta(0).min_spacing
+            }
+        });
+        info!(
+            "Sketching {} genome fasta(s) at -c {} -k {} --min-spacing {} (matching {})",
+            args.genomes.len(),
+            db.c,
+            db.k,
+            min_spacing,
+            args.database
+        );
+        let sketched: Vec<GenomeSketch> = args
+            .genomes
+            .par_iter()
+            .flat_map(|g| {
+                if args.individual {
+                    crate::sketch::sketch_genome_individual(db.c, db.k, g, min_spacing, true)
+                } else {
+                    crate::sketch::sketch_genome(db.c, db.k, g, min_spacing, true)
+                        .into_iter()
+                        .collect()
+                }
+            })
+            .collect();
+        if sketched.len() < args.genomes.len() && !args.individual {
+            warn!(
+                "Only {} of {} genome fasta(s) could be sketched; the rest were skipped",
+                sketched.len(),
+                args.genomes.len()
+            );
+        }
+        new_sketches.extend(sketched);
+    }
+    if new_sketches.is_empty() {
+        error!("No genome sketches found in the inputs to add; exiting");
+        std::process::exit(1);
+    }
+
+    // The new genomes must match the database exactly: FracMinHash lets a sketch be
+    // made sparser but never denser, and a -c/-k mismatch would silently make the
+    // added genomes' k-mers incomparable to the existing ones.
+    for s in &new_sketches {
+        if s.c != db.c || s.k != db.k {
+            error!(
+                "Genome '{}' was sketched with -c {} -k {}, but {} is -c {} -k {}; re-sketch the added genomes to match. Exiting",
+                s.file_name, s.c, s.k, args.database, db.c, db.k
+            );
+            std::process::exit(1);
+        }
+        if s.pseudotax_tracked_nonused_kmers.is_none() {
+            error!(
+                "Genome '{}' was sketched with --disable-profiling (no profiling k-mers). A two-stage database is for `profile`; re-sketch without --disable-profiling. Exiting",
+                s.file_name
+            );
+            std::process::exit(1);
+        }
+    }
+
+    // A .syl2db identifies genomes by `file_name` (that is all a profile TSV
+    // reports, and all the dense-sketch cache and --apply-unknown can key on), so a
+    // duplicate name would make two genomes indistinguishable downstream.
+    let mut existing: FxHashSet<&str> = FxHashSet::default();
+    for g in 0..db.len() as u32 {
+        existing.insert(db.genome_file_name(g));
+    }
+    let mut kept: Vec<GenomeSketch> = Vec::with_capacity(new_sketches.len());
+    let mut seen_new: FxHashSet<String> = FxHashSet::default();
+    let mut skipped = 0usize;
+    for s in new_sketches {
+        if existing.contains(s.file_name.as_str()) {
+            if args.skip_existing {
+                skipped += 1;
+                continue;
+            }
+            error!(
+                "Genome '{}' is already in {}. Pass --skip-existing to ignore genomes already present. Exiting",
+                s.file_name, args.database
+            );
+            std::process::exit(1);
+        }
+        // Individual-records genomes legitimately repeat a file name across records,
+        // so only flag a repeat when the inputs are whole-genome sketches.
+        if !args.individual && !seen_new.insert(s.file_name.clone()) {
+            error!(
+                "Genome '{}' appears more than once in the genomes to add; each genome must be distinct. If these are individual records of one fasta, pass -i/--individual-records. Exiting",
+                s.file_name
+            );
+            std::process::exit(1);
+        }
+        kept.push(s);
+    }
+    if skipped > 0 {
+        info!(
+            "Skipping {} genome(s) already present in {}",
+            skipped, args.database
+        );
+    }
+    // Only reachable under --skip-existing (a duplicate is otherwise fatal above),
+    // where the point is idempotence: re-running the same add is a no-op, not a
+    // failure. An in-place run has nothing to do; an `-o` run still owes the caller
+    // the output file, so it falls through and writes the copy.
+    let new_sketches = kept;
+    if new_sketches.is_empty() {
+        if args.output.is_none() {
+            info!(
+                "Every genome given is already in {}; leaving it unchanged.",
+                args.database
+            );
+            return;
+        }
+        info!(
+            "Every genome given is already in {}; the output will be an unchanged copy of it.",
+            args.database
+        );
+    }
+
+    let out = match &args.output {
+        Some(o) => suffixed_output(o),
+        // Default is in-place: write a sibling temp file and rename over the
+        // original only once it is complete, so an interrupted run cannot leave a
+        // half-written database in place of a good one.
+        None => args.database.clone(),
+    };
+    if let Some(parent) = Path::new(&out).parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).ok();
+        }
+    }
+    let in_place = std::fs::canonicalize(&out).ok().is_some_and(|o| {
+        std::fs::canonicalize(&args.database)
+            .ok()
+            .is_some_and(|d| d == o)
+    });
+    let tmp = format!("{}.tmp{}", out, std::process::id());
+    let write_path = if in_place { tmp.clone() } else { out.clone() };
+
+    info!(
+        "Adding {} genome(s) to {} existing -> {} ({} genomes total)",
+        new_sketches.len(),
+        db.len(),
+        out,
+        db.len() + new_sketches.len()
+    );
+
+    // Copy every existing dense block through verbatim (Golomb-Rice re-encoding
+    // would be pure waste), then append the new ones. The stage-1 index cannot be
+    // extended in place -- its MPHF is built over the pooled key set -- so it is
+    // rebuilt from every genome's sparse k-mers, which is why the copied blocks are
+    // still decoded on the way past.
+    let result = (|| -> io::Result<()> {
+        let w = BufWriter::with_capacity(1 << 20, File::create(&write_path)?);
+        let mut builder = DbBuilder::new(w, db.c, db.k, db.screen_c)?;
+        // Chunked so the reads/decodes of a chunk run in parallel while the writer
+        // stays sequential (block order defines the footer offsets), without holding
+        // the whole body in RAM.
+        const COPY_CHUNK: usize = 1024;
+        for chunk_start in (0..db.len()).step_by(COPY_CHUNK) {
+            let chunk_end = (chunk_start + COPY_CHUNK).min(db.len());
+            let decoded: Vec<io::Result<(Vec<u8>, Vec<u64>)>> = (chunk_start..chunk_end)
+                .into_par_iter()
+                .map(|g| db.raw_block_and_sparse(g as u32, db.screen_c))
+                .collect();
+            for (i, d) in decoded.into_iter().enumerate() {
+                let (block, sparse) = d?;
+                let g = (chunk_start + i) as u32;
+                builder.push_encoded(&block, sparse, db.genome_meta(g))?;
+            }
+            info!("Copied {}/{} existing genomes", chunk_end, db.len());
+        }
+        for gs in &new_sketches {
+            builder.push_sketch(gs)?;
+        }
+        builder.finish()
+    })();
+    if let Err(e) = result {
+        let _ = std::fs::remove_file(&write_path);
+        error!("Failed to write {}: {}. Exiting", write_path, e);
+        std::process::exit(1);
+    }
+    if in_place {
+        if let Err(e) = std::fs::rename(&tmp, &out) {
+            let _ = std::fs::remove_file(&tmp);
+            error!("Could not replace {} with the grown database: {}", out, e);
+            std::process::exit(1);
+        }
+    }
+    info!(
+        "Wrote two-stage database with {} genomes to {}",
+        db.len() + new_sketches.len(),
+        out
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1012,6 +1407,14 @@ mod tests {
         roundtrip_hashes(&v);
     }
 
+    /// `write_two_stage_db` patches its header at the end and so needs `Seek`; a
+    /// bare `Vec<u8>` is not seekable, hence the cursor.
+    fn write_db_to_vec(sketches: &[GenomeSketch], screen_c: usize) -> Vec<u8> {
+        let mut cur = std::io::Cursor::new(Vec::new());
+        write_two_stage_db(&mut cur, sketches, screen_c).unwrap();
+        cur.into_inner()
+    }
+
     fn gsketch(name: &str, kmers: Vec<u64>, pt: Option<Vec<u64>>) -> GenomeSketch {
         GenomeSketch {
             genome_kmers: kmers,
@@ -1037,9 +1440,7 @@ mod tests {
             gsketch("g1.fa", g1_kmers.clone(), Some(vec![])),
         ];
 
-        let mut buf = Vec::new();
-        write_two_stage_db(&mut buf, &sketches, 200).unwrap();
-        let db = open(std::io::Cursor::new(buf)).unwrap();
+        let db = open(std::io::Cursor::new(write_db_to_vec(&sketches, 200))).unwrap();
 
         assert_eq!(db.c, 50);
         assert_eq!(db.k, 31);
@@ -1166,6 +1567,91 @@ mod tests {
         assert_eq!(g0, vec![2, 3, 7, 7]);
     }
 
+    /// Growing a database by copying existing dense blocks verbatim and appending a
+    /// new one must produce exactly what writing all the sketches at once produces:
+    /// same genome metadata, same decoded dense k-mers, and a stage-1 index that
+    /// screens a sample identically (including for the appended genome).
+    #[test]
+    fn db_add_matches_building_all_at_once() {
+        let screen_c = 200usize;
+        let thresh = screen_threshold(screen_c);
+        let g0 = vec![1u64, 2, thresh - 1, thresh + 10, 9_000_000_000];
+        let g1 = vec![7u64, thresh + 1, 123_456_789_000];
+        let g2 = vec![3u64, 5, thresh - 2, thresh * 4];
+        let s0 = gsketch("g0.fa", g0.clone(), Some(vec![100, 200]));
+        let s1 = gsketch("g1.fa", g1.clone(), Some(vec![]));
+        let s2 = gsketch("g2.fa", g2.clone(), Some(vec![7, 8, 9]));
+
+        // Two genomes, then grow by copying their blocks through and appending g2.
+        let base = open(std::io::Cursor::new(write_db_to_vec(
+            &[s0.clone(), s1.clone()],
+            screen_c,
+        )))
+        .unwrap();
+        let mut cur = std::io::Cursor::new(Vec::new());
+        let mut builder = DbBuilder::new(&mut cur, base.c, base.k, base.screen_c).unwrap();
+        for g in 0..base.len() as u32 {
+            let (block, sparse) = base.raw_block_and_sparse(g, base.screen_c).unwrap();
+            builder
+                .push_encoded(&block, sparse, base.genome_meta(g))
+                .unwrap();
+        }
+        builder.push_sketch(&s2).unwrap();
+        builder.finish().unwrap();
+        let grown = open(std::io::Cursor::new(cur.into_inner())).unwrap();
+
+        let all = open(std::io::Cursor::new(write_db_to_vec(
+            &[s0, s1, s2],
+            screen_c,
+        )))
+        .unwrap();
+
+        assert_eq!(grown.len(), 3);
+        assert_eq!(grown.c, all.c);
+        assert_eq!(grown.k, all.k);
+        assert_eq!(grown.screen_c, all.screen_c);
+        for g in 0..3u32 {
+            assert_eq!(grown.genome_meta(g), all.genome_meta(g));
+            let a = grown.decode_dense(g).unwrap();
+            let b = all.decode_dense(g).unwrap();
+            assert_eq!(a, b, "dense block {} differs after db-add", g);
+        }
+        assert_eq!(
+            grown.screen_index.sparse_count,
+            all.screen_index.sparse_count
+        );
+
+        // The rebuilt stage-1 index must screen identically, including for the
+        // appended genome's k-mers.
+        let sample = sample_from(&[
+            (1, 4),
+            (2, 2),
+            (3, 6),
+            (5, 1),
+            (7, 3),
+            (thresh - 1, 5),
+            (thresh - 2, 8),
+        ]);
+        let norm = |m: FxHashMap<u32, Vec<u32>>| -> Vec<(u32, Vec<u32>)> {
+            let mut out: Vec<(u32, Vec<u32>)> = m
+                .into_iter()
+                .map(|(g, mut v)| {
+                    v.sort_unstable();
+                    (g, v)
+                })
+                .collect();
+            out.sort();
+            out
+        };
+        let from_grown = norm(grown.screen_index.gather_hits(&sample));
+        assert_eq!(from_grown, norm(all.screen_index.gather_hits(&sample)));
+        // g2 was the appended genome; it must be screened, not silently absent.
+        assert!(
+            from_grown.iter().any(|(g, _)| *g == 2),
+            "appended genome missing from the rebuilt screen index"
+        );
+    }
+
     /// The index survives a serialize/parse round-trip through the file format.
     #[test]
     fn screen_index_roundtrips_through_db() {
@@ -1176,9 +1662,7 @@ mod tests {
             gsketch("g0.fa", g0.clone(), Some(vec![1])),
             gsketch("g1.fa", g1.clone(), Some(vec![2])),
         ];
-        let mut buf = Vec::new();
-        write_two_stage_db(&mut buf, &sketches, 200).unwrap();
-        let db = open(std::io::Cursor::new(buf)).unwrap();
+        let db = open(std::io::Cursor::new(write_db_to_vec(&sketches, 200))).unwrap();
 
         let sample = sample_from(&[(5, 4), (7, 6), (thresh - 1, 1), (thresh - 2, 9)]);
         let hits = db.screen_index.gather_hits(&sample);
