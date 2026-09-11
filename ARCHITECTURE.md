@@ -166,7 +166,7 @@ varint-delta encoding of genome ids efficient in `.sylspr`.
 | Querying / profiling | `contain.rs::contain` |
 | Two-stage profiling path | `contain.rs::contain` → `TwoStageDb` or `RefIndex` screen then dense decode |
 | Coverage/ANI statistics | `inference.rs::mme_lambda`, `estimate_lambda` |
-| k-mer extraction kernel | `seeding.rs::fmh_seeds` (scalar), `avx2_seeding.rs::extract_markers_avx2` (AVX2) or `avx512_seeding.rs::extract_markers_avx512` (AVX-512); dispatched at runtime in `sketch.rs::extract_markers` |
+| k-mer extraction kernel | `seeding.rs::fmh_seeds` (scalar), `avx2_seeding.rs::extract_markers_avx2` (AVX2) or `avx512_seeding.rs::extract_markers_avx512` (AVX-512, only for read sequences ≥ `sketch.rs::AVX512_MIN_SEQ_LEN`); dispatched at runtime in `sketch.rs::extract_markers`, overridable with `WEEBILL_SIMD` |
 | Compressed I/O (SYLZ format) | `compress.rs` |
 | Reference-delta build | `refdelta/ref_build.rs::run_ref_build` |
 | Reference-delta compress/decompress | `refdelta/sketch_compress.rs::run_ref_compress` |

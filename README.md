@@ -98,6 +98,21 @@ are ignored for pre-sketched inputs. The pre-built sylph databases and `weebill 
 a matching or smaller `-c` (e.g. `-c 50` for a `-c 50` database); `weebill inspect gtdb.syl2db`
 reports the database's `c` and `k`.
 
+A `.syl2db` built by upstream sylph (`sylph convert-db-two-screen`) is read directly, so a
+sylph-built or hosted two-stage database needs no conversion. The only difference between the two
+tools' files is the whole-file checksum weebill stores in the header, so `weebill inspect` reports
+`checksum: absent` for a sylph-built one instead of verifying it; sylph 1.0 does not read
+weebill-built ones in the other direction. `db-convert` also answers to sylph's name for it,
+`convert-db-two-screen`.
+
+Very small genomes — plasmids, phage, short contigs — have few k-mers at the stage-1 screen rate
+(`--screen-c`, default 3000), so `db-convert`/`db-add` give any genome that falls below
+`--min-sparse-kmers` (default 50) a denser, genome-specific screen rate, and loosen the rate
+recorded in the file enough to keep those k-mers matchable. That last part is database-wide: one
+tiny genome can pull the whole screen index denser (and so bigger and slower for every sample), which
+`db-convert` logs. Keeping tiny genomes in a plain `.syldb` avoids that; `--min-sparse-kmers 1`
+disables the floor.
+
 ### Pre-sketching samples
 
 Sketching reads is the slowest part of the run above, and profiling raw reads repeats it every time.

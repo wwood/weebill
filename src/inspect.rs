@@ -238,12 +238,21 @@ fn get_seekable_db_inspect(path: &String) -> SeekableDatabaseInspect {
         }
     } else {
         let db = crate::twostage_db::open_file(path).unwrap_or_else(|e| fatal(e));
-        db.verify_checksum().unwrap_or_else(|e| fatal(e));
-        info!("Two-stage database {} verified", path);
+        // An upstream sylph database has no checksum to verify; say so rather than
+        // reporting "ok" for a check that never ran.
+        let verified = db.verify_checksum().unwrap_or_else(|e| fatal(e));
+        if verified {
+            info!("Two-stage database {} verified", path);
+        } else {
+            info!(
+                "Two-stage database {} read (upstream sylph format: no whole-file checksum to verify)",
+                path
+            );
+        }
         SeekableDatabaseInspect {
             database_file: path.clone(),
             format: TWO_STAGE_DB_SUFFIX.to_string(),
-            checksum: "ok".to_string(),
+            checksum: if verified { "ok" } else { "absent" }.to_string(),
             c: db.c,
             k: db.k,
             stage1_c: db.screen_c,

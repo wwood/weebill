@@ -618,6 +618,73 @@ fn avx512_seeding_matches_avx2_and_scalar() {
     }
 }
 
+/// `extract_markers` picks AVX-512 only for sequences at least
+/// `AVX512_MIN_SEQ_LEN` long (AVX-512 loses to AVX2 on short reads: it primes twice
+/// as many lanes for half as many inner-loop iterations). That split must not change
+/// what is sketched, so the dispatcher has to agree with *both* kernels on either
+/// side of the threshold.
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn simd_dispatch_matches_both_kernels_across_the_avx512_threshold() {
+    use weebill::sketch::{extract_markers, AVX512_MIN_SEQ_LEN};
+
+    if !is_x86_feature_detected!("avx512f") || !is_x86_feature_detected!("avx2") {
+        eprintln!("skipping: AVX-512/AVX2 not both available on this CPU");
+        return;
+    }
+
+    let mut state: u64 = 0xfeed_face_dead_beef;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let alphabet = [b'A', b'C', b'G', b'T'];
+    let longest = AVX512_MIN_SEQ_LEN * 4 + 3;
+    let seq: Vec<u8> = (0..longest)
+        .map(|_| alphabet[(next() & 3) as usize])
+        .collect();
+
+    let t = AVX512_MIN_SEQ_LEN;
+    for len in [
+        0,
+        1,
+        30,
+        31,
+        150,
+        t - 2,
+        t - 1,
+        t,
+        t + 1,
+        t + 7,
+        t * 3,
+        longest,
+    ] {
+        let s = &seq[..len];
+        for &k in &[21usize, 31] {
+            for &c in &[3usize, 200] {
+                let mut dispatched = Vec::new();
+                let mut a = Vec::new();
+                let mut b = Vec::new();
+                extract_markers(s, &mut dispatched, c, k);
+                unsafe {
+                    weebill::avx2_seeding::extract_markers_avx2(s, &mut a, c, k);
+                    weebill::avx512_seeding::extract_markers_avx512(s, &mut b, c, k);
+                }
+                for v in [&mut dispatched, &mut a, &mut b] {
+                    v.sort_unstable();
+                }
+                assert_eq!(a, b, "kernels disagree at len={len} k={k} c={c}");
+                assert_eq!(
+                    dispatched, a,
+                    "dispatcher disagrees with the kernels at len={len} k={k} c={c}"
+                );
+            }
+        }
+    }
+}
+
 // Write `n` FASTQ records of a fixed length, using a deterministic ACGT
 // sequence and uniform quality.
 fn write_fastq(path: &std::path::Path, read_len: usize, n: usize) {

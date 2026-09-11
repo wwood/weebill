@@ -62,6 +62,16 @@
 //! `.sylspr` formats, whose zstd checksum is validated on every decode). The header
 //! instead carries an XXH64 of the rest of the file, checked on demand by
 //! [`TwoStageDb::verify_checksum`] — which `weebill inspect` does.
+//!
+//! ## Upstream sylph compatibility
+//!
+//! Upstream sylph writes the same format without that checksum (version 2), so its
+//! header is 8 bytes shorter and its offsets sit 8 bytes earlier; everything after
+//! the header is byte-identical in meaning. Both versions are read here, so a
+//! sylph-built `.syl2db` — including a hosted database — works directly with
+//! `profile --two-stage`, `db-add` and `inspect`, with only the integrity check
+//! unavailable for a v2 file. Databases written here are version 3 (with the
+//! checksum), which sylph 1.0 does not yet read.
 
 use crate::cmdline::{DbAddArgs, DbConvertArgs};
 use crate::constants::*;
@@ -77,13 +87,18 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 const MAGIC: &[u8; 4] = b"SY2D";
-/// Format version (dense Golomb-Rice blocks + pooled-MPHF stage-1 screen index).
-/// Only this exact version is readable — an older database must be rebuilt with
-/// `db-convert`.
+/// Format version written here (dense Golomb-Rice blocks + pooled-MPHF stage-1 screen
+/// index + whole-file checksum).
 const VERSION: u8 = 3;
+/// Upstream sylph's version of the same format, without the whole-file checksum.
+/// Readable here (see [`parse_header`]); anything older must be rebuilt with
+/// `db-convert`.
+const VERSION_NO_CHECKSUM: u8 = 2;
 /// magic (4) + version (1) + XXH64 of the rest of the file (8) + index offset (8)
 /// + footer offset (8)
 const HEADER_LEN: u64 = 29;
+/// [`VERSION_NO_CHECKSUM`] header: as above without the checksum.
+const HEADER_LEN_V2: u64 = 21;
 /// boomphf construction gamma (space/speed trade-off), matching the ref-delta
 /// sparse index.
 const MPHF_GAMMA: f64 = 2.0;
@@ -579,6 +594,61 @@ fn sparse_subset(genome_kmers: &[u64], screen_c: usize) -> Vec<u64> {
         .collect()
 }
 
+/// Below this many sparse k-mers, a genome is warned about loudly: it has so few
+/// k-mers in total that even the adaptive floor cannot be reached, so it both screens
+/// unreliably and drags the whole database's effective screen rate down toward the
+/// dense rate (see [`DbBuilder::finish`]).
+const SPARSE_WARN_THRESHOLD: usize = 20;
+
+/// The `n` smallest hashes of `hashes` (all of them if it has fewer), as a multiset
+/// so repeated k-mers keep their multiplicity. O(n) partial selection.
+fn smallest_n(hashes: &[u64], n: usize) -> Vec<u64> {
+    if n == 0 {
+        return Vec::new();
+    }
+    if n >= hashes.len() {
+        return hashes.to_vec();
+    }
+    let mut v = hashes.to_vec();
+    v.select_nth_unstable(n - 1);
+    v.truncate(n);
+    v
+}
+
+/// A genome's stage-1 sparse set: the FracMinHash subset at `screen_c`, unless that
+/// falls short of `min_sparse_kmers`, in which case the `min_sparse_kmers` smallest
+/// hashes are taken instead — a denser, genome-specific screen rate.
+///
+/// Without the floor a small genome is nearly invisible to the screen: at
+/// `--screen-c 3000` a 50 kbp plasmid has ~17 sparse k-mers, so a couple of chance
+/// matches dominate its screen ANI and it is dropped (or admitted) on noise. This is
+/// the same rule, and the same default, as upstream sylph's `--min-sparse-kmers`.
+///
+/// In every case the result is a *prefix of the genome's dense hashes ordered by
+/// value*: all of them, those below a threshold, or the smallest `min_sparse_kmers`.
+/// That invariant is what lets [`TwoStageDb::raw_block_and_sparse`] rebuild the exact
+/// same set from the stored per-genome count alone, so `db-add` reproduces a
+/// from-scratch build without the selection rate having to be stored per genome.
+fn select_sparse(genome_kmers: &[u64], screen_c: usize, min_sparse_kmers: usize) -> Vec<u64> {
+    let nominal = sparse_subset(genome_kmers, screen_c);
+    // `nominal.len() == genome_kmers.len()` means every dense k-mer is already in the
+    // sparse set, so there is nothing denser to fall back to.
+    if nominal.len() >= min_sparse_kmers || nominal.len() == genome_kmers.len() {
+        return nominal;
+    }
+    let sparse = smallest_n(genome_kmers, min_sparse_kmers);
+    debug!(
+        "using a denser genome-specific stage-1 screen rate: {} sparse k-mers at -c {} is \
+         below --min-sparse-kmers {}, taking the {} smallest of {} dense k-mers instead",
+        nominal.len(),
+        screen_c,
+        min_sparse_kmers,
+        sparse.len(),
+        genome_kmers.len()
+    );
+    sparse
+}
+
 /// Streaming writer for the two-stage layout. Each genome's dense block is written
 /// out as it is added, so the body is never held in RAM; only the per-genome
 /// metadata and *sparse* k-mers are accumulated, because the pooled stage-1 index
@@ -593,13 +663,23 @@ pub struct DbBuilder<W: Write + Seek> {
     pos: u64,
     c: usize,
     k: usize,
+    /// Nominal stage-1 screen rate requested by the caller (`--screen-c`). The rate
+    /// actually recorded may be denser; see [`DbBuilder::finish`].
     screen_c: usize,
+    /// Floor on each genome's sparse k-mer count (`--min-sparse-kmers`).
+    min_sparse_kmers: usize,
     genomes: Vec<GenomeMeta>,
     sparse_per_genome: Vec<Vec<u64>>,
 }
 
 impl<W: Write + Seek> DbBuilder<W> {
-    pub fn new(mut w: W, c: usize, k: usize, screen_c: usize) -> io::Result<DbBuilder<W>> {
+    pub fn new(
+        mut w: W,
+        c: usize,
+        k: usize,
+        screen_c: usize,
+        min_sparse_kmers: usize,
+    ) -> io::Result<DbBuilder<W>> {
         w.write_all(MAGIC)?;
         w.write_all(&[VERSION])?;
         w.write_all(&0u64.to_le_bytes())?; // checksum, patched by finish()
@@ -613,6 +693,7 @@ impl<W: Write + Seek> DbBuilder<W> {
             c,
             k,
             screen_c,
+            min_sparse_kmers: min_sparse_kmers.max(1),
             genomes: Vec::new(),
             sparse_per_genome: Vec::new(),
         })
@@ -642,7 +723,22 @@ impl<W: Write + Seek> DbBuilder<W> {
     /// sparse subset.
     pub fn push_sketch(&mut self, gs: &GenomeSketch) -> io::Result<()> {
         let block = encode_dense_block(gs);
-        let sparse = sparse_subset(&gs.genome_kmers, self.screen_c);
+        let sparse = select_sparse(&gs.genome_kmers, self.screen_c, self.min_sparse_kmers);
+        if sparse.len() < SPARSE_WARN_THRESHOLD.min(self.min_sparse_kmers) {
+            warn!(
+                "genome '{}' (file {}) has only {} k-mers in total; its whole k-mer set is used \
+                 as its stage-1 screen entry, and because it is (one of) the densest genome(s) \
+                 in this database it drags the WHOLE database's stage-1 screen rate down toward \
+                 the dense -c {}, making screening slower for every sample. Detection \
+                 reliability at this size is inherently poor -- consider keeping tiny \
+                 genomes/contigs/plasmids in a plain .syldb instead, or check that this \
+                 genome/contig was sketched as intended.",
+                gs.first_contig_name,
+                gs.file_name,
+                sparse.len(),
+                self.c
+            );
+        }
         self.push_encoded(&block, sparse, &meta_of(gs, 0))
     }
 
@@ -650,11 +746,47 @@ impl<W: Write + Seek> DbBuilder<W> {
         self.genomes.len()
     }
 
+    /// Coarsest screen rate whose FracMinHash threshold still admits every sparse
+    /// k-mer pushed so far, capped at the requested `screen_c`.
+    ///
+    /// Safe by the integer identity `floor(a / floor(a / b)) >= b`: with
+    /// `c = u64::MAX / (max_hash + 1)`, `screen_threshold(c) = u64::MAX / c >=
+    /// max_hash + 1 > max_hash`, so every stored k-mer passes `gather_hits`'
+    /// early-exit filter.
+    fn effective_screen_c(&self) -> usize {
+        let max_sparse = self
+            .sparse_per_genome
+            .iter()
+            .flat_map(|v| v.iter().copied())
+            .max();
+        match max_sparse {
+            Some(h) => self
+                .screen_c
+                .min((u64::MAX / h.saturating_add(1)).max(1) as usize),
+            None => self.screen_c,
+        }
+    }
+
     /// Build the pooled stage-1 index, write it plus the footer, and patch the
     /// header with the checksum and section offsets.
+    ///
+    /// The screen rate recorded in the file is the *effective* one: `gather_hits`
+    /// skips sample k-mers at or above `screen_threshold(screen_c)`, so a genome that
+    /// had to use a denser genome-specific rate (see [`select_sparse`]) would have its
+    /// densest stored k-mers unmatchable if the nominal rate were recorded. The
+    /// effective rate is therefore the coarsest rate whose threshold still admits
+    /// every stored sparse k-mer, and never coarser than the requested one.
     pub fn finish(mut self) -> io::Result<()> {
         let index_offset = self.pos;
-        let screen_index = ScreenIndex::build(&self.sparse_per_genome, self.screen_c, self.k);
+        let effective_screen_c = self.effective_screen_c();
+        if effective_screen_c != self.screen_c {
+            info!(
+                "effective stage-1 screen -c adjusted from {} to {} to keep small genomes' \
+                 screen k-mers matchable (see warnings above)",
+                self.screen_c, effective_screen_c
+            );
+        }
+        let screen_index = ScreenIndex::build(&self.sparse_per_genome, effective_screen_c, self.k);
         self.sparse_per_genome = Vec::new();
         let mut index_block: Vec<u8> = Vec::new();
         screen_index.write_to_vec(&mut index_block)?;
@@ -665,7 +797,7 @@ impl<W: Write + Seek> DbBuilder<W> {
         let footer = Footer {
             c: self.c,
             k: self.k,
-            screen_c: self.screen_c,
+            screen_c: effective_screen_c,
             genomes: self.genomes,
         };
         let footer_bytes = bincode::serialize(&footer).map_err(io::Error::other)?;
@@ -699,15 +831,18 @@ fn meta_of(gs: &GenomeSketch, dense_offset: u64) -> GenomeMeta {
 
 /// Re-pack genome sketches into the two-stage seekable layout and write to `w`.
 /// `screen_c` is the (coarser) stage-1 subsampling rate; it must be `>= c`.
-/// Dense blocks are Golomb-Rice coded.
+/// `min_sparse_kmers` is the per-genome sparse floor (see [`select_sparse`]) and must
+/// be `>= 1` -- 0 would let a genome's screen entry be empty, making it invisible to
+/// the stage-1 screen forever. Dense blocks are Golomb-Rice coded.
 pub fn write_two_stage_db<W: Write + Seek>(
     w: W,
     sketches: &[GenomeSketch],
     screen_c: usize,
+    min_sparse_kmers: usize,
 ) -> io::Result<()> {
     let c = sketches.first().map(|s| s.c).unwrap_or(0);
     let k = sketches.first().map(|s| s.k).unwrap_or(0);
-    let mut builder = DbBuilder::new(w, c, k, screen_c)?;
+    let mut builder = DbBuilder::new(w, c, k, screen_c, min_sparse_kmers)?;
     for gs in sketches {
         builder.push_sketch(gs)?;
     }
@@ -749,8 +884,11 @@ pub struct TwoStageDb {
     pub screen_c: usize,
     /// XXH64 of the file after the header, as recorded when it was written. Checked
     /// by [`TwoStageDb::verify_checksum`], not on open: validating it costs a full
-    /// read of a file that profiling otherwise only touches a few blocks of.
-    checksum: u64,
+    /// read of a file that profiling otherwise only touches a few blocks of. `None`
+    /// for an upstream sylph (v2) database, which carries no checksum.
+    checksum: Option<u64>,
+    /// Header length of the file as opened; the checksum covers everything after it.
+    header_len: u64,
     /// File offset where the dense-block region ends (start of the screen index);
     /// used to bound the last genome's block for positional reads.
     index_offset: u64,
@@ -762,34 +900,67 @@ pub struct TwoStageDb {
     cache: Mutex<FxHashMap<u32, Arc<GenomeSketch>>>,
 }
 
-/// Parse the magic + version header; return `(checksum, index_offset, footer_offset)`.
-fn parse_header(hdr: &[u8]) -> io::Result<(u64, u64, u64)> {
-    if hdr.len() < HEADER_LEN as usize || &hdr[0..4] != MAGIC {
+/// A parsed `.syl2db` header. `checksum` is absent for upstream sylph's version 2,
+/// whose header has no checksum field.
+struct Header {
+    len: u64,
+    checksum: Option<u64>,
+    index_offset: u64,
+    footer_offset: u64,
+}
+
+/// Parse the magic + version header of either readable version.
+///
+/// Version 2 is upstream sylph's: the same layout minus the 8-byte whole-file
+/// checksum, so its header is 8 bytes shorter and its offsets sit 8 bytes earlier.
+/// Everything after the header -- dense blocks, screen index, footer -- is identical
+/// between the two, so a sylph-built database is read here directly (and vice versa
+/// once sylph learns to skip the extra 8 bytes); only the on-demand integrity check
+/// is unavailable for a v2 file.
+fn parse_header(hdr: &[u8]) -> io::Result<Header> {
+    if hdr.len() < HEADER_LEN_V2 as usize || &hdr[0..4] != MAGIC {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "not a sylph two-stage database",
         ));
     }
-    if hdr[4] != VERSION {
+    let version = hdr[4];
+    let (len, checksum_bytes) = match version {
+        VERSION => (HEADER_LEN, Some(5..13)),
+        VERSION_NO_CHECKSUM => (HEADER_LEN_V2, None),
+        other => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "two-stage database is version {}, but only versions {} and {} are readable; rebuild it with db-convert",
+                    other, VERSION_NO_CHECKSUM, VERSION
+                ),
+            ))
+        }
+    };
+    if (hdr.len() as u64) < len {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!(
-                "two-stage database is version {}, but only version {} is readable; rebuild it with db-convert",
-                hdr[4], VERSION
-            ),
+            "two-stage database header is truncated",
         ));
     }
-    let checksum = u64::from_le_bytes(hdr[5..13].try_into().unwrap());
-    let index_offset = u64::from_le_bytes(hdr[13..21].try_into().unwrap());
-    let footer_offset = u64::from_le_bytes(hdr[21..29].try_into().unwrap());
-    Ok((checksum, index_offset, footer_offset))
+    let checksum = checksum_bytes.map(|r| u64::from_le_bytes(hdr[r].try_into().unwrap()));
+    let offsets_at = len as usize - 16;
+    let index_offset = u64::from_le_bytes(hdr[offsets_at..offsets_at + 8].try_into().unwrap());
+    let footer_offset =
+        u64::from_le_bytes(hdr[offsets_at + 8..offsets_at + 16].try_into().unwrap());
+    Ok(Header {
+        len,
+        checksum,
+        index_offset,
+        footer_offset,
+    })
 }
 
 /// Assemble a `TwoStageDb` from its parsed footer + screen index + backing store.
 fn build_db(
     footer: Footer,
-    checksum: u64,
-    index_offset: u64,
+    header: &Header,
     screen_index: ScreenIndex,
     data: DenseData,
 ) -> TwoStageDb {
@@ -797,8 +968,9 @@ fn build_db(
         c: footer.c,
         k: footer.k,
         screen_c: footer.screen_c,
-        checksum,
-        index_offset,
+        checksum: header.checksum,
+        header_len: header.len,
+        index_offset: header.index_offset,
         genomes: footer.genomes,
         screen_index,
         data,
@@ -809,21 +981,21 @@ fn build_db(
 /// Parse the header + index + footer of a `.syl2db` already resident in `data`.
 fn from_bytes(data: DenseData) -> io::Result<TwoStageDb> {
     let bytes = data.bytes();
-    let (checksum, index_offset, footer_offset) = parse_header(bytes)?;
-    if index_offset > footer_offset || footer_offset as usize > bytes.len() {
+    let header = parse_header(bytes)?;
+    if header.index_offset > header.footer_offset || header.footer_offset as usize > bytes.len() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "two-stage database offsets out of range",
         ));
     }
-    let footer: Footer = bincode::deserialize(&bytes[footer_offset as usize..])
+    let footer: Footer = bincode::deserialize(&bytes[header.footer_offset as usize..])
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     let screen_index = ScreenIndex::read(
-        &bytes[index_offset as usize..footer_offset as usize],
+        &bytes[header.index_offset as usize..header.footer_offset as usize],
         footer.screen_c,
         footer.k,
     )?;
-    Ok(build_db(footer, checksum, index_offset, screen_index, data))
+    Ok(build_db(footer, &header, screen_index, data))
 }
 
 /// Open a `.syl2db` from an in-memory reader (reads it all into memory).
@@ -923,12 +1095,20 @@ impl TwoStageDb {
 
     /// Everything needed to copy genome `g` into another database: its dense region
     /// exactly as it sits on disk (so it is never re-encoded), plus its stage-1
-    /// sparse k-mers at `screen_c`.
+    /// sparse k-mers.
     ///
     /// The sparse set has to be recovered by decoding the block, because the pooled
     /// `ScreenIndex` stores only the inverted k-mer → owners mapping and cannot hand
     /// the per-genome sparse sets back. One positional read serves both.
-    pub fn raw_block_and_sparse(&self, g: u32, screen_c: usize) -> io::Result<(Vec<u8>, Vec<u64>)> {
+    ///
+    /// It is recovered from the stored *count* rather than by re-subsampling at
+    /// `screen_c`: a genome's sparse set is always the smallest `n` of its dense
+    /// hashes (see [`select_sparse`]), and `n` is in the screen index, so this
+    /// reproduces the original selection exactly — including for a small genome that
+    /// was selected at a denser genome-specific rate, which re-subsampling at the
+    /// database's screen rate would silently change.
+    pub fn raw_block_and_sparse(&self, g: u32) -> io::Result<(Vec<u8>, Vec<u64>)> {
+        let n_sparse = self.screen_index.sparse_count[g as usize] as usize;
         self.with_block(g, |bytes| {
             // The owned backing hands back everything from the block's start, so trim
             // to this genome's region; the file backing already reads exactly it.
@@ -941,30 +1121,36 @@ impl TwoStageDb {
             let block = &bytes[..len];
             let mut cur = block;
             let gk = read_hashes(&mut cur)?;
-            Ok((block.to_vec(), sparse_subset(&gk, screen_c)))
+            Ok((block.to_vec(), smallest_n(&gk, n_sparse)))
         })
     }
 
     /// Re-hash the whole file and compare against the checksum in its header. This
     /// reads every byte, so it is on-demand (`weebill inspect`) rather than part of
     /// opening the database.
-    pub fn verify_checksum(&self) -> io::Result<()> {
+    ///
+    /// `Ok(false)` means the file carries no checksum to check (an upstream sylph v2
+    /// database), as opposed to `Ok(true)` for a verified one.
+    pub fn verify_checksum(&self) -> io::Result<bool> {
+        let Some(expected) = self.checksum else {
+            return Ok(false);
+        };
         let got = match &self.data {
-            DenseData::Owned(v) => crate::checksum::hash_reader(&v[HEADER_LEN as usize..])?,
+            DenseData::Owned(v) => crate::checksum::hash_reader(&v[self.header_len as usize..])?,
             DenseData::File(file) => {
                 let mut r = BufReader::with_capacity(1 << 20, file.try_clone()?);
-                r.seek(SeekFrom::Start(HEADER_LEN))?;
+                r.seek(SeekFrom::Start(self.header_len))?;
                 crate::checksum::hash_reader(r)?
             }
         };
-        if got != self.checksum {
+        if got != expected {
             return Err(crate::checksum::mismatch(
                 "the two-stage database",
-                self.checksum,
+                expected,
                 got,
             ));
         }
-        Ok(())
+        Ok(true)
     }
 
     /// Decode genome `g`'s full dense `GenomeSketch`, caching it across calls.
@@ -984,29 +1170,43 @@ impl TwoStageDb {
 pub fn open_file(path: &str) -> io::Result<TwoStageDb> {
     let file = File::open(path)?;
     let mut hdr = [0u8; HEADER_LEN as usize];
-    file.read_exact_at(&mut hdr, 0)?;
-    let (checksum, index_offset, footer_offset) = parse_header(&hdr)?;
+    // A v2 (upstream sylph) database is 8 bytes shorter in the header, and could in
+    // principle be a file of only HEADER_LEN_V2 bytes, so a short read is not fatal
+    // here; `parse_header` rejects anything genuinely too short.
+    let read = read_at_most(&file, &mut hdr, 0)?;
+    let header = parse_header(&hdr[..read])?;
     let flen = file.metadata()?.len();
-    if index_offset > footer_offset || footer_offset > flen {
+    if header.index_offset > header.footer_offset || header.footer_offset > flen {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "two-stage database offsets out of range",
         ));
     }
-    let mut fbytes = vec![0u8; (flen - footer_offset) as usize];
-    file.read_exact_at(&mut fbytes, footer_offset)?;
+    let mut fbytes = vec![0u8; (flen - header.footer_offset) as usize];
+    file.read_exact_at(&mut fbytes, header.footer_offset)?;
     let footer: Footer =
         bincode::deserialize(&fbytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    let mut ibytes = vec![0u8; (footer_offset - index_offset) as usize];
-    file.read_exact_at(&mut ibytes, index_offset)?;
+    let mut ibytes = vec![0u8; (header.footer_offset - header.index_offset) as usize];
+    file.read_exact_at(&mut ibytes, header.index_offset)?;
     let screen_index = ScreenIndex::read(&ibytes, footer.screen_c, footer.k)?;
     Ok(build_db(
         footer,
-        checksum,
-        index_offset,
+        &header,
         screen_index,
         DenseData::File(file),
     ))
+}
+
+/// Positional read of up to `buf.len()` bytes, returning how many were read.
+fn read_at_most(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+    let mut done = 0;
+    while done < buf.len() {
+        match file.read_at(&mut buf[done..], offset + done as u64)? {
+            0 => break,
+            n => done += n,
+        }
+    }
+    Ok(done)
 }
 
 // --- CLI handler ------------------------------------------------------------
@@ -1083,6 +1283,13 @@ pub fn run_db_convert(args: DbConvertArgs) {
         );
         std::process::exit(1);
     }
+    if args.min_sparse_kmers < 1 {
+        error!(
+            "--min-sparse-kmers must be >= 1: a genome with an empty stage-1 screen entry \
+             could never pass the screen. Exiting"
+        );
+        std::process::exit(1);
+    }
 
     let out = if args.output.ends_with(TWO_STAGE_DB_SUFFIX) {
         args.output.clone()
@@ -1103,7 +1310,7 @@ pub fn run_db_convert(args: DbConvertArgs) {
     );
     let w =
         BufWriter::new(File::create(&out).unwrap_or_else(|_| panic!("Could not create {}", out)));
-    write_two_stage_db(w, &sketches, args.screen_c)
+    write_two_stage_db(w, &sketches, args.screen_c, args.min_sparse_kmers)
         .unwrap_or_else(|e| panic!("Failed to write {}: {}", out, e));
     info!("Wrote two-stage database to {}", out);
 }
@@ -1151,10 +1358,18 @@ pub fn run_db_add(args: DbAddArgs) {
     });
     if !args.no_verify {
         info!("Verifying {} before growing it...", args.database);
-        db.verify_checksum().unwrap_or_else(|e| {
+        let verified = db.verify_checksum().unwrap_or_else(|e| {
             error!("{}. Refusing to grow a corrupt database; exiting", e);
             std::process::exit(1);
         });
+        if !verified {
+            warn!(
+                "{} was written by upstream sylph and carries no whole-file checksum, so it \
+                 cannot be verified; growing it regardless. The database written here will \
+                 carry one.",
+                args.database
+            );
+        }
     }
     info!(
         "{} holds {} genomes (dense -c {}, -k {}, stage-1 screen -c {})",
@@ -1333,7 +1548,11 @@ pub fn run_db_add(args: DbAddArgs) {
             file.set_permissions(permissions)?;
         }
         let w = BufWriter::with_capacity(1 << 20, file);
-        let mut builder = DbBuilder::new(w, db.c, db.k, db.screen_c)?;
+        // The existing genomes' sparse sets are reproduced from their stored counts, so
+        // the floor only applies to the genomes being added; they are selected at the
+        // database's recorded screen rate, which is what the existing genomes were
+        // (nominally) selected at.
+        let mut builder = DbBuilder::new(w, db.c, db.k, db.screen_c, args.min_sparse_kmers.max(1))?;
         // Chunked so the reads/decodes of a chunk run in parallel while the writer
         // stays sequential (block order defines the footer offsets). Keeping at most
         // one decoded block per Rayon worker bounds transient dense-block memory by
@@ -1343,7 +1562,7 @@ pub fn run_db_add(args: DbAddArgs) {
             let chunk_end = (chunk_start + copy_chunk).min(db.len());
             let decoded: Vec<io::Result<(Vec<u8>, Vec<u64>)>> = (chunk_start..chunk_end)
                 .into_par_iter()
-                .map(|g| db.raw_block_and_sparse(g as u32, db.screen_c))
+                .map(|g| db.raw_block_and_sparse(g as u32))
                 .collect();
             for (i, d) in decoded.into_iter().enumerate() {
                 let (block, sparse) = d?;
@@ -1413,8 +1632,16 @@ mod tests {
     /// `write_two_stage_db` patches its header at the end and so needs `Seek`; a
     /// bare `Vec<u8>` is not seekable, hence the cursor.
     fn write_db_to_vec(sketches: &[GenomeSketch], screen_c: usize) -> Vec<u8> {
+        write_db_to_vec_min_sparse(sketches, screen_c, 1)
+    }
+
+    fn write_db_to_vec_min_sparse(
+        sketches: &[GenomeSketch],
+        screen_c: usize,
+        min_sparse_kmers: usize,
+    ) -> Vec<u8> {
         let mut cur = std::io::Cursor::new(Vec::new());
-        write_two_stage_db(&mut cur, sketches, screen_c).unwrap();
+        write_two_stage_db(&mut cur, sketches, screen_c, min_sparse_kmers).unwrap();
         cur.into_inner()
     }
 
@@ -1592,9 +1819,9 @@ mod tests {
         )))
         .unwrap();
         let mut cur = std::io::Cursor::new(Vec::new());
-        let mut builder = DbBuilder::new(&mut cur, base.c, base.k, base.screen_c).unwrap();
+        let mut builder = DbBuilder::new(&mut cur, base.c, base.k, base.screen_c, 1).unwrap();
         for g in 0..base.len() as u32 {
-            let (block, sparse) = base.raw_block_and_sparse(g, base.screen_c).unwrap();
+            let (block, sparse) = base.raw_block_and_sparse(g).unwrap();
             builder
                 .push_encoded(&block, sparse, base.genome_meta(g))
                 .unwrap();
@@ -1676,5 +1903,138 @@ mod tests {
         let mut g1h = hits[&1].clone();
         g1h.sort_unstable();
         assert_eq!(g1h, vec![4, 6, 9]);
+    }
+
+    /// Both header layouts are parsed, with the offsets read from the right place in
+    /// each: upstream sylph's version 2 has no checksum field, so its offsets sit 8
+    /// bytes earlier than in the version 3 written here.
+    #[test]
+    fn parses_both_header_versions() {
+        let mut v3 = Vec::new();
+        v3.extend_from_slice(MAGIC);
+        v3.push(VERSION);
+        v3.extend_from_slice(&0xdead_beef_u64.to_le_bytes()); // checksum
+        v3.extend_from_slice(&111u64.to_le_bytes()); // index offset
+        v3.extend_from_slice(&222u64.to_le_bytes()); // footer offset
+        assert_eq!(v3.len(), HEADER_LEN as usize);
+        let h = parse_header(&v3).unwrap();
+        assert_eq!(h.len, HEADER_LEN);
+        assert_eq!(h.checksum, Some(0xdead_beef));
+        assert_eq!((h.index_offset, h.footer_offset), (111, 222));
+
+        let mut v2 = Vec::new();
+        v2.extend_from_slice(MAGIC);
+        v2.push(VERSION_NO_CHECKSUM);
+        v2.extend_from_slice(&111u64.to_le_bytes());
+        v2.extend_from_slice(&222u64.to_le_bytes());
+        assert_eq!(v2.len(), HEADER_LEN_V2 as usize);
+        let h = parse_header(&v2).unwrap();
+        assert_eq!(h.len, HEADER_LEN_V2);
+        assert_eq!(h.checksum, None);
+        assert_eq!((h.index_offset, h.footer_offset), (111, 222));
+        // A v2 file is exactly HEADER_LEN_V2 long here, i.e. shorter than the buffer a
+        // v3 read would fill; that must not be mistaken for truncation.
+        assert!(parse_header(&v2[..v2.len() - 1]).is_err());
+
+        // Unknown version, and a v3 header cut short.
+        let mut future = v3.clone();
+        future[4] = VERSION + 1;
+        assert!(parse_header(&future).is_err());
+        assert!(parse_header(&v3[..HEADER_LEN as usize - 1]).is_err());
+        assert!(parse_header(b"NOPE").is_err());
+    }
+
+    /// A genome too small to reach `--min-sparse-kmers` at the nominal `--screen-c`
+    /// gets a denser, genome-specific screen rate, and the database-wide rate recorded
+    /// in the file is loosened just enough that its k-mers are still matchable.
+    #[test]
+    fn small_genome_gets_denser_screen_rate() {
+        let screen_c = 3000usize;
+        let thresh = screen_threshold(screen_c);
+        // A big genome with plenty of sparse k-mers, and a small one with none at all
+        // at screen_c (every hash above the nominal threshold).
+        let big: Vec<u64> = (0..60u64).map(|i| thresh / 2 + i).collect();
+        let small: Vec<u64> = (0..10u64).map(|i| thresh * 7 + i * 13).collect();
+        let sketches = vec![
+            gsketch("big.fa", big.clone(), Some(vec![1])),
+            gsketch("small.fa", small.clone(), Some(vec![2])),
+        ];
+
+        // Plain FracMinHash selection leaves the small genome with no screen k-mers at
+        // all, i.e. invisible to the stage-1 screen however deeply it is covered.
+        assert!(sparse_subset(&small, screen_c).is_empty());
+
+        // With a floor of 5 it stores its 5 smallest k-mers, and the recorded screen
+        // rate is denser so those k-mers pass `gather_hits`' threshold.
+        let on = open(std::io::Cursor::new(write_db_to_vec_min_sparse(
+            &sketches, screen_c, 5,
+        )))
+        .unwrap();
+        assert_eq!(on.screen_index.sparse_count[1], 5);
+        assert!(
+            on.screen_c < screen_c,
+            "effective screen -c should have been densified, got {}",
+            on.screen_c
+        );
+        // The big genome is unaffected: it clears the floor at the nominal rate, so it
+        // keeps exactly its FracMinHash subset.
+        assert_eq!(
+            on.screen_index.sparse_count[0] as usize,
+            sparse_subset(&big, screen_c).len()
+        );
+        let smallest_five = smallest_n(&small, 5);
+        let hits = on
+            .screen_index
+            .gather_hits(&sample_from(&[(smallest_five[0], 4)]));
+        assert_eq!(hits.get(&1).map(|v| v.as_slice()), Some(&[4u32][..]));
+    }
+
+    /// `db-add` must reproduce a densified genome's screen entry exactly. Its sparse
+    /// set is recovered from the stored count, not by re-subsampling at the database's
+    /// screen rate -- which, for a genome selected at a denser rate, would hand back a
+    /// different set and change every genome's screen ANI denominator.
+    #[test]
+    fn db_add_preserves_densified_sparse_sets() {
+        let screen_c = 3000usize;
+        let thresh = screen_threshold(screen_c);
+        let big: Vec<u64> = (0..60u64).map(|i| thresh / 2 + i).collect();
+        let small: Vec<u64> = (0..10u64).map(|i| thresh * 7 + i * 13).collect();
+        let s0 = gsketch("big.fa", big, Some(vec![1]));
+        let s1 = gsketch("small.fa", small, Some(vec![2]));
+        let s2 = gsketch(
+            "extra.fa",
+            (0..80u64).map(|i| thresh / 3 + i).collect(),
+            None,
+        );
+
+        let base = open(std::io::Cursor::new(write_db_to_vec_min_sparse(
+            &[s0.clone(), s1.clone()],
+            screen_c,
+            5,
+        )))
+        .unwrap();
+        let mut cur = std::io::Cursor::new(Vec::new());
+        let mut builder = DbBuilder::new(&mut cur, base.c, base.k, base.screen_c, 5).unwrap();
+        for g in 0..base.len() as u32 {
+            let (block, sparse) = base.raw_block_and_sparse(g).unwrap();
+            builder
+                .push_encoded(&block, sparse, base.genome_meta(g))
+                .unwrap();
+        }
+        builder.push_sketch(&s2).unwrap();
+        builder.finish().unwrap();
+        let grown = open(std::io::Cursor::new(cur.into_inner())).unwrap();
+
+        // The copied genomes keep exactly the screen entries they were built with.
+        assert_eq!(
+            &grown.screen_index.sparse_count[..2],
+            &base.screen_index.sparse_count[..]
+        );
+        assert_eq!(grown.screen_c, base.screen_c);
+        let sample = sample_from(&[(smallest_n(&s1.genome_kmers, 5)[0], 3)]);
+        assert_eq!(
+            grown.screen_index.gather_hits(&sample).get(&1),
+            base.screen_index.gather_hits(&sample).get(&1)
+        );
     }
 }

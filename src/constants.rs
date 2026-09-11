@@ -20,7 +20,18 @@ pub const DEREP_PROFILE_ANI: f64 = 0.975;
 pub const MAX_DEDUP_COUNT: u32 = 4;
 pub const MAX_DEDUP_LEN: usize = 10000000;
 pub const DEFAULT_FPR: f64 = 0.0001;
+/// Base seed for algorithms whose output must be repeatable across runs (matches
+/// upstream sylph's constant of the same name, so both tools bootstrap identically).
+pub const DEFAULT_RNG_SEED: u64 = 7;
 pub const MED_KMER_FOR_ID_EST: f64 = 3.;
+/// Minimum number of sampled k-mers a genome must have to be reported at all (`-M`).
+/// Small genomes -- plasmids, phage, viral contigs -- have few k-mers at c=200, so a
+/// high floor makes them invisible; the evidence floor below is what keeps precision.
+pub const MIN_NUMBER_KMERS_DEFAULT: f64 = 10.;
+/// Minimum number of *contained* (matched) k-mers required for a hit (`--min-contain`).
+/// Independent of genome size, unlike `-M`, so lowering `-M` for small genomes does not
+/// admit hits supported by one or two chance matches.
+pub const MIN_CONTAIN_DEFAULT: usize = 7;
 pub const DENSE_C_DEFAULT: usize = 50;
 pub const SCREEN_C_DEFAULT: usize = 3000;
 pub const SCREEN_MIN_ANI_DEFAULT: f64 = 85.;
@@ -79,6 +90,12 @@ pub const ERROR_YIELD_PER_OBSERVATION: f64 = 0.09;
 /// depends on it, so a bad estimate can cost time or a missed saving, never correctness.
 pub const ERROR_YIELD_CALIBRATION: f64 = 0.6;
 pub const GENOME_SKETCH_SUFFIX: &str = ".sylgn";
+/// Default minimum number of stage-1 sparse (screen) k-mers per genome in a `.syl2db`.
+/// A genome whose nominal `--screen-c` subsample falls short of this uses a denser,
+/// genome-specific screen rate to reach it, so small genomes (plasmids, phage, short
+/// contigs) still have enough screen k-mers to be detected. Matches upstream sylph's
+/// `--min-sparse-kmers` default, so both tools build equivalent screen indexes.
+pub const SPARSE_TARGET_MIN_DEFAULT: usize = 50;
 /// Two-stage seekable database: a small bincoded sparse (screen) index plus
 /// per-genome Golomb-Rice compressed dense blocks loaded on demand.
 pub const TWO_STAGE_DB_SUFFIX: &str = ".syl2db";
