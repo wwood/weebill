@@ -191,7 +191,7 @@ fn error_kmer_fixture(
     k: usize,
 ) -> (Vec<u8>, Vec<u64>, refdelta::RefIndex) {
     // deterministic random ACGT genome
-    let bases = [b'A', b'C', b'G', b'T'];
+    let bases = *b"ACGT";
     let mut state = seed | 1;
     let mut next = || {
         state ^= state << 13;
@@ -269,7 +269,7 @@ fn refdelta_error_kmer_roundtrip_and_savings() {
     // window contains exactly one substitution: a single-base variant of a real
     // genome k-mer. Sketching the mutated genome yields those error k-mers.
     let mut mutated = genome.clone();
-    let bases = [b'A', b'C', b'G', b'T'];
+    let bases = *b"ACGT";
     let mut p = 200usize;
     while p < mutated.len() - 1 {
         let orig = mutated[p];
@@ -571,7 +571,7 @@ fn avx512_seeding_matches_avx2_and_scalar() {
         state ^= state << 17;
         state
     };
-    let alphabet = [b'A', b'C', b'G', b'T'];
+    let alphabet = *b"ACGT";
 
     for len in 0..400usize {
         let seq: Vec<u8> = (0..len).map(|_| alphabet[(next() & 3) as usize]).collect();
@@ -640,7 +640,7 @@ fn simd_dispatch_matches_both_kernels_across_the_avx512_threshold() {
         state ^= state << 17;
         state
     };
-    let alphabet = [b'A', b'C', b'G', b'T'];
+    let alphabet = *b"ACGT";
     let longest = AVX512_MIN_SEQ_LEN * 4 + 3;
     let seq: Vec<u8> = (0..longest)
         .map(|_| alphabet[(next() & 3) as usize])

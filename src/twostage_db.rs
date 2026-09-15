@@ -603,16 +603,24 @@ const SPARSE_WARN_THRESHOLD: usize = 20;
 /// The `n` smallest hashes of `hashes` (all of them if it has fewer), as a multiset
 /// so repeated k-mers keep their multiplicity. O(n) partial selection.
 fn smallest_n(hashes: &[u64], n: usize) -> Vec<u64> {
-    if n == 0 {
-        return Vec::new();
-    }
+    smallest_n_and_next(hashes, n).0
+}
+
+/// [`smallest_n`], plus the smallest hash it left out (`None` if it kept them all).
+/// That excluded hash bounds the selection rate the set was taken at: every selection
+/// here keeps a value-ordered prefix of the dense hashes (see [`select_sparse`]), so a
+/// prefix of `n` taken at rate `c` means `screen_threshold(c)` cannot exceed it. That
+/// is what lets `db-add` recover the rate an existing database's genomes were selected
+/// at (see [`run_db_add`]).
+fn smallest_n_and_next(hashes: &[u64], n: usize) -> (Vec<u64>, Option<u64>) {
     if n >= hashes.len() {
-        return hashes.to_vec();
+        return (hashes.to_vec(), None);
     }
     let mut v = hashes.to_vec();
-    v.select_nth_unstable(n - 1);
-    v.truncate(n);
-    v
+    // `select_nth_unstable(n)` partitions around the (n+1)-th smallest hash: the `n`
+    // smallest end up before it, and it is itself the smallest excluded one.
+    let (smallest, &mut next, _) = v.select_nth_unstable(n);
+    (smallest.to_vec(), Some(next))
 }
 
 /// A genome's stage-1 sparse set: the FracMinHash subset at `screen_c`, unless that
@@ -647,6 +655,33 @@ fn select_sparse(genome_kmers: &[u64], screen_c: usize, min_sparse_kmers: usize)
         genome_kmers.len()
     );
     sparse
+}
+
+/// The nominal `--screen-c` an existing database's genomes were selected at, recovered
+/// from `smallest_excluded`: the smallest dense hash any of its genomes left out of its
+/// sparse set (`None` if none of them left any out). Used by `db-add` to select the
+/// genomes it adds at the rate the existing ones were selected at.
+///
+/// That is *not* in general the rate recorded in the database, which is the effective
+/// one: the `--min-sparse-kmers` floor may have made it far denser than the nominal rate
+/// in order to keep one small genome's screen k-mers matchable (see
+/// [`DbBuilder::finish`]). Selecting added genomes at that dense rate would put many
+/// times more hashes than intended into the stage-1 index — one tiny genome in a
+/// database would make every later `db-add` behave as if `--screen-c` were the dense
+/// `-c`, ballooning the index and slowing screening for every sample.
+///
+/// The nominal rate is not stored anywhere (the footer layout is shared with upstream
+/// sylph), but the genomes bound it: every genome keeps *at least* all of its dense
+/// hashes below `screen_threshold(nominal)`, so that threshold cannot exceed a hash any
+/// genome excluded, hence `nominal >= u64::MAX / smallest_excluded` (to integer
+/// rounding). The bound is tight as soon as one genome was selected at the nominal rate,
+/// which every genome that cleared the floor was. It is floored on the recorded rate, so
+/// a database that never hit the floor selects at exactly its recorded rate.
+fn nominal_screen_c(recorded_screen_c: usize, smallest_excluded: Option<u64>) -> usize {
+    match smallest_excluded {
+        Some(h) => recorded_screen_c.max((u64::MAX / h.max(1)).max(1) as usize),
+        None => recorded_screen_c,
+    }
 }
 
 /// Streaming writer for the two-stage layout. Each genome's dense block is written
@@ -744,6 +779,16 @@ impl<W: Write + Seek> DbBuilder<W> {
 
     pub fn num_genomes(&self) -> usize {
         self.genomes.len()
+    }
+
+    /// Set the nominal screen rate that subsequent [`DbBuilder::push_sketch`] calls
+    /// select their stage-1 sparse k-mers at. For `db-add`, which recovers that rate
+    /// from the genomes it copies through and so only knows it once they have all been
+    /// pushed (see [`run_db_add`]). Genomes already pushed keep the sparse sets they
+    /// were pushed with, and the rate *recorded* in the file is still the effective one
+    /// [`DbBuilder::finish`] derives, so this cannot make any stored k-mer unmatchable.
+    pub fn set_screen_c(&mut self, screen_c: usize) {
+        self.screen_c = screen_c;
     }
 
     /// Coarsest screen rate whose FracMinHash threshold still admits every sparse
@@ -898,6 +943,19 @@ pub struct TwoStageDb {
     pub screen_index: ScreenIndex,
     data: DenseData,
     cache: Mutex<FxHashMap<u32, Arc<GenomeSketch>>>,
+}
+
+/// One genome of an existing database, ready to be pushed into another one by
+/// `db-add`; see [`TwoStageDb::raw_block_and_sparse`].
+pub struct CopiedGenome {
+    /// Its dense block, exactly as it sits on disk (never decoded and re-encoded).
+    pub block: Vec<u8>,
+    /// Its stage-1 sparse k-mers, as originally selected.
+    pub sparse: Vec<u64>,
+    /// The smallest dense hash *not* in `sparse` (`None` if every one of them is),
+    /// which bounds the rate `sparse` was selected at; see [`smallest_n_and_next`]
+    /// and [`nominal_screen_c`].
+    pub smallest_excluded: Option<u64>,
 }
 
 /// A parsed `.syl2db` header. `checksum` is absent for upstream sylph's version 2,
@@ -1107,7 +1165,7 @@ impl TwoStageDb {
     /// reproduces the original selection exactly — including for a small genome that
     /// was selected at a denser genome-specific rate, which re-subsampling at the
     /// database's screen rate would silently change.
-    pub fn raw_block_and_sparse(&self, g: u32) -> io::Result<(Vec<u8>, Vec<u64>)> {
+    pub fn raw_block_and_sparse(&self, g: u32) -> io::Result<CopiedGenome> {
         let n_sparse = self.screen_index.sparse_count[g as usize] as usize;
         self.with_block(g, |bytes| {
             // The owned backing hands back everything from the block's start, so trim
@@ -1121,7 +1179,12 @@ impl TwoStageDb {
             let block = &bytes[..len];
             let mut cur = block;
             let gk = read_hashes(&mut cur)?;
-            Ok((block.to_vec(), smallest_n(&gk, n_sparse)))
+            let (sparse, smallest_excluded) = smallest_n_and_next(&gk, n_sparse);
+            Ok(CopiedGenome {
+                block: block.to_vec(),
+                sparse,
+                smallest_excluded,
+            })
         })
     }
 
@@ -1549,28 +1612,45 @@ pub fn run_db_add(args: DbAddArgs) {
         }
         let w = BufWriter::with_capacity(1 << 20, file);
         // The existing genomes' sparse sets are reproduced from their stored counts, so
-        // the floor only applies to the genomes being added; they are selected at the
-        // database's recorded screen rate, which is what the existing genomes were
-        // (nominally) selected at.
+        // the floor only applies to the genomes being added. The rate those are selected
+        // at is set once the existing genomes have been copied through, to the nominal
+        // rate recovered from them (see `nominal_screen_c`); the database's recorded rate
+        // is only the fallback for a database that says nothing about its nominal one.
         let mut builder = DbBuilder::new(w, db.c, db.k, db.screen_c, args.min_sparse_kmers.max(1))?;
         // Chunked so the reads/decodes of a chunk run in parallel while the writer
         // stays sequential (block order defines the footer offsets). Keeping at most
         // one decoded block per Rayon worker bounds transient dense-block memory by
         // the requested concurrency rather than an arbitrary genome count.
         let copy_chunk = rayon::current_num_threads().max(1);
+        // Smallest hash any existing genome left out of its sparse set, which is what
+        // pins down the rate they were selected at (see `nominal_screen_c`).
+        let mut smallest_excluded: Option<u64> = None;
         for chunk_start in (0..db.len()).step_by(copy_chunk) {
             let chunk_end = (chunk_start + copy_chunk).min(db.len());
-            let decoded: Vec<io::Result<(Vec<u8>, Vec<u64>)>> = (chunk_start..chunk_end)
+            let decoded: Vec<io::Result<CopiedGenome>> = (chunk_start..chunk_end)
                 .into_par_iter()
                 .map(|g| db.raw_block_and_sparse(g as u32))
                 .collect();
             for (i, d) in decoded.into_iter().enumerate() {
-                let (block, sparse) = d?;
+                let copied = d?;
                 let g = (chunk_start + i) as u32;
-                builder.push_encoded(&block, sparse, db.genome_meta(g))?;
+                builder.push_encoded(&copied.block, copied.sparse, db.genome_meta(g))?;
+                if let Some(h) = copied.smallest_excluded {
+                    smallest_excluded = Some(smallest_excluded.map_or(h, |m: u64| m.min(h)));
+                }
             }
             info!("Copied {}/{} existing genomes", chunk_end, db.len());
         }
+        let nominal_screen_c = nominal_screen_c(db.screen_c, smallest_excluded);
+        if nominal_screen_c != db.screen_c {
+            info!(
+                "Selecting the added genomes' stage-1 screen k-mers at -c {}: {}'s recorded screen \
+                 -c ({}) is denser than the rate its genomes were selected at, because the \
+                 --min-sparse-kmers floor applied to at least one small genome.",
+                nominal_screen_c, args.database, db.screen_c
+            );
+        }
+        builder.set_screen_c(nominal_screen_c);
         for gs in &new_sketches {
             builder.push_sketch(gs)?;
         }
@@ -1821,9 +1901,9 @@ mod tests {
         let mut cur = std::io::Cursor::new(Vec::new());
         let mut builder = DbBuilder::new(&mut cur, base.c, base.k, base.screen_c, 1).unwrap();
         for g in 0..base.len() as u32 {
-            let (block, sparse) = base.raw_block_and_sparse(g).unwrap();
+            let copied = base.raw_block_and_sparse(g).unwrap();
             builder
-                .push_encoded(&block, sparse, base.genome_meta(g))
+                .push_encoded(&copied.block, copied.sparse, base.genome_meta(g))
                 .unwrap();
         }
         builder.push_sketch(&s2).unwrap();
@@ -2016,9 +2096,9 @@ mod tests {
         let mut cur = std::io::Cursor::new(Vec::new());
         let mut builder = DbBuilder::new(&mut cur, base.c, base.k, base.screen_c, 5).unwrap();
         for g in 0..base.len() as u32 {
-            let (block, sparse) = base.raw_block_and_sparse(g).unwrap();
+            let copied = base.raw_block_and_sparse(g).unwrap();
             builder
-                .push_encoded(&block, sparse, base.genome_meta(g))
+                .push_encoded(&copied.block, copied.sparse, base.genome_meta(g))
                 .unwrap();
         }
         builder.push_sketch(&s2).unwrap();
@@ -2036,5 +2116,108 @@ mod tests {
             grown.screen_index.gather_hits(&sample).get(&1),
             base.screen_index.gather_hits(&sample).get(&1)
         );
+    }
+
+    /// The nominal screen rate is recovered from the smallest excluded hash, and never
+    /// reported denser than the rate recorded in the database.
+    #[test]
+    fn nominal_screen_c_recovers_the_build_rate() {
+        // A genome selected at 3000 excludes hashes at or above the 3000 threshold, so
+        // the smallest one it excluded pins the rate down to within integer rounding --
+        // even when the database's recorded rate was densified to 400.
+        let thresh = screen_threshold(3000);
+        for recorded in [400usize, 3000] {
+            let got = nominal_screen_c(recorded, Some(thresh));
+            assert!(
+                (2999..=3000).contains(&got),
+                "recovered {} from recorded {}",
+                got,
+                recorded
+            );
+        }
+        // A genome whose sparse set had to reach down past the nominal threshold (the
+        // floor) only gives a weaker bound, and a database whose genomes excluded
+        // nothing at all gives none: neither may report a rate denser than the recorded
+        // one, which is known to be safe.
+        assert_eq!(nominal_screen_c(400, Some(screen_threshold(100))), 400);
+        assert_eq!(nominal_screen_c(400, None), 400);
+        // Degenerate inputs must not divide by zero or return a rate of 0.
+        assert_eq!(nominal_screen_c(1, Some(0)), u64::MAX as usize);
+        assert_eq!(nominal_screen_c(1, Some(u64::MAX)), 1);
+    }
+
+    /// A small genome forces a database's *recorded* screen rate far denser than the
+    /// `--screen-c` it was built with. Genomes added later must still be selected at that
+    /// nominal rate: at the recorded rate they would contribute several times more
+    /// stage-1 k-mers than a from-scratch `db-convert` of all the genomes would give
+    /// them, inflating the screen index for good.
+    #[test]
+    fn db_add_selects_new_genomes_at_the_nominal_screen_rate() {
+        let screen_c = 3000usize;
+        let thresh = screen_threshold(screen_c);
+        // big: 40 k-mers below the nominal threshold plus one just above it, so the
+        // smallest hash it excludes sits immediately above that threshold.
+        let mut big: Vec<u64> = (0..40u64).map(|i| thresh / 2 + i).collect();
+        big.push(thresh);
+        // small: nothing at all at the nominal rate, so the floor of 5 takes its 5
+        // smallest k-mers and drags the recorded rate down with them.
+        let small: Vec<u64> = (0..10u64).map(|i| thresh * 7 + i * 13).collect();
+        // added: 25 k-mers below the nominal threshold, and 50 more between it and the
+        // recorded (densified) rate's threshold -- the ones that must NOT be selected.
+        let mut added: Vec<u64> = (0..25u64).map(|i| thresh / 3 + i).collect();
+        added.extend((0..50u64).map(|i| thresh * 2 + i * 7));
+        let s0 = gsketch("big.fa", big.clone(), Some(vec![1]));
+        let s1 = gsketch("small.fa", small, Some(vec![2]));
+        let s2 = gsketch("added.fa", added.clone(), Some(vec![3]));
+
+        let base = open(std::io::Cursor::new(write_db_to_vec_min_sparse(
+            &[s0.clone(), s1.clone()],
+            screen_c,
+            5,
+        )))
+        .unwrap();
+        assert!(
+            base.screen_c < screen_c / 2,
+            "test needs a database whose recorded rate was densified, got {}",
+            base.screen_c
+        );
+        // At the recorded rate the added genome would contribute all 75 of its k-mers.
+        assert_eq!(sparse_subset(&added, base.screen_c).len(), 75);
+
+        // What `run_db_add` does: copy the existing blocks through with their stored
+        // sparse sets, then select the new genome at the recovered nominal rate.
+        let mut cur = std::io::Cursor::new(Vec::new());
+        let mut builder = DbBuilder::new(&mut cur, base.c, base.k, base.screen_c, 5).unwrap();
+        let mut smallest_excluded: Option<u64> = None;
+        for g in 0..base.len() as u32 {
+            let copied = base.raw_block_and_sparse(g).unwrap();
+            builder
+                .push_encoded(&copied.block, copied.sparse, base.genome_meta(g))
+                .unwrap();
+            if let Some(h) = copied.smallest_excluded {
+                smallest_excluded = Some(smallest_excluded.map_or(h, |m: u64| m.min(h)));
+            }
+        }
+        // `big` excluded exactly the hash at the nominal threshold.
+        assert_eq!(smallest_excluded, Some(thresh));
+        builder.set_screen_c(nominal_screen_c(base.screen_c, smallest_excluded));
+        builder.push_sketch(&s2).unwrap();
+        builder.finish().unwrap();
+        let grown = open(std::io::Cursor::new(cur.into_inner())).unwrap();
+
+        // Identical to converting all three genomes at the original --screen-c: same
+        // screen entry for the added genome (25 k-mers, not 75), same recorded rate.
+        let all = open(std::io::Cursor::new(write_db_to_vec_min_sparse(
+            &[s0, s1, s2],
+            screen_c,
+            5,
+        )))
+        .unwrap();
+        assert_eq!(grown.screen_index.sparse_count[2], 25);
+        assert_eq!(
+            grown.screen_index.sparse_count,
+            all.screen_index.sparse_count
+        );
+        assert_eq!(grown.screen_c, all.screen_c);
     }
 }

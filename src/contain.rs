@@ -702,25 +702,6 @@ pub fn contain(mut args: ContainArgs, pseudotax_in: bool) {
         None
     };
 
-    let num_raw_read_files = read_files.len();
-    let step;
-    if let Some(sample_threads) = args.sample_threads {
-        if sample_threads > 0 {
-            step = sample_threads;
-        } else {
-            step = 1;
-        }
-    } else {
-        // `profile` used to reserve fewer samples in flight than `query` via a
-        // `threads/3 + 1` floor, to leave headroom for the per-sample reassignment
-        // pass. The floor is inert here -- `step` only bounds samples in flight
-        // through `get_chunks`, which already caps at the number of files, and the
-        // floor can only exceed `min(num_files, threads)` when it also exceeds
-        // `num_files` -- and upstream sylph dropped it (it actively starved its
-        // per-file sketch pipeline). Use `query`'s formula for both.
-        step = usize::max(1, usize::min(num_raw_read_files, args.threads))
-    }
-
     let read_sketch_files_as_vec = read_sketch_files
         .clone()
         .into_iter()
@@ -728,6 +709,25 @@ pub fn contain(mut args: ContainArgs, pseudotax_in: bool) {
         .collect::<Vec<Vec<&String>>>();
     read_files.extend(read_sketch_files_as_vec);
     let sequence_index_vec = (0..read_files.len()).collect::<Vec<usize>>();
+
+    // How many samples are in flight at once: `get_chunks` cuts the sample list into
+    // chunks of `step`, and each chunk is processed in parallel. Counted over *every*
+    // sample, pre-sketched ones included -- `profile db *.sylsp` has no raw read files
+    // at all, so counting only those would leave `step == 1` and profile the whole run
+    // one sample at a time.
+    //
+    // `profile` used to reserve fewer samples in flight than `query` via a
+    // `threads/3 + 1` floor, to leave headroom for the per-sample reassignment pass.
+    // With every sample counted the floor can only exceed `min(num_samples, threads)`
+    // when it also exceeds `num_samples`, which `get_chunks` caps at anyway, and
+    // upstream sylph dropped it (it actively starved their per-file sketch pipeline).
+    // So `query`'s formula serves both.
+    let num_samples = read_files.len();
+    let step = match args.sample_threads {
+        Some(sample_threads) if sample_threads > 0 => sample_threads,
+        Some(_) => 1,
+        None => usize::max(1, usize::min(num_samples, args.threads)),
+    };
 
     // --apply-unknown: rescale an existing (non-`-u`) profile TSV into the profile
     // `-u` would have produced, without re-profiling. Everything `-u` changes is a

@@ -69,7 +69,7 @@ fn fuzz_correctness() {
         state ^= state << 17;
         state
     };
-    let alphabet = [b'A', b'C', b'G', b'T'];
+    let alphabet = *b"ACGT";
     let mut failures = 0;
     for len in 0..600usize {
         let mut seq = Vec::with_capacity(len);

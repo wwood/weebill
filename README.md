@@ -111,7 +111,9 @@ Very small genomes — plasmids, phage, short contigs — have few k-mers at the
 recorded in the file enough to keep those k-mers matchable. That last part is database-wide: one
 tiny genome can pull the whole screen index denser (and so bigger and slower for every sample), which
 `db-convert` logs. Keeping tiny genomes in a plain `.syldb` avoids that; `--min-sparse-kmers 1`
-disables the floor.
+disables the floor. `db-add` recovers the nominal `--screen-c` from the genomes already in the
+database, so genomes added to such a database are still selected at that rate rather than at the
+denser one recorded in the file.
 
 ### Pre-sketching samples
 
