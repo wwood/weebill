@@ -7,7 +7,7 @@ species-level metagenomic profiler (ANI querying + taxonomic profiling). See the
 [sylph repository](https://github.com/bluenote-1577/sylph) and
 [sylph documentation](https://sylph-docs.github.io/) for the underlying method. Weebill maintains compatibility with sylph's command-line interface and sketch formats where possible. 
 
-Weebill is currently in development and is experimental. Efforts are made to contribute improvements back upstream to sylph, but some features are beyond its scope.
+Weebill is currently in development and is experimental. Efforts are made to contribute improvements back upstream to sylph, but some features are beyond its scope. Several such contributions have already landed: **sylph v1.0.0 merged weebill's two-stage `.syl2db` database/profiling format** (as `convert-db-two-screen`, crediting weebill in its changelog), along with weebill's multi-threaded read sketching and seeded, deterministic read deduplication. Those are therefore no longer differences between the two tools — see [Changes in the weebill fork](#changes-in-the-weebill-fork) for what still is, as of sylph v1.0.0.
 
 ## Contents
 
@@ -208,13 +208,23 @@ uncompressed samples — reference-delta compression is lossless.
 
 The binary is installed as `weebill`. Weebill changes:
 
-- **Lighter weight profiling** - the `profile` command can use a "2 stage" profiling approach which is
-~7–27× faster and uses ~6× less RAM (a flat ~4.4 GB vs the whole ~26 GB database) than standard sylph profiling (when input is sketches - FASTA/FASTQ inputs are also faster but more modestly). The on-disk database is also ~22% smaller. The profiles produced are effectively identical to standard sylph profiling, and the speed/RAM boost means that choosing smaller `c` values is more computationally feasible. To use this mode, see `weebill db-convert` and `weebill profile --two-stage`.
+- **Two-stage profiling (now merged into sylph)** - weebill introduced a "2 stage" profiling approach — a
+sparse first-stage screen followed by dense per-genome decoding only for genomes that pass — which is
+~7–27× faster and uses ~6× less RAM (a flat ~4.4 GB vs the whole ~26 GB database) than standard profiling
+(when input is sketches - FASTA/FASTQ inputs are also faster but more modestly), with an ~22% smaller
+on-disk database and profiles effectively identical to standard profiling. **Sylph v1.0.0 merged this
+upstream** (as `convert-db-two-screen`/`.syl2db`, crediting weebill in its changelog), so it is no longer
+weebill-exclusive — a sylph-built `.syl2db` and a weebill-built one are interoperable (see
+[compatibility notes](#from-reads-to-a-profile-two-stage) above). To use this mode: `weebill db-convert`
+(= sylph's `convert-db-two-screen`) and `weebill profile --two-stage` (implied automatically for a
+`.syl2db` input, in both tools). What weebill still adds on top of sylph here is growing a `.syl2db` in
+place without rebuilding it — see the next bullet.
 - **Growable two-stage databases** — `weebill db-add` adds genomes to an existing `.syl2db`
-  without rebuilding it. Each genome's dense block is independently coded, so the existing blocks
-  are copied through byte for byte and the new ones appended; only the small stage-1 screen index
-  is rebuilt (its pooled MPHF cannot absorb new keys). The result is identical to converting all
-  the genomes at once. See [Adding genomes to a `.syl2db`](#adding-genomes-to-a-syl2db).
+  without rebuilding it (sylph has no equivalent; growing a database there means re-running
+  `convert-db-two-screen` on the whole source `.syldb`). Each genome's dense block is independently
+  coded, so the existing blocks are copied through byte for byte and the new ones appended; only the
+  small stage-1 screen index is rebuilt (its pooled MPHF cannot absorb new keys). The result is
+  identical to converting all the genomes at once. See [Adding genomes to a `.syl2db`](#adding-genomes-to-a-syl2db).
 - **Compressed sketches** — `weebill sketch --compressed-output`/`--compressed-database` write
   `.sylspc` samples and `.syldbc` databases (~55% smaller samples, ~30%+ smaller databases). Hashes
   are sorted, delta-encoded and Golomb–Rice coded, then wrapped in a zstd frame. `query`, `profile`,
@@ -247,13 +257,16 @@ The binary is installed as `weebill`. Weebill changes:
 
 Smaller improvements and fixes beyond the headline features above:
 
-- **Multi-threaded read sketching** — sketching a read input now uses threads at two levels. Across
-  inputs, single-end, paired-end and interleaved passes are drained concurrently rather than one at a
-  time. Within a single input, a dedicated reader thread does the IO/decompression while rayon workers
-  extract k-mers from batches of reads in parallel; only the order-dependent dedup fold stays serial,
-  so the sketch is byte-for-byte identical to the single-threaded result (and independent of `-t`).
-  This lets one large read file scale across cores (~2× on 4 threads for a single-end input) where it
-  previously ran the k-mer work on one core regardless of `-t`.
+- **Multi-threaded read sketching (now merged into sylph)** — sketching a read input uses threads at
+  two levels. Across inputs, single-end, paired-end and interleaved passes are drained concurrently
+  rather than one at a time. Within a single input, a dedicated reader thread does the IO/decompression
+  while rayon workers extract k-mers from batches of reads in parallel; only the order-dependent dedup
+  fold stays serial, so the sketch is byte-for-byte identical to the single-threaded result (and
+  independent of `-t`). This let one large read file scale across cores (~2× on 4 threads for a
+  single-end input) where it previously ran the k-mer work on one core regardless of `-t`. **Sylph
+  v1.0.0 has since merged this too** (crediting weebill in its changelog), via its own `parallel_sketch`
+  module, which adds further tunables (`--sketch-batch-size`, `--sketch-shards`, `--no-sketch-pipeline`,
+  …) that weebill does not currently expose — so this is no longer a difference between the tools.
 - **`profile --apply-unknown`** — converts a profile produced *without* `-u`/`--estimate-unknown`
   into the profile `-u` would have produced, without re-profiling. `-u`'s effect is a per-sample
   rescale of just two columns (`Eff_cov` → `True_cov`, and `Sequence_abundance` by the estimated
@@ -274,8 +287,10 @@ Smaller improvements and fixes beyond the headline features above:
   stream does not abort a `--merge`. A run where *every* input is empty is still an error.
 - **AVX-512 k-mer extraction** — an 8-lane AVX-512 seeding path (with `vpcompressq`) alongside the
   existing AVX2 path, for faster k-mer extraction on capable CPUs.
-- **Reproducible sketching** — `rand` is pinned and the read-deduplication cuckoo filter RNG is
-  seeded, so repeated sketching of the same input is deterministic.
+- **Reproducible sketching (now also in sylph)** — the read-deduplication cuckoo filter's RNG is
+  seeded, so repeated sketching of the same input is deterministic regardless of thread count. Sylph
+  v1.0.0 has since adopted the same fix (a differently-seeded RNG, same effect), so this is no longer
+  a difference between the tools.
 - **More accurate paired read lengths** — the read-length estimate for paired-end data uses the
   mean of both mates and excludes sub-*k* mates, improving `--estimate-unknown` coverage scaling.
 - **Corruption detection in the new sketch/database formats** — the compressed sketches are
