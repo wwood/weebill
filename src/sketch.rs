@@ -224,21 +224,109 @@ pub fn check_vram_and_block(max_ram: usize, file: &str) {
     }
 }
 
-pub fn extract_markers(string: &[u8], kmer_vec: &mut Vec<u64>, c: usize, k: usize) {
-    #[cfg(any(target_arch = "x86_64"))]
-    {
-        if is_x86_feature_detected!("avx512f") {
-            use crate::avx512_seeding::*;
-            unsafe {
-                extract_markers_avx512(string, kmer_vec, c, k);
-            }
+/// Which k-mer extraction kernel `extract_markers{,_positions}` dispatch to.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum SimdBackend {
+    /// AVX-512 for sequences at least [`AVX512_MIN_SEQ_LEN`] long, AVX2 below it.
+    Auto,
+    /// AVX-512 for every sequence, however short.
+    Avx512,
+    Avx2,
+    Scalar,
+}
+
+/// Sequence length at or above which the AVX-512 kernel is used in [`SimdBackend::Auto`]
+/// — in [`extract_markers`] only; [`extract_markers_positions`] never uses it
+/// automatically (see the comment there).
+///
+/// Both SIMD kernels split the sequence into equal lanes and prime each lane with
+/// `k - 1` bases before its rolling hash produces anything, so priming costs
+/// `lanes * (k - 1)` byte loads regardless of sequence length. AVX-512 has twice
+/// the lanes, so it pays twice the priming for half as many inner-loop iterations:
+/// on a short sequence that fixed cost dominates and it *loses* to AVX2, while on a
+/// long one it is amortised away and the wider vectors win.
+///
+/// Measured with `cargo run --release --example bench_seeding` on an AMD EPYC 9684X
+/// (Zen 4), k=31, c=200 (AVX-512 throughput relative to AVX2):
+///
+/// | seq len | 100  | 150  | 250  | 500  | 1000 | 1500 | 2000 | 10000 |
+/// |---------|------|------|------|------|------|------|------|-------|
+/// | speedup | 0.46 | 0.65 | 0.72 | 0.86 | 0.99 | 1.01 | 1.05 | 1.08  |
+///
+/// The crossover is ~1 kbp; 2 kbp is past the noise. Short reads (100-250 bp) -- the
+/// dominant `sketch`/`profile` input -- were 1.4-2.2x *slower* under AVX-512 before
+/// this split (27% slower end to end on single-threaded paired sketching), which is
+/// why upstream sylph measured AVX-512 as a regression. What is left above the
+/// threshold is long-read (Nanopore/PacBio) sketching, worth ~1.08x.
+pub const AVX512_MIN_SEQ_LEN: usize = 2000;
+
+/// Pick the kernel once: the widest one this CPU supports, unless `WEEBILL_SIMD`
+/// (`auto`/`avx512`/`avx2`/`scalar`) overrides it.
+///
+/// The override exists to benchmark the kernels against each other in a real run
+/// and to reproduce another machine's sketch here. The AVX2 and AVX-512 paths are
+/// interchangeable -- they emit the same multiset of hashes (see
+/// `avx512_seeding.rs`), which is what makes the length-based `Auto` split safe --
+/// but `scalar` is *not*: it also sketches the trailing `(n - k + 1) % 4` windows
+/// of each sequence that both SIMD paths drop, so forcing it changes sketch
+/// contents slightly.
+#[cfg(target_arch = "x86_64")]
+pub fn simd_backend() -> SimdBackend {
+    static BACKEND: std::sync::OnceLock<SimdBackend> = std::sync::OnceLock::new();
+    *BACKEND.get_or_init(|| {
+        let detected = if is_x86_feature_detected!("avx512f") {
+            SimdBackend::Auto
         } else if is_x86_feature_detected!("avx2") {
-            use crate::avx2_seeding::*;
-            unsafe {
-                extract_markers_avx2(string, kmer_vec, c, k);
-            }
+            SimdBackend::Avx2
         } else {
-            fmh_seeds(string, kmer_vec, c, k);
+            SimdBackend::Scalar
+        };
+        let requested = std::env::var("WEEBILL_SIMD").ok();
+        match requested.as_deref().map(str::trim) {
+            None | Some("") => detected,
+            Some("auto") => detected,
+            Some("scalar") => SimdBackend::Scalar,
+            Some("avx2") if is_x86_feature_detected!("avx2") => SimdBackend::Avx2,
+            Some("avx512") if is_x86_feature_detected!("avx512f") => SimdBackend::Avx512,
+            Some(other) => {
+                warn!(
+                    "WEEBILL_SIMD='{}' is not a known backend, or is not supported by this CPU \
+                     (expected one of auto/avx512/avx2/scalar); using {:?}",
+                    other, detected
+                );
+                detected
+            }
+        }
+    })
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+pub fn simd_backend() -> SimdBackend {
+    SimdBackend::Scalar
+}
+
+pub fn extract_markers(string: &[u8], kmer_vec: &mut Vec<u64>, c: usize, k: usize) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let backend = match simd_backend() {
+            SimdBackend::Auto if string.len() >= AVX512_MIN_SEQ_LEN => SimdBackend::Avx512,
+            SimdBackend::Auto => SimdBackend::Avx2,
+            other => other,
+        };
+        match backend {
+            SimdBackend::Avx512 => {
+                use crate::avx512_seeding::*;
+                unsafe {
+                    extract_markers_avx512(string, kmer_vec, c, k);
+                }
+            }
+            SimdBackend::Avx2 => {
+                use crate::avx2_seeding::*;
+                unsafe {
+                    extract_markers_avx2(string, kmer_vec, c, k);
+                }
+            }
+            SimdBackend::Scalar | SimdBackend::Auto => fmh_seeds(string, kmer_vec, c, k),
         }
     }
     #[cfg(not(target_arch = "x86_64"))]
@@ -254,20 +342,36 @@ pub fn extract_markers_positions(
     k: usize,
     contig_number: usize,
 ) {
-    #[cfg(any(target_arch = "x86_64"))]
+    #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx512f") {
-            use crate::avx512_seeding::*;
-            unsafe {
-                extract_markers_avx512_positions(string, kmer_vec, c, k, contig_number);
+        // Unlike `extract_markers`, this path never picks AVX-512 automatically,
+        // whatever the sequence length. It emits `(contig, position, hash)` tuples, so
+        // the survivors cannot be compacted with `vpcompressq`: both kernels store
+        // their lane hashes and loop over them scalar-wise, which is where the time
+        // goes, and AVX-512 only adds its doubled per-lane priming. Measured on an AMD
+        // EPYC 9684X (Zen 4) over a 5 Mbp contig it is 0.88x AVX2 at c=200 and 0.90x at
+        // c=50 -- and genome sketching, the only caller, showed the same ~7% loss end
+        // to end. `WEEBILL_SIMD=avx512` still forces it, for re-measuring on other CPUs.
+        let backend = match simd_backend() {
+            SimdBackend::Auto => SimdBackend::Avx2,
+            other => other,
+        };
+        match backend {
+            SimdBackend::Avx512 => {
+                use crate::avx512_seeding::*;
+                unsafe {
+                    extract_markers_avx512_positions(string, kmer_vec, c, k, contig_number);
+                }
             }
-        } else if is_x86_feature_detected!("avx2") {
-            use crate::avx2_seeding::*;
-            unsafe {
-                extract_markers_avx2_positions(string, kmer_vec, c, k, contig_number);
+            SimdBackend::Avx2 => {
+                use crate::avx2_seeding::*;
+                unsafe {
+                    extract_markers_avx2_positions(string, kmer_vec, c, k, contig_number);
+                }
             }
-        } else {
-            fmh_seeds_positions(string, kmer_vec, c, k, contig_number);
+            SimdBackend::Scalar | SimdBackend::Auto => {
+                fmh_seeds_positions(string, kmer_vec, c, k, contig_number)
+            }
         }
     }
     #[cfg(not(target_arch = "x86_64"))]

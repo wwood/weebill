@@ -454,6 +454,10 @@ pub fn contain(mut args: ContainArgs, pseudotax_in: bool) {
     let mut read_files = vec![];
 
     let mut all_files = args.files.clone();
+    // `-d/--databases` is just an explicit way of naming database inputs; they are
+    // routed by suffix exactly like positional inputs, so a sample sketch passed to
+    // -d still works (and a database passed positionally still works too).
+    all_files.extend(args.databases.iter().cloned());
 
     if let Some(ref newline_file) = args.file_list {
         let file = File::open(newline_file).unwrap();
@@ -698,25 +702,6 @@ pub fn contain(mut args: ContainArgs, pseudotax_in: bool) {
         None
     };
 
-    let num_raw_read_files = read_files.len();
-    let step;
-    if let Some(sample_threads) = args.sample_threads {
-        if sample_threads > 0 {
-            step = sample_threads;
-        } else {
-            step = 1;
-        }
-    } else {
-        if args.pseudotax {
-            step = usize::max(
-                args.threads / 3 + 1,
-                usize::min(num_raw_read_files, args.threads),
-            )
-        } else {
-            step = usize::max(1, usize::min(num_raw_read_files, args.threads))
-        }
-    }
-
     let read_sketch_files_as_vec = read_sketch_files
         .clone()
         .into_iter()
@@ -724,6 +709,25 @@ pub fn contain(mut args: ContainArgs, pseudotax_in: bool) {
         .collect::<Vec<Vec<&String>>>();
     read_files.extend(read_sketch_files_as_vec);
     let sequence_index_vec = (0..read_files.len()).collect::<Vec<usize>>();
+
+    // How many samples are in flight at once: `get_chunks` cuts the sample list into
+    // chunks of `step`, and each chunk is processed in parallel. Counted over *every*
+    // sample, pre-sketched ones included -- `profile db *.sylsp` has no raw read files
+    // at all, so counting only those would leave `step == 1` and profile the whole run
+    // one sample at a time.
+    //
+    // `profile` used to reserve fewer samples in flight than `query` via a
+    // `threads/3 + 1` floor, to leave headroom for the per-sample reassignment pass.
+    // With every sample counted the floor can only exceed `min(num_samples, threads)`
+    // when it also exceeds `num_samples`, which `get_chunks` caps at anyway, and
+    // upstream sylph dropped it (it actively starved their per-file sketch pipeline).
+    // So `query`'s formula serves both.
+    let num_samples = read_files.len();
+    let step = match args.sample_threads {
+        Some(sample_threads) if sample_threads > 0 => sample_threads,
+        Some(_) => 1,
+        None => usize::max(1, usize::min(num_samples, args.threads)),
+    };
 
     // --apply-unknown: rescale an existing (non-`-u`) profile TSV into the profile
     // `-u` would have produced, without re-profiling. Everything `-u` changes is a
@@ -1747,6 +1751,19 @@ fn get_stats<'a>(
     }
 
     let n_kmers = gn_kmers.len();
+    // Absolute evidence floor, independent of genome size: `-M` scales with the
+    // genome's k-mer count, so lowering it to admit small genomes would also admit
+    // hits carried by a couple of chance matches. Both gates have to pass.
+    if contain_count < args.min_contain {
+        log::debug!(
+            "Discarding {}/{}: {} contained k-mers is below the minimum evidence floor {}",
+            genome_sketch.file_name,
+            genome_sketch.first_contig_name,
+            contain_count,
+            args.min_contain,
+        );
+        return None;
+    }
     let reassign_log = if winner_map.is_some() && log_reassign {
         Some((
             genome_sketch.file_name.as_str(),
@@ -1971,7 +1988,14 @@ fn bootstrap_interval(
     k: f64,
     args: &ContainArgs,
 ) -> (Option<f64>, Option<f64>, Option<f64>, Option<f64>) {
-    fastrand::seed(7);
+    // A local generator, rather than seeding fastrand's thread-local global: genomes
+    // are finalized concurrently through rayon, so a global seed is both reset and
+    // consumed by whichever genomes happen to share a worker thread, making each
+    // genome's confidence interval depend on the interleaving. Seeding a private
+    // generator per call gives every genome the same bootstrap resamples it would get
+    // in a single-threaded run, so the CIs are reproducible run-to-run and
+    // independent of -t.
+    let mut rng = fastrand::Rng::with_seed(DEFAULT_RNG_SEED);
     let num_samp = covs_full.len();
     let iters = 100;
     let mut res_ani = vec![];
@@ -1981,7 +2005,7 @@ fn bootstrap_interval(
         let mut rand_vec = vec![];
         rand_vec.reserve(num_samp);
         for _ in 0..num_samp {
-            rand_vec.push(covs_full[fastrand::usize(..covs_full.len())]);
+            rand_vec.push(covs_full[rng.usize(..covs_full.len())]);
         }
         let lambda;
         if args.ratio {

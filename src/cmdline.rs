@@ -38,7 +38,13 @@ pub enum Mode {
     #[clap(arg_required_else_help = true, display_order = 6)]
     RefCompress(RefCompressArgs),
     ///Convert a standard database (.syldb) into a two-stage seekable database (.syl2db) for `profile --two-stage`.
-    #[clap(arg_required_else_help = true, display_order = 7)]
+    // `convert-db-two-screen` is what upstream sylph calls this, kept as a hidden alias
+    // so a command line written for either tool runs on both.
+    #[clap(
+        arg_required_else_help = true,
+        display_order = 7,
+        alias = "convert-db-two-screen"
+    )]
     DbConvert(DbConvertArgs),
     ///Add new genomes to an existing two-stage database (.syl2db) without rebuilding it from scratch.
     #[clap(arg_required_else_help = true, display_order = 7)]
@@ -86,7 +92,14 @@ pub struct DbAddArgs {
         help = "Minimum spacing between selected k-mers when sketching -g genomes. Default: the value the existing database's genomes were sketched with, so the added genomes match."
     )]
     pub min_spacing_kmer: Option<usize>,
-    #[clap(short, default_value_t = 3, help = "Number of threads")]
+    #[clap(long="min-sparse-kmers", default_value_t = SPARSE_TARGET_MIN_DEFAULT, help = "Minimum stage-1 sparse/screen k-mers for the genomes being added (see `db-convert --min-sparse-kmers`). The existing genomes keep the screen k-mers they were built with. Must be >= 1.")]
+    pub min_sparse_kmers: usize,
+    #[clap(
+        short,
+        long = "threads",
+        default_value_t = 3,
+        help = "Number of threads"
+    )]
     pub threads: usize,
     #[clap(long = "trace", help = "Trace output")]
     pub trace: bool,
@@ -109,7 +122,14 @@ pub struct DbConvertArgs {
     pub output: String,
     #[clap(long="screen-c", default_value_t = SCREEN_C_DEFAULT, help = "Subsampling rate -c of the small in-memory stage-1 SCREEN index (the bincoded sparse hashes). Must be >= the database -c. A coarser (larger) value gives a smaller/faster screen index. The dense per-genome blocks always keep every k-mer at the database -c.")]
     pub screen_c: usize,
-    #[clap(short, default_value_t = 3, help = "Number of threads")]
+    #[clap(long="min-sparse-kmers", default_value_t = SPARSE_TARGET_MIN_DEFAULT, help = "Minimum stage-1 sparse/screen k-mers per genome; genomes whose nominal --screen-c subsample would fall short use a denser, genome-specific screen rate to reach this floor (or all of their dense k-mers if they have fewer than this to begin with). Must be >= 1.")]
+    pub min_sparse_kmers: usize,
+    #[clap(
+        short,
+        long = "threads",
+        default_value_t = 3,
+        help = "Number of threads"
+    )]
     pub threads: usize,
     #[clap(long = "trace", help = "Trace output")]
     pub trace: bool,
@@ -170,7 +190,12 @@ pub struct RefBuildArgs {
         help = "Directory for build scratch files (needs roughly the input database size of free space). Default: alongside the output."
     )]
     pub tmp_dir: Option<String>,
-    #[clap(short, default_value_t = 3, help = "Number of threads")]
+    #[clap(
+        short,
+        long = "threads",
+        default_value_t = 3,
+        help = "Number of threads"
+    )]
     pub threads: usize,
     #[clap(long = "trace", help = "Trace output")]
     pub trace: bool,
@@ -211,7 +236,12 @@ pub struct RefCompressArgs {
         help = "Output directory"
     )]
     pub output_dir: String,
-    #[clap(short, default_value_t = 3, help = "Number of threads")]
+    #[clap(
+        short,
+        long = "threads",
+        default_value_t = 3,
+        help = "Number of threads"
+    )]
     pub threads: usize,
     #[clap(
         long = "ref-screen-ani",
@@ -413,7 +443,12 @@ pub struct SketchArgs {
         help = "Subsampling rate"
     )]
     pub c: usize,
-    #[clap(short, default_value_t = 3, help = "Number of threads")]
+    #[clap(
+        short,
+        long = "threads",
+        default_value_t = 3,
+        help = "Number of threads"
+    )]
     pub threads: usize,
     #[clap(
         long = "ram-barrier",
@@ -502,6 +537,15 @@ pub struct ContainArgs {
     pub file_list: Option<String>,
 
     #[clap(
+        short = 'd',
+        long = "databases",
+        multiple = true,
+        help = "Explicitly specify database files (*.syldb/*.syldbc/*.syl2db) instead of/in addition to positional input",
+        help_heading = "INPUT/OUTPUT"
+    )]
+    pub databases: Vec<String>,
+
+    #[clap(
         long,
         default_value_t = 3.,
         help_heading = "ALGORITHM",
@@ -511,11 +555,18 @@ pub struct ContainArgs {
     #[clap(
         short = 'M',
         long,
-        default_value_t = 50.,
+        default_value_t = MIN_NUMBER_KMERS_DEFAULT,
         help_heading = "ALGORITHM",
-        help = "Exclude genomes with less than this number of sampled k-mers"
+        help = "Discard genomes with fewer than this many sampled k-mers"
     )]
     pub min_number_kmers: f64,
+    #[clap(
+        long = "min-contain",
+        default_value_t = MIN_CONTAIN_DEFAULT,
+        help_heading = "ALGORITHM",
+        help = "Minimum number of contained k-mers required for a hit"
+    )]
+    pub min_contain: usize,
     #[clap(
         short,
         long = "minimum-ani",
@@ -523,7 +574,12 @@ pub struct ContainArgs {
         help = "Minimum adjusted ANI to consider (0-100). Default is 90 for query and 95 for profile. Smaller than 95 for profile will give inaccurate results."
     )]
     pub minimum_ani: Option<f64>,
-    #[clap(short, default_value_t = 3, help = "Number of threads")]
+    #[clap(
+        short,
+        long = "threads",
+        default_value_t = 3,
+        help = "Number of threads"
+    )]
     pub threads: usize,
     #[clap(
         short = 's',

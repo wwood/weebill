@@ -1179,7 +1179,7 @@ fn test_two_stage_profile_raw_reads() {
         let mut v: Vec<String> = tsv
             .lines()
             .skip(1)
-            .map(|l| l.splitn(2, '\t').nth(1).unwrap_or("").to_string())
+            .map(|l| l.split_once('\t').map(|x| x.1).unwrap_or("").to_string())
             .collect();
         v.sort();
         v
