@@ -214,7 +214,8 @@ sparse first-stage screen followed by dense per-genome decoding only for genomes
 (when input is sketches - FASTA/FASTQ inputs are also faster but more modestly), with an ~22% smaller
 on-disk database and profiles effectively identical to standard profiling. **Sylph v1.0.0 merged this
 upstream** (as `convert-db-two-screen`/`.syl2db`, crediting weebill in its changelog), so it is no longer
-weebill-exclusive — a sylph-built `.syl2db` and a weebill-built one are interoperable (see
+weebill-exclusive — compatibility is one-way, though: weebill reads a sylph-built `.syl2db` directly,
+but sylph 1.0 does not read a weebill-built one (see
 [compatibility notes](#from-reads-to-a-profile-two-stage) above). To use this mode: `weebill db-convert`
 (= sylph's `convert-db-two-screen`) and `weebill profile --two-stage` (implied automatically for a
 `.syl2db` input, in both tools). What weebill still adds on top of sylph here is growing a `.syl2db` in
