@@ -66,6 +66,7 @@
 //! read rather than silently decoded into a corrupt sketch. Decoding reads the
 //! whole frame (`zstd::stream::decode_all`), so the checksum is always checked.
 
+mod recover;
 mod ref_build;
 mod sketch_compress;
 mod sketch_decompress;
@@ -127,10 +128,13 @@ fn init_logger(trace: bool) {
 
 // Public re-exports — everything callers outside `refdelta` need.
 
+pub use recover::{
+    build_graph, fingerprint_for_order, read_graph, run_ref_recover, write_graph, Graph, Group,
+};
 pub use ref_build::{
     build_refdb, build_refdb_with_pool_min_genomes, open_ref_index, open_ref_index_file,
-    open_ref_index_file_for_compress, run_ref_build, write_refdb, GenomeSeq, GenomeSource, RefDb,
-    RefGenome, RefGenomeMeta, RefIndex,
+    open_ref_index_file_for_compress, route_genomes, run_ref_build, write_refdb, GenomeSeq,
+    GenomeSource, RefDb, RefGenome, RefGenomeMeta, RefIndex, Routed,
 };
 pub use sketch_compress::{
     compress_seq, compress_seq_with_meta, compress_seq_with_opts, run_ref_compress, CompressOpts,

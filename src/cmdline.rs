@@ -37,6 +37,9 @@ pub enum Mode {
     ///Compress sample sketches against a reference DB (.sylsp -> .sylspr), or --decompress to reverse.
     #[clap(arg_required_else_help = true, display_order = 6)]
     RefCompress(RefCompressArgs),
+    ///Recover the genome order a lost .sylref was built with, from the samples compressed against it.
+    #[clap(arg_required_else_help = true, display_order = 6)]
+    RefRecover(RefRecoverArgs),
     ///Convert a standard database (.syldb) into a two-stage seekable database (.syl2db) for `profile --two-stage`.
     // `convert-db-two-screen` is what upstream sylph calls this, kept as a hidden alias
     // so a command line written for either tool runs on both.
@@ -176,6 +179,12 @@ pub struct RefBuildArgs {
     )]
     pub pool_min_genomes: u32,
     #[clap(
+        long = "genome-order",
+        help_heading = "INPUT",
+        help = "File of genome file names, one per line, fixing the order in which genomes are fed to the owner-assignment pass. This decides only the tie-break for k-mers contested by fewer than --pool-min-genomes same-tier genomes, which is otherwise the order the sketches happen to sit in their *.syldb. Supply it to make a build reproducible, or to replay the order of a lost reference (see `ref-recover`). Every genome in the input must be listed exactly once."
+    )]
+    pub genome_order: Option<String>,
+    #[clap(
         long = "store-genomes",
         help = "Store the nucleotide sequence (2-bit packed) of every species representative in the .sylref. This enables single-substitution error-k-mer encoding in `ref-compress`, which losslessly recodes sequencing-error hashes much more compactly. Adds ~1/4 byte per genome base to the reference."
     )]
@@ -188,6 +197,103 @@ pub struct RefBuildArgs {
     #[clap(
         long = "tmp-dir",
         help = "Directory for build scratch files (needs roughly the input database size of free space). Default: alongside the output."
+    )]
+    pub tmp_dir: Option<String>,
+    #[clap(
+        short,
+        long = "threads",
+        default_value_t = 3,
+        help = "Number of threads"
+    )]
+    pub threads: usize,
+    #[clap(long = "trace", help = "Trace output")]
+    pub trace: bool,
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RefRecoverMode {
+    /// Record the contested k-mer groups: which genomes are in the running for
+    /// each k-mer whose owner the build order decides. This is the unknown.
+    Pairs,
+    /// Read each sample's novel hashes -- no reference needed -- and report
+    /// which contested groups they contain. A group's k-mer being novel proves
+    /// the group's winner is a genome that sample did not hit.
+    Probe,
+    /// Score a candidate --genome-order by computing the fingerprint the
+    /// reference would carry, without building it.
+    Fingerprint,
+    /// Search the groups the evidence left unresolved for the assignment whose
+    /// fingerprint matches the one the samples record, and write the order.
+    Search,
+}
+
+#[derive(Args)]
+pub struct RefRecoverArgs {
+    #[clap(value_enum, help = "Which recovery step to run")]
+    pub mode: RefRecoverMode,
+    #[clap(
+        multiple = true,
+        help = "For `pairs`, the genome database sketches (*.syldb) the lost reference was built from. For `probe`, the samples (*.sylspr) compressed against it; inputs that are not *.sylspr are skipped, so a directory of mixed sketches can be passed as-is."
+    )]
+    pub files: Vec<String>,
+    #[clap(
+        short = 'o',
+        long = "output",
+        help = "Output path: the recovery graph for `pairs`, the evidence TSV for `probe` (default: stdout)"
+    )]
+    pub output: Option<String>,
+    #[clap(
+        long = "graph",
+        help = "Recovery graph written by `ref-recover pairs`; required by `probe` and `fingerprint`"
+    )]
+    pub graph: Option<String>,
+    #[clap(
+        long = "genome-order",
+        help = "Candidate order to score, in the same format `ref-build --genome-order` takes; required by `fingerprint`"
+    )]
+    pub genome_order: Option<String>,
+    #[clap(
+        long = "solved",
+        help = "For `search`, the groups the evidence already settled: a TSV of <group_id><TAB><winning genome id>, as `solve_order.py` writes. Groups absent from it are searched."
+    )]
+    pub solved: Option<String>,
+    #[clap(
+        long = "target",
+        help = "For `search`, the reference fingerprint to hit -- the value every *.sylspr records, as 16 hex digits (`ref-recover probe` prints it)."
+    )]
+    pub target: Option<String>,
+    #[clap(
+        long = "max-candidates",
+        default_value_t = 4_000_000,
+        help = "For `search`, give up after this many candidate assignments rather than running unbounded."
+    )]
+    pub max_candidates: u64,
+    #[clap(
+        long = "tsv",
+        help = "For `pairs`, also write the graph as a TSV: one row per genome (the table a --genome-order is written from) and one per contested group"
+    )]
+    pub tsv: Option<String>,
+    #[clap(
+        short = 'T',
+        long = "taxonomy",
+        help = "The same --taxonomy the lost reference was built with. It fixes the species grouping and so the genome ids; getting it wrong makes the whole graph refer to different genomes."
+    )]
+    pub taxonomy: Option<String>,
+    #[clap(
+        long = "pool-min-genomes",
+        default_value_t = 3,
+        help = "The same --pool-min-genomes the lost reference was built with. It sets how many same-tier genomes may contest a k-mer before it goes to the shared pool, and so how large the unknown groups are."
+    )]
+    pub pool_min_genomes: u32,
+    #[clap(
+        long = "partitions",
+        default_value_t = 256,
+        help = "Number of on-disk hash partitions to stream through while building the graph. More partitions means less RAM."
+    )]
+    pub partitions: usize,
+    #[clap(
+        long = "tmp-dir",
+        help = "Directory for scratch files. Default: alongside the output."
     )]
     pub tmp_dir: Option<String>,
     #[clap(
@@ -815,6 +921,11 @@ pub struct InspectArgs {
         help = "Output to this file (YAML format). [default: stdout]"
     )]
     pub out_file_name: Option<String>,
+    #[clap(
+        long = "genomes",
+        help = "For seekable databases (*.sylref/*.syl2db), also list the per-genome metadata (names, and for a *.sylref the species/representative assignment and k-mer counts). Off by default: a large reference holds hundreds of thousands of genomes."
+    )]
+    pub genomes: bool,
 }
 
 #[derive(Args)]

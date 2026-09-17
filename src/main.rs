@@ -33,6 +33,7 @@ fn main() {
         Mode::Merge(args) => merge::merge(args),
         Mode::RefBuild(args) => refdelta::run_ref_build(args),
         Mode::RefCompress(args) => refdelta::run_ref_compress(args),
+        Mode::RefRecover(args) => refdelta::run_ref_recover(args),
         Mode::DbConvert(args) => twostage_db::run_db_convert(args),
         Mode::DbAdd(args) => twostage_db::run_db_add(args),
     }
