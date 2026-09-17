@@ -39,6 +39,10 @@ probe_shards: 64        # parallel probe jobs
 samples_per_group: 4    # evidence per contested group; more is more robust
 max_candidates: 4000000 # ceiling on the residual search
 
-# Optional: the fingerprint to recover, as 16 hex digits. Leave unset and it is
-# taken from the samples themselves (`ref-recover probe` reports it).
+# Optional: the fingerprint to recover, as 16 hex digits. Leave it unset and the
+# fingerprint is taken from the samples themselves (`ref-recover probe` reports
+# it). Set it and it is used instead, everywhere -- which is what you want when
+# the collection was compressed against more than one reference: the samples then
+# disagree, no single order satisfies all of them, and the workflow stops and
+# asks rather than picking one. Run it once per reference, naming each here.
 # target_fingerprint: "42b269ab46793f72"

@@ -195,13 +195,12 @@ rule solve_order:
         graph=f"{OUT}/graph.bin",
         tsv=f"{OUT}/graph.tsv",
         evidence=f"{OUT}/evidence.tsv",
+        target=f"{OUT}/target_fingerprint.txt",
         profiles=config["profiles"],
     output:
         order=f"{OUT}/evidence_order.txt",
         solved=f"{OUT}/solved.tsv",
         report=f"{OUT}/solve_report.txt",
-    params:
-        target=lambda w: config.get("target_fingerprint", ""),
     shell:
         r"""
         python3 {workflow.basedir}/scripts/solve_order.py \
@@ -210,32 +209,71 @@ rule solve_order:
             --graph {input.graph} --weebill {WEEBILL} \
             --out {output.order} --report {output.report} \
             --solved-out {output.solved} \
-            {params.target:q}
+            "$(cat {input.target})"
+        """
+
+
+# The fingerprint being recovered, resolved once and used by every step that
+# needs it. config["target_fingerprint"] wins when set; otherwise it comes from
+# the samples. Samples disagreeing means the collection was compressed against
+# more than one reference, which no single order can satisfy -- that is an error
+# to report, not something to pick a winner from, so run the workflow once per
+# reference with target_fingerprint set.
+rule resolve_target:
+    input:
+        evidence=f"{OUT}/evidence.tsv",
+    output:
+        target=f"{OUT}/target_fingerprint.txt",
+    params:
+        configured=lambda w: config.get("target_fingerprint") or "",
+    shell:
+        r"""
+        set -euo pipefail
+        configured="{params.configured}"
+        if [ -n "$configured" ]; then
+            if ! printf '%s' "$configured" | grep -Eq '^[0-9a-fA-F]{{16}}$'; then
+                echo "target_fingerprint '$configured' is not 16 hex digits" >&2
+                exit 1
+            fi
+            printf '%s\n' "$configured" > {output.target}
+            seen=$(tail -n +2 {input.evidence} | cut -f2 | grep -v '^$' | sort -u || true)
+            if [ -n "$seen" ] && ! printf '%s\n' "$seen" | grep -qix "$configured"; then
+                echo "WARNING: target_fingerprint $configured is not one the samples record ($(printf '%s' "$seen" | tr '\n' ' '))" >&2
+            fi
+            exit 0
+        fi
+        seen=$(tail -n +2 {input.evidence} | cut -f2 | grep -v '^$' | sort -u || true)
+        n=$(printf '%s\n' "$seen" | grep -c . || true)
+        if [ "$n" -eq 0 ]; then
+            echo "no *.sylspr supplied a fingerprint -- nothing to recover against" >&2
+            exit 1
+        fi
+        if [ "$n" -gt 1 ]; then
+            echo "the samples record $n different reference fingerprints:" >&2
+            printf '  %s\n' $seen >&2
+            echo "these came from different references; set target_fingerprint and run once per reference" >&2
+            exit 1
+        fi
+        printf '%s\n' "$seen" > {output.target}
         """
 
 
 # The evidence settles the groups it can see; whatever is left is one choice per
-# group, scored analytically rather than by building a reference each time. The
-# target is the fingerprint every .sylspr carries, so a match is the answer.
+# group, scored analytically rather than by building a reference each time.
 rule search_residual:
     input:
         graph=f"{OUT}/graph.bin",
         solved=f"{OUT}/solved.tsv",
-        evidence=f"{OUT}/evidence.tsv",
+        target=f"{OUT}/target_fingerprint.txt",
     output:
         order=f"{OUT}/genome_order.txt",
     params:
         maxc=config["max_candidates"],
     shell:
         r"""
-        set -euo pipefail
-        target=$(tail -n +2 {input.evidence} | cut -f2 | sort -u | head -n1)
-        if [ -z "$target" ]; then
-            echo "no *.sylspr supplied any fingerprint -- nothing to recover against" >&2
-            exit 1
-        fi
         {WEEBILL} ref-recover search --graph {input.graph} --solved {input.solved} \
-            --target "$target" --max-candidates {params.maxc} -o {output.order}
+            --target "$(cat {input.target})" --max-candidates {params.maxc} \
+            -o {output.order}
         """
 
 
@@ -267,7 +305,7 @@ rule rebuild:
 rule verify:
     input:
         ref=f"{OUT}/recovered.sylref",
-        evidence=f"{OUT}/evidence.tsv",
+        target=f"{OUT}/target_fingerprint.txt",
         selected=f"{OUT}/selected_samples.txt",
     output:
         txt=f"{OUT}/verify.txt",
@@ -275,7 +313,7 @@ rule verify:
         r"""
         set -euo pipefail
         got=$({WEEBILL} inspect {input.ref} 2>/dev/null | awk '/fingerprint:/ {{print $2}}')
-        want=$(tail -n +2 {input.evidence} | cut -f2 | sort -u | head -n1)
+        want=$(cat {input.target})
         {{
           echo "rebuilt_fingerprint	$got"
           echo "sample_fingerprint	$want"
