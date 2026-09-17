@@ -224,11 +224,38 @@ fn fingerprint(db: &RefDb) -> u64 {
     h
 }
 
+/// Ownership tally for one k-mer. `rep_id`/`strain_id` hold the *lowest* id seen
+/// at that tier, not the first one encountered: the two coincide when ids arrive
+/// in increasing order (as they do in `build_refdb`, and in `ref-build` without
+/// `--genome-order`), but taking the minimum is what makes the id — and so a
+/// caller-supplied order — decide the tie-break instead of the order the
+/// sketches happened to be streamed in.
 struct OwnAccum {
     rep_count: u32,
     rep_id: u32,
     strain_count: u32,
     strain_id: u32,
+}
+
+impl OwnAccum {
+    fn empty() -> Self {
+        OwnAccum {
+            rep_count: 0,
+            rep_id: u32::MAX,
+            strain_count: 0,
+            strain_id: u32::MAX,
+        }
+    }
+
+    fn add(&mut self, id: u32, is_rep: bool) {
+        if is_rep {
+            self.rep_id = self.rep_id.min(id);
+            self.rep_count += 1;
+        } else {
+            self.strain_id = self.strain_id.min(id);
+            self.strain_count += 1;
+        }
+    }
 }
 
 const POOL: u32 = u32::MAX;
@@ -445,23 +472,9 @@ pub fn build_refdb_with_pool_min_genomes(
             if seen.insert(h, ()).is_some() {
                 continue;
             }
-            let e = acc.entry(h).or_insert(OwnAccum {
-                rep_count: 0,
-                rep_id: 0,
-                strain_count: 0,
-                strain_id: 0,
-            });
-            if is_rep {
-                if e.rep_count == 0 {
-                    e.rep_id = new_id;
-                }
-                e.rep_count += 1;
-            } else {
-                if e.strain_count == 0 {
-                    e.strain_id = new_id;
-                }
-                e.strain_count += 1;
-            }
+            acc.entry(h)
+                .or_insert_with(OwnAccum::empty)
+                .add(new_id, is_rep);
         }
     }
 
@@ -1087,6 +1100,12 @@ fn partition_of(h: u64, p: u64) -> usize {
 
 /// Read a LEB128 uvarint, returning `None` at a clean end of stream (used to
 /// iterate the variable number of genome blocks in a shard file).
+/// The next genome's file id in a scratch shard, or `None` at the end of it.
+/// Shared with `ref-recover`, which walks the same shards.
+pub(super) fn read_shard_fid<R: Read>(r: &mut R) -> io::Result<Option<u64>> {
+    read_uvarint_opt(r)
+}
+
 fn read_uvarint_opt<R: Read>(r: &mut R) -> io::Result<Option<u64>> {
     let mut first = [0u8; 1];
     if r.read(&mut first)? == 0 {
@@ -1152,37 +1171,25 @@ fn process_shard(path: &Path, remap: &[u32], pool_min_genomes: u32) -> io::Resul
         let mut rep = [0u8; 1];
         r.read_exact(&mut rep)?;
         let is_rep = rep[0] != 0;
-        let gid = remap[fid as usize];
+        let fid = fid as u32;
         let hashes = read_hashes(&mut r)?;
         for h in hashes {
-            let e = acc.entry(h).or_insert(OwnAccum {
-                rep_count: 0,
-                rep_id: 0,
-                strain_count: 0,
-                strain_id: 0,
-            });
-            if is_rep {
-                if e.rep_count == 0 {
-                    e.rep_id = gid;
-                }
-                e.rep_count += 1;
-            } else {
-                if e.strain_count == 0 {
-                    e.strain_id = gid;
-                }
-                e.strain_count += 1;
-            }
+            acc.entry(h)
+                .or_insert_with(OwnAccum::empty)
+                .add(fid, is_rep);
         }
     }
 
     let mut by_gid: FxHashMap<u32, Vec<u64>> = FxHashMap::default();
     let mut pool: Vec<u64> = Vec::new();
     for (h, a) in acc {
+        // Owners are tallied by file id (the tie-break axis); the reference
+        // stores them by genome id, so remap the winner here.
         let owner = owner_for_accum(&a, pool_min_genomes);
         if owner == POOL {
             pool.push(h);
         } else {
-            by_gid.entry(owner).or_default().push(h);
+            by_gid.entry(remap[owner as usize]).or_default().push(h);
         }
     }
     // Not sorted here: modular partitioning isn't order-preserving, so the merge
@@ -1217,7 +1224,7 @@ fn set_rep_seq_sources(db: &mut RefDb) {
     db.rep_seqs = sources;
 }
 
-fn parse_taxonomy(path: &str) -> FxHashMap<String, (String, bool)> {
+pub(super) fn parse_taxonomy_file(path: &str) -> FxHashMap<String, (String, bool)> {
     let text = std::fs::read_to_string(path)
         .unwrap_or_else(|_| panic!("Could not read taxonomy file {}", path));
     let mut map = FxHashMap::default();
@@ -1254,6 +1261,62 @@ fn parse_taxonomy(path: &str) -> FxHashMap<String, (String, bool)> {
     map
 }
 
+/// Read a `--genome-order` file: one genome file name per line, in the order the
+/// owner-assignment pass should see them. Blank lines and `#` comments are
+/// skipped. Both the full name and its basename are indexed, so an order file
+/// written from one path spelling still matches sketches made from another.
+fn parse_genome_order(path: &str) -> FxHashMap<String, u32> {
+    let text = std::fs::read_to_string(path)
+        .unwrap_or_else(|e| panic!("Could not read --genome-order file {}: {}", path, e));
+    let mut map: FxHashMap<String, u32> = FxHashMap::default();
+    let mut rank = 0u32;
+    for (lineno, line) in text.lines().enumerate() {
+        let name = line.trim();
+        if name.is_empty() || name.starts_with('#') {
+            continue;
+        }
+        if map.insert(name.to_string(), rank).is_some() {
+            error!(
+                "--genome-order line {}: {} is listed more than once; exiting",
+                lineno + 1,
+                name
+            );
+            std::process::exit(1);
+        }
+        // Basenames are a fallback only: a collision between two directories
+        // would make the fallback ambiguous, so drop it rather than guess.
+        if let Some(base) = Path::new(name).file_name().and_then(|s| s.to_str()) {
+            if base != name {
+                map.entry(base.to_string()).or_insert(rank);
+            }
+        }
+        rank += 1;
+    }
+    if rank == 0 {
+        error!("--genome-order file {} lists no genomes; exiting", path);
+        std::process::exit(1);
+    }
+    // `len()` must be the genome count, not the key count (basenames add keys).
+    map.insert(ORDER_LEN_KEY.to_string(), rank);
+    map
+}
+
+/// Sentinel key holding the genome count in a parsed order map, so the map's own
+/// `len()` (inflated by basename aliases) is never mistaken for it.
+const ORDER_LEN_KEY: &str = "\0weebill_genome_order_len";
+
+fn order_len(ranks: &FxHashMap<String, u32>) -> usize {
+    ranks[ORDER_LEN_KEY] as usize
+}
+
+fn lookup_order_rank(ranks: &FxHashMap<String, u32>, file_name: &str) -> Option<u32> {
+    if let Some(&r) = ranks.get(file_name) {
+        return Some(r);
+    }
+    let base = Path::new(file_name).file_name().and_then(|s| s.to_str())?;
+    ranks.get(base).copied()
+}
+
 /// Open a `.sylref` for querying/compression (CLI helper).
 pub(super) fn open_refdb_file(path: &str) -> RefIndex {
     open_refdb_file_with_mode(path, false)
@@ -1274,27 +1337,43 @@ fn open_refdb_file_with_mode(path: &str, compression_only: bool) -> RefIndex {
     }
 }
 
-pub fn run_ref_build(args: RefBuildArgs) {
-    super::init_logger(args.trace);
-    let threads = args.threads.max(1);
-    rayon::ThreadPoolBuilder::new()
-        .num_threads(threads)
-        .build_global()
-        .ok();
-    if args.files.is_empty() {
-        error!("No genome database sketches (*.syldb) supplied; exiting");
-        std::process::exit(1);
-    }
-    let taxonomy = match &args.taxonomy {
-        Some(p) => parse_taxonomy(p),
-        None => FxHashMap::default(),
-    };
-    if args.sparse_div_compat.is_some() {
-        warn!("--sparse-subsample is deprecated and ignored; use --sparse-c to size the sparse MPHF index");
-    }
-    let sparse_c = args.sparse_c.max(1);
-    let pool_min_genomes = args.pool_min_genomes.max(2);
+/// Everything the owner-assignment pass needs, produced by routing every genome's
+/// k-mers into hash partitions on disk: the genomes in build order, the file-id
+/// -> genome-id remap the tie-break is resolved through, and the scratch shards.
+pub struct Routed {
+    pub genomes: Vec<RefGenome>,
+    /// file id (tie-break order) -> genome id (build order).
+    pub remap: Vec<u32>,
+    pub c: usize,
+    pub k: usize,
+    pub partitions: usize,
+    tmp_dir: PathBuf,
+}
 
+impl Routed {
+    pub fn shard_path(&self, i: usize) -> PathBuf {
+        self.tmp_dir.join(format!("shard_{}.bin", i))
+    }
+    pub fn cleanup(&self) {
+        std::fs::remove_dir_all(&self.tmp_dir).ok();
+    }
+}
+
+/// Pass 1 of a reference build, shared with `ref-recover`: stream every genome
+/// sketch, assign it a file id (from `genome_order` when given, else the order it
+/// arrives in), and route its k-mers into `p` hash partitions on disk. Also fixes
+/// the build order — species, representatives first, then file name — which is
+/// what makes genome ids reproducible even when the file ids are not.
+#[allow(clippy::too_many_arguments)]
+pub fn route_genomes(
+    files: &[String],
+    taxonomy: &FxHashMap<String, (String, bool)>,
+    genome_order: Option<&str>,
+    p: usize,
+    tmp_root: Option<&str>,
+    near: &str,
+    tag: &str,
+) -> Routed {
     let resolve = |file_name: &str| -> (String, bool) {
         if let Some(v) = taxonomy.get(file_name) {
             return v.clone();
@@ -1308,6 +1387,181 @@ pub fn run_ref_build(args: RefBuildArgs) {
         }
         (file_name.to_string(), true)
     };
+    let tmp_dir = match tmp_root {
+        Some(d) => PathBuf::from(d),
+        None => Path::new(near)
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf(),
+    }
+    .join(format!(".{}_{}", tag, std::process::id()));
+    std::fs::create_dir_all(&tmp_dir)
+        .unwrap_or_else(|e| panic!("Could not create scratch dir {:?}: {}", tmp_dir, e));
+    let shard_path = |i: usize| tmp_dir.join(format!("shard_{}.bin", i));
+
+    let mut writers: Vec<BufWriter<File>> = (0..p)
+        .map(|i| {
+            BufWriter::with_capacity(
+                1 << 16,
+                File::create(shard_path(i))
+                    .unwrap_or_else(|e| panic!("Could not create scratch shard: {}", e)),
+            )
+        })
+        .collect();
+    // `--genome-order` fixes the file ids, and so the tie-break for contested
+    // k-mers, instead of letting the order the sketches sit in decide it.
+    let forced_order: Option<FxHashMap<String, u32>> = genome_order.map(parse_genome_order);
+    let mut meta_by_fid: Vec<Option<(String, String, bool)>> = match &forced_order {
+        Some(m) => vec![None; order_len(m)],
+        None => Vec::new(),
+    };
+    let mut c = 0usize;
+    let mut k = 0usize;
+    let mut total_instances: u64 = 0;
+    let mut seen = 0usize;
+    let pu = p as u64;
+    {
+        let mut next_fid = 0u32;
+        // reused per genome: one bucket of k-mers per partition
+        let mut buckets: Vec<Vec<u64>> = vec![Vec::new(); p];
+        for_each_genome(files, |s| {
+            if seen == 0 {
+                c = s.c;
+                k = s.k;
+            }
+            seen += 1;
+            let (species, is_rep) = resolve(&s.file_name);
+            let fid = match &forced_order {
+                Some(ranks) => match lookup_order_rank(ranks, &s.file_name) {
+                    Some(r) => r,
+                    None => {
+                        error!(
+                            "--genome-order does not list {} (nor its basename); exiting",
+                            s.file_name
+                        );
+                        std::process::exit(1);
+                    }
+                },
+                None => {
+                    let f = next_fid;
+                    next_fid += 1;
+                    meta_by_fid.push(None);
+                    f
+                }
+            };
+            if let Some(prev) = &meta_by_fid[fid as usize] {
+                error!(
+                    "--genome-order maps both {} and {} to the same position; exiting",
+                    prev.0, s.file_name
+                );
+                std::process::exit(1);
+            }
+            meta_by_fid[fid as usize] = Some((s.file_name.clone(), species, is_rep));
+            let rep_byte = is_rep as u8;
+            let mut kmers = s.genome_kmers;
+            kmers.sort_unstable();
+            kmers.dedup();
+            total_instances += kmers.len() as u64;
+            for b in buckets.iter_mut() {
+                b.clear();
+            }
+            for &h in &kmers {
+                buckets[partition_of(h, pu)].push(h);
+            }
+            for (part, b) in buckets.iter().enumerate() {
+                if b.is_empty() {
+                    continue;
+                }
+                let w = &mut writers[part];
+                write_uvarint(w, fid as u64)?;
+                w.write_all(&[rep_byte])?;
+                write_hashes(w, b)?;
+            }
+            Ok(())
+        });
+    }
+    for mut w in writers {
+        w.flush()
+            .unwrap_or_else(|e| panic!("Failed to flush scratch shard: {}", e));
+    }
+
+    if seen == 0 {
+        std::fs::remove_dir_all(&tmp_dir).ok();
+        error!("No genome sketches found; exiting");
+        std::process::exit(1);
+    }
+    // An order file listing genomes that never arrived would leave holes in the
+    // file-id space, silently shifting every later genome's tie-break.
+    let meta: Vec<(String, String, bool)> = match meta_by_fid
+        .iter()
+        .position(|m| m.is_none())
+        .map(|i| (i, meta_by_fid.len()))
+    {
+        Some((i, n)) => {
+            std::fs::remove_dir_all(&tmp_dir).ok();
+            error!(
+                "--genome-order lists {} genomes but position {} was never supplied by the input sketches ({} arrived); exiting",
+                n, i, seen
+            );
+            std::process::exit(1);
+        }
+        None => meta_by_fid.into_iter().map(|m| m.unwrap()).collect(),
+    };
+    let ng = meta.len();
+    info!(
+        "Routed {} genomes ({} k-mers) into {} partitions; assigning owners...",
+        ng, total_instances, p
+    );
+
+    // build order (species, reps first, then file name) and file-id -> genome-id remap
+    let mut order: Vec<usize> = (0..ng).collect();
+    order.sort_by(|&a, &b| {
+        meta[a]
+            .1
+            .cmp(&meta[b].1)
+            .then(meta[b].2.cmp(&meta[a].2))
+            .then(meta[a].0.cmp(&meta[b].0))
+    });
+    let mut remap = vec![0u32; ng];
+    let mut genomes: Vec<RefGenome> = Vec::with_capacity(ng);
+    for (gid, &fid) in order.iter().enumerate() {
+        remap[fid] = gid as u32;
+        genomes.push(RefGenome {
+            file_name: meta[fid].0.clone(),
+            species: meta[fid].1.clone(),
+            is_rep: meta[fid].2,
+        });
+    }
+    Routed {
+        genomes,
+        remap,
+        c,
+        k,
+        partitions: p,
+        tmp_dir,
+    }
+}
+
+pub fn run_ref_build(args: RefBuildArgs) {
+    super::init_logger(args.trace);
+    let threads = args.threads.max(1);
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build_global()
+        .ok();
+    if args.files.is_empty() {
+        error!("No genome database sketches (*.syldb) supplied; exiting");
+        std::process::exit(1);
+    }
+    let taxonomy = match &args.taxonomy {
+        Some(p) => parse_taxonomy_file(p),
+        None => FxHashMap::default(),
+    };
+    if args.sparse_div_compat.is_some() {
+        warn!("--sparse-subsample is deprecated and ignored; use --sparse-c to size the sparse MPHF index");
+    }
+    let sparse_c = args.sparse_c.max(1);
+    let pool_min_genomes = args.pool_min_genomes.max(2);
 
     // Choose the partition count from the RAM target (soft) and the input size.
     let total_input_bytes: u64 = args
@@ -1342,113 +1596,28 @@ pub fn run_ref_build(args: RefBuildArgs) {
     if let Some(parent) = Path::new(&out).parent() {
         std::fs::create_dir_all(parent).ok();
     }
-    let tmp_dir = match &args.tmp_dir {
-        Some(d) => PathBuf::from(d),
-        None => Path::new(&out)
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .to_path_buf(),
-    }
-    .join(format!(".sylref_build_{}", std::process::id()));
-    std::fs::create_dir_all(&tmp_dir)
-        .unwrap_or_else(|e| panic!("Could not create scratch dir {:?}: {}", tmp_dir, e));
-    let shard_path = |i: usize| tmp_dir.join(format!("shard_{}.bin", i));
-
-    // --- pass 1: stream genomes, route k-mers into hash-partitioned shards ---
-    let mut writers: Vec<BufWriter<File>> = (0..p)
-        .map(|i| {
-            BufWriter::with_capacity(
-                1 << 16,
-                File::create(shard_path(i))
-                    .unwrap_or_else(|e| panic!("Could not create scratch shard: {}", e)),
-            )
-        })
-        .collect();
-    let mut meta: Vec<(String, String, bool)> = Vec::new();
-    let mut c = 0usize;
-    let mut k = 0usize;
-    let mut total_instances: u64 = 0;
-    let pu = p as u64;
-    {
-        let mut fid = 0u32;
-        // reused per genome: one bucket of k-mers per partition
-        let mut buckets: Vec<Vec<u64>> = vec![Vec::new(); p];
-        for_each_genome(&args.files, |s| {
-            if meta.is_empty() {
-                c = s.c;
-                k = s.k;
-            }
-            let (species, is_rep) = resolve(&s.file_name);
-            meta.push((s.file_name.clone(), species, is_rep));
-            let rep_byte = is_rep as u8;
-            let mut kmers = s.genome_kmers;
-            kmers.sort_unstable();
-            kmers.dedup();
-            total_instances += kmers.len() as u64;
-            for b in buckets.iter_mut() {
-                b.clear();
-            }
-            for &h in &kmers {
-                buckets[partition_of(h, pu)].push(h);
-            }
-            for (part, b) in buckets.iter().enumerate() {
-                if b.is_empty() {
-                    continue;
-                }
-                let w = &mut writers[part];
-                write_uvarint(w, fid as u64)?;
-                w.write_all(&[rep_byte])?;
-                write_hashes(w, b)?;
-            }
-            fid += 1;
-            Ok(())
-        });
-    }
-    for mut w in writers {
-        w.flush()
-            .unwrap_or_else(|e| panic!("Failed to flush scratch shard: {}", e));
-    }
-
-    let ng = meta.len();
-    if ng == 0 {
-        std::fs::remove_dir_all(&tmp_dir).ok();
-        error!("No genome sketches found; exiting");
-        std::process::exit(1);
-    }
-    info!(
-        "Routed {} genomes ({} k-mers) into {} partitions; assigning owners...",
-        ng, total_instances, p
+    let routed = route_genomes(
+        &args.files,
+        &taxonomy,
+        args.genome_order.as_deref(),
+        p,
+        args.tmp_dir.as_deref(),
+        &out,
+        "sylref_build",
     );
-
-    // build order (species, reps first, then file name) and file-id -> genome-id remap
-    let mut order: Vec<usize> = (0..ng).collect();
-    order.sort_by(|&a, &b| {
-        meta[a]
-            .1
-            .cmp(&meta[b].1)
-            .then(meta[b].2.cmp(&meta[a].2))
-            .then(meta[a].0.cmp(&meta[b].0))
-    });
-    let mut remap = vec![0u32; ng];
-    let mut genomes: Vec<RefGenome> = Vec::with_capacity(ng);
-    for (gid, &fid) in order.iter().enumerate() {
-        remap[fid] = gid as u32;
-        genomes.push(RefGenome {
-            file_name: meta[fid].0.clone(),
-            species: meta[fid].1.clone(),
-            is_rep: meta[fid].2,
-        });
-    }
+    let (c, k) = (routed.c, routed.k);
+    let ng = routed.genomes.len();
+    let remap = &routed.remap;
 
     // --- pass 2: build ownership per shard in parallel ----------------------
     let shard_outs: Vec<ShardOut> = (0..p)
         .into_par_iter()
         .map(|pi| {
-            process_shard(&shard_path(pi), &remap, pool_min_genomes)
+            process_shard(&routed.shard_path(pi), remap, pool_min_genomes)
                 .unwrap_or_else(|e| panic!("Failed to process scratch shard {}: {}", pi, e))
         })
         .collect();
-    std::fs::remove_dir_all(&tmp_dir).ok();
+    routed.cleanup();
 
     // merge shards (any order), then sort each genome's hashes and the pool, since
     // modular partitioning does not preserve hash order.
@@ -1466,7 +1635,7 @@ pub fn run_ref_build(args: RefBuildArgs) {
     let mut db = RefDb {
         c,
         k,
-        genomes,
+        genomes: routed.genomes.clone(),
         distinctive,
         pool,
         rep_seqs: Vec::new(),

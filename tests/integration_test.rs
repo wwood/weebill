@@ -1402,6 +1402,15 @@ fn test_two_stage_individual_records() {
         .failure();
 }
 
+/// The `fingerprint:` value `inspect` reports for a `.sylref`.
+fn fingerprint_of(inspect_stdout: &str) -> String {
+    inspect_stdout
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("fingerprint:"))
+        .map(|v| v.trim().to_string())
+        .expect("inspect output had no fingerprint")
+}
+
 /// Number of genomes `inspect` reports for a seekable database.
 fn num_genomes(inspect_stdout: &str) -> u64 {
     inspect_stdout
@@ -3153,4 +3162,370 @@ fn test_inspect_genomes_syl2db() {
     // Reference-only fields are omitted for this format rather than reported empty.
     assert!(!listed.contains("species:"));
     assert!(!listed.contains("distinctive_kmers:"));
+}
+
+/// `ref-build --genome-order` must fully determine the contested-k-mer
+/// ownership: the same order file gives the same reference whatever order the
+/// genome sketches sit in, which is what makes a build reproducible.
+#[serial]
+#[test]
+fn test_ref_build_genome_order_is_reproducible() {
+    fresh();
+    let dir = "./tests/results/test_sketch_dir";
+    let a = "test_files/e.coli-EC590.fasta.gz";
+    let b = "test_files/e.coli-K12.fasta.gz";
+    let c = "test_files/e.coli-o157.fasta.gz";
+
+    // Two databases holding the same genomes in different orders.
+    for (name, order) in [("db1", [a, b, c]), ("db2", [c, b, a])] {
+        let mut cmd = Command::cargo_bin("weebill").unwrap();
+        cmd.arg("sketch")
+            .args(order)
+            .arg("-o")
+            .arg(format!("{}/{}", dir, name))
+            .arg("-d")
+            .arg(dir)
+            .assert()
+            .success();
+    }
+
+    let order_path = format!("{}/order.txt", dir);
+    fs::write(&order_path, format!("{}\n{}\n{}\n", a, c, b)).unwrap();
+
+    let mut fps = Vec::new();
+    for name in ["db1", "db2"] {
+        let out = format!("{}/ref_{}", dir, name);
+        let mut cmd = Command::cargo_bin("weebill").unwrap();
+        cmd.arg("ref-build")
+            .arg(format!("{}/{}.syldb", dir, name))
+            .arg("--genome-order")
+            .arg(&order_path)
+            .arg("-o")
+            .arg(&out)
+            .assert()
+            .success();
+        let mut cmd = Command::cargo_bin("weebill").unwrap();
+        let inspected = cmd
+            .arg("inspect")
+            .arg(format!("{}.sylref", out))
+            .output()
+            .expect("failed");
+        fps.push(fingerprint_of(
+            str::from_utf8(&inspected.stdout).expect("not UTF-8"),
+        ));
+    }
+    assert_eq!(
+        fps[0], fps[1],
+        "--genome-order must pin the fingerprint regardless of the .syldb order"
+    );
+
+    // A different order file must give a different reference, or the flag is
+    // not reaching the tie-break at all.
+    let other = format!("{}/order2.txt", dir);
+    fs::write(&other, format!("{}\n{}\n{}\n", a, b, c)).unwrap();
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("ref-build")
+        .arg(format!("{}/db1.syldb", dir))
+        .arg("--genome-order")
+        .arg(&other)
+        .arg("-o")
+        .arg(format!("{}/ref_other", dir))
+        .assert()
+        .success();
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    let inspected = cmd
+        .arg("inspect")
+        .arg(format!("{}/ref_other.sylref", dir))
+        .output()
+        .expect("failed");
+    let other_fp = fingerprint_of(str::from_utf8(&inspected.stdout).expect("not UTF-8"));
+    assert_ne!(fps[0], other_fp);
+}
+
+/// An order file that does not cover the input is a silent corruption risk -- it
+/// would leave holes in the file-id space and shift every later tie-break -- so
+/// it must fail loudly instead.
+#[serial]
+#[test]
+fn test_ref_build_genome_order_rejects_incomplete_list() {
+    fresh();
+    let dir = "./tests/results/test_sketch_dir";
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("sketch")
+        .arg("test_files/e.coli-EC590.fasta.gz")
+        .arg("test_files/e.coli-K12.fasta.gz")
+        .arg("-o")
+        .arg(format!("{}/db", dir))
+        .arg("-d")
+        .arg(dir)
+        .assert()
+        .success();
+
+    let order_path = format!("{}/short.txt", dir);
+    fs::write(&order_path, "test_files/e.coli-EC590.fasta.gz\n").unwrap();
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("ref-build")
+        .arg(format!("{}/db.syldb", dir))
+        .arg("--genome-order")
+        .arg(&order_path)
+        .arg("-o")
+        .arg(format!("{}/ref", dir))
+        .assert()
+        .failure();
+}
+
+/// The whole recovery, end to end: a reference built in one order is "lost", the
+/// genomes are re-sketched in another, and the order is recovered from a sample
+/// compressed against the original. The rebuilt reference must be byte-identical
+/// and the sample must verify against it.
+#[serial]
+#[test]
+fn test_ref_recover_round_trip() {
+    fresh();
+    let dir = "./tests/results/test_sketch_dir";
+    let a = "test_files/e.coli-EC590.fasta.gz";
+    let b = "test_files/e.coli-K12.fasta.gz";
+    let c = "test_files/e.coli-o157.fasta.gz";
+
+    // The database the lost reference was built from, and a sample.
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("sketch")
+        .args([a, b, c])
+        .arg("-r")
+        .arg("test_files/o157_reads.fastq.gz")
+        .arg("-o")
+        .arg(format!("{}/orig", dir))
+        .arg("-d")
+        .arg(dir)
+        .assert()
+        .success();
+
+    let lost_order = format!("{}/lost.txt", dir);
+    fs::write(&lost_order, format!("{}\n{}\n{}\n", a, c, b)).unwrap();
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("ref-build")
+        .arg(format!("{}/orig.syldb", dir))
+        .arg("--genome-order")
+        .arg(&lost_order)
+        .arg("-o")
+        .arg(format!("{}/lost", dir))
+        .assert()
+        .success();
+
+    // A sample that hits only some of a contested group's members is what makes
+    // the flip visible, so screen it down to one hit genome.
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("ref-compress")
+        .arg("-r")
+        .arg(format!("{}/lost.sylref", dir))
+        .arg(format!("{}/o157_reads.fastq.gz.sylsp", dir))
+        .arg("--ref-screen-ani")
+        .arg("95")
+        .arg("-d")
+        .arg(dir)
+        .assert()
+        .success();
+
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    let inspected = cmd
+        .arg("inspect")
+        .arg(format!("{}/lost.sylref", dir))
+        .output()
+        .expect("failed");
+    let target = fingerprint_of(str::from_utf8(&inspected.stdout).expect("not UTF-8"));
+
+    // The reference is now "lost": re-sketch the genomes in a different order.
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("sketch")
+        .args([c, a, b])
+        .arg("-o")
+        .arg(format!("{}/resketch", dir))
+        .arg("-d")
+        .arg(dir)
+        .assert()
+        .success();
+
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("ref-recover")
+        .arg("pairs")
+        .arg(format!("{}/resketch.syldb", dir))
+        .arg("-o")
+        .arg(format!("{}/graph.bin", dir))
+        .arg("--tsv")
+        .arg(format!("{}/graph.tsv", dir))
+        .assert()
+        .success();
+
+    // Probing needs no reference at all: the novel hashes are reachable from the
+    // section lengths in the sample's own header.
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    let probed = cmd
+        .arg("ref-recover")
+        .arg("probe")
+        .arg("--graph")
+        .arg(format!("{}/graph.bin", dir))
+        .arg(format!("{}/o157_reads.fastq.gz.sylspr", dir))
+        .output()
+        .expect("failed");
+    assert!(probed.status.success());
+    let probed = str::from_utf8(&probed.stdout).expect("not UTF-8");
+    assert!(
+        probed.contains(&target),
+        "probe must report the target fingerprint"
+    );
+
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("ref-recover")
+        .arg("search")
+        .arg("--graph")
+        .arg(format!("{}/graph.bin", dir))
+        .arg("--target")
+        .arg(&target)
+        .arg("-o")
+        .arg(format!("{}/recovered_order.txt", dir))
+        .assert()
+        .success();
+
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("ref-build")
+        .arg(format!("{}/resketch.syldb", dir))
+        .arg("--genome-order")
+        .arg(format!("{}/recovered_order.txt", dir))
+        .arg("-o")
+        .arg(format!("{}/recovered", dir))
+        .assert()
+        .success();
+
+    let lost = fs::read(format!("{}/lost.sylref", dir)).unwrap();
+    let recovered = fs::read(format!("{}/recovered.sylref", dir)).unwrap();
+    assert_eq!(
+        lost, recovered,
+        "the recovered reference must be byte-identical to the lost one"
+    );
+
+    // The point of the exercise: the sample decodes again.
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("ref-compress")
+        .arg("--verify")
+        .arg("-r")
+        .arg(format!("{}/recovered.sylref", dir))
+        .arg(format!("{}/o157_reads.fastq.gz.sylspr", dir))
+        .assert()
+        .success();
+}
+
+/// The analytic fingerprint must equal what a real build produces, or scoring a
+/// candidate order without building it would be meaningless.
+#[serial]
+#[test]
+fn test_ref_recover_fingerprint_matches_real_build() {
+    fresh();
+    let dir = "./tests/results/test_sketch_dir";
+    let a = "test_files/e.coli-EC590.fasta.gz";
+    let b = "test_files/e.coli-K12.fasta.gz";
+    let c = "test_files/e.coli-o157.fasta.gz";
+
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("sketch")
+        .args([a, b, c])
+        .arg("-o")
+        .arg(format!("{}/db", dir))
+        .arg("-d")
+        .arg(dir)
+        .assert()
+        .success();
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("ref-recover")
+        .arg("pairs")
+        .arg(format!("{}/db.syldb", dir))
+        .arg("-o")
+        .arg(format!("{}/graph.bin", dir))
+        .assert()
+        .success();
+
+    for (i, order) in [[a, b, c], [a, c, b], [c, b, a]].iter().enumerate() {
+        let order_path = format!("{}/ord{}.txt", dir, i);
+        fs::write(
+            &order_path,
+            format!("{}\n{}\n{}\n", order[0], order[1], order[2]),
+        )
+        .unwrap();
+
+        let mut cmd = Command::cargo_bin("weebill").unwrap();
+        cmd.arg("ref-build")
+            .arg(format!("{}/db.syldb", dir))
+            .arg("--genome-order")
+            .arg(&order_path)
+            .arg("-o")
+            .arg(format!("{}/r{}", dir, i))
+            .assert()
+            .success();
+        let mut cmd = Command::cargo_bin("weebill").unwrap();
+        let inspected = cmd
+            .arg("inspect")
+            .arg(format!("{}/r{}.sylref", dir, i))
+            .output()
+            .expect("failed");
+        let actual = fingerprint_of(str::from_utf8(&inspected.stdout).expect("not UTF-8"));
+
+        let mut cmd = Command::cargo_bin("weebill").unwrap();
+        let scored = cmd
+            .arg("ref-recover")
+            .arg("fingerprint")
+            .arg("--graph")
+            .arg(format!("{}/graph.bin", dir))
+            .arg("--genome-order")
+            .arg(&order_path)
+            .output()
+            .expect("failed");
+        assert!(scored.status.success());
+        let analytic = str::from_utf8(&scored.stdout).expect("not UTF-8").trim();
+        assert_eq!(
+            analytic, actual,
+            "analytic fingerprint must match the build"
+        );
+    }
+}
+
+/// `probe` is pointed at whole collections, most of which are ordinary sketches
+/// from samples too diverse to have been reference-compressed. Those carry no
+/// evidence and must be skipped rather than treated as corrupt.
+#[serial]
+#[test]
+fn test_ref_recover_probe_skips_non_sylspr_inputs() {
+    fresh();
+    let dir = "./tests/results/test_sketch_dir";
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("sketch")
+        .arg("test_files/e.coli-EC590.fasta.gz")
+        .arg("-r")
+        .arg("test_files/o157_reads.fastq.gz")
+        .arg("-o")
+        .arg(format!("{}/db", dir))
+        .arg("-d")
+        .arg(dir)
+        .assert()
+        .success();
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("ref-recover")
+        .arg("pairs")
+        .arg(format!("{}/db.syldb", dir))
+        .arg("-o")
+        .arg(format!("{}/graph.bin", dir))
+        .assert()
+        .success();
+
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    let out = cmd
+        .arg("ref-recover")
+        .arg("probe")
+        .arg("--graph")
+        .arg(format!("{}/graph.bin", dir))
+        .arg(format!("{}/o157_reads.fastq.gz.sylsp", dir))
+        .arg(format!("{}/db.syldb", dir))
+        .output()
+        .expect("failed");
+    assert!(out.status.success(), "a plain sketch must not fail the run");
+    let stdout = str::from_utf8(&out.stdout).expect("not UTF-8");
+    assert_eq!(stdout.lines().count(), 1, "header only; no evidence rows");
 }

@@ -1,0 +1,44 @@
+# Example config for workflow/recover_sylref_order.smk.
+#
+#   snakemake -s workflow/recover_sylref_order.smk \
+#             --configfile workflow/recover.example.yaml -j 32
+#
+# The settings under "must match the lost reference" are not preferences: they
+# decide the genome ids and the contested groups, so getting one wrong makes the
+# recovery search a space that does not contain the answer. Take them from the
+# command that built the reference originally.
+
+outdir: recover
+weebill: weebill
+
+# One path per line. The genomes the lost reference was built from -- all of
+# them, and nothing else.
+genomes: inputs/genomes.txt
+
+# One path per line. Paths that do not end in .sylspr are ignored, so a listing
+# of the whole collection is fine: samples too diverse to have been
+# reference-compressed simply carry no evidence.
+samples: inputs/samples.txt
+
+# One path per line: the profile TSVs for those samples. These say which genomes
+# each sample contains, which is how the workflow picks samples that hit some but
+# not all of a contested group's members -- the only ones that resolve it.
+profiles: inputs/profiles.txt
+
+# --- must match the lost reference ------------------------------------------
+taxonomy: null          # the -T/--taxonomy ref-build was given, or null
+pool_min_genomes: 3     # --pool-min-genomes
+sparse_c: 3000          # --sparse-c
+store_genomes: false    # --store-genomes
+c: 200                  # sketch -c
+k: 31                   # sketch -k
+
+# --- tuning ------------------------------------------------------------------
+threads: 16
+probe_shards: 64        # parallel probe jobs
+samples_per_group: 4    # evidence per contested group; more is more robust
+max_candidates: 4000000 # ceiling on the residual search
+
+# Optional: the fingerprint to recover, as 16 hex digits. Leave unset and it is
+# taken from the samples themselves (`ref-recover probe` reports it).
+# target_fingerprint: "42b269ab46793f72"

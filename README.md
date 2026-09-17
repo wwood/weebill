@@ -241,6 +241,10 @@ place without rebuilding it — see the next bullet.
   `weebill inspect --genomes gtdb.sylref` lists what the reference records per genome — its
   genome id, file name, species/representative assignment and k-mer counts — and the summary
   reports the `fingerprint` a `.sylspr` must match to decode against it.
+  `ref-build --genome-order` pins the one thing about a build that is otherwise not
+  reproducible — which of two same-tier genomes owns a k-mer they contest — and `weebill
+  ref-recover` plus `workflow/recover_sylref_order.smk` recover that order for a `.sylref`
+  that has been lost, using only the samples compressed against it.
 - **Error-k-mer encoding** — `ref-build --store-genomes` additionally stores each species
   representative's nucleotide sequence (2-bit packed, ~0.25 byte/bp) in the `.sylref`. `ref-compress`
   then recognises sample hashes that are a *single-base substitution* of a reference k-mer — the
