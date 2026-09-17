@@ -815,6 +815,11 @@ pub struct InspectArgs {
         help = "Output to this file (YAML format). [default: stdout]"
     )]
     pub out_file_name: Option<String>,
+    #[clap(
+        long = "genomes",
+        help = "For seekable databases (*.sylref/*.syl2db), also list the per-genome metadata (names, and for a *.sylref the species/representative assignment and k-mer counts). Off by default: a large reference holds hundreds of thousands of genomes."
+    )]
+    pub genomes: bool,
 }
 
 #[derive(Args)]

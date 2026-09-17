@@ -3041,3 +3041,116 @@ fn test_profile_apply_unknown() {
         "output file was truncated before the input TSV was rejected"
     );
 }
+
+/// `inspect --genomes` lists the per-genome metadata a `.sylref` records: every
+/// genome's name, its species assignment and its k-mer counts. Without the flag
+/// the summary stays short (a production reference holds ~10^5 genomes).
+#[serial]
+#[test]
+fn test_inspect_genomes_sylref() {
+    fresh();
+    let dir = "./tests/results/test_sketch_dir";
+
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("sketch")
+        .arg("test_files/e.coli-EC590.fasta.gz")
+        .arg("test_files/e.coli-K12.fasta.gz")
+        .arg("-o")
+        .arg(format!("{}/db", dir))
+        .arg("-d")
+        .arg(dir)
+        .assert()
+        .success();
+
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("ref-build")
+        .arg(format!("{}/db.syldb", dir))
+        .arg("-o")
+        .arg(format!("{}/ref", dir))
+        .assert()
+        .success();
+
+    // Without --genomes: the summary only, no per-genome block.
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    let out = cmd
+        .arg("inspect")
+        .arg(format!("{}/ref.sylref", dir))
+        .output()
+        .expect("failed");
+    assert!(out.status.success());
+    let summary = str::from_utf8(&out.stdout).expect("not UTF-8");
+    assert!(summary.contains("num_genomes: 2"));
+    assert!(summary.contains("fingerprint:"));
+    assert!(!summary.contains("genome_id:"));
+    assert!(!summary.contains("e.coli-K12.fasta.gz"));
+
+    // With --genomes: one entry per genome, named and in genome-id order.
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    let out = cmd
+        .arg("inspect")
+        .arg("--genomes")
+        .arg(format!("{}/ref.sylref", dir))
+        .output()
+        .expect("failed");
+    assert!(out.status.success());
+    let listed = str::from_utf8(&out.stdout).expect("not UTF-8");
+    assert!(listed.contains("genome_id: 0"));
+    assert!(listed.contains("genome_id: 1"));
+    assert!(listed.contains("e.coli-EC590.fasta.gz"));
+    assert!(listed.contains("e.coli-K12.fasta.gz"));
+    assert!(listed.contains("is_rep: true"));
+    assert!(listed.contains("distinctive_kmers:"));
+    assert!(listed.contains("stage1_kmers:"));
+    // ref-build without --store-genomes keeps no nucleotide sequence.
+    assert!(listed.contains("stores_sequence: false"));
+
+    // The names are ordered by genome id, which is the id a .sylspr refers to.
+    let ec590 = listed.find("e.coli-EC590.fasta.gz").unwrap();
+    let k12 = listed.find("e.coli-K12.fasta.gz").unwrap();
+    assert!(ec590 < k12);
+}
+
+/// The same flag on a `.syl2db`, which records a different per-genome set:
+/// contig name and genome size rather than the reference's species assignment.
+#[serial]
+#[test]
+fn test_inspect_genomes_syl2db() {
+    fresh();
+    let dir = "./tests/results/test_sketch_dir";
+
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("sketch")
+        .arg("test_files/e.coli-EC590.fasta.gz")
+        .arg("test_files/e.coli-K12.fasta.gz")
+        .arg("-o")
+        .arg(format!("{}/db", dir))
+        .arg("-d")
+        .arg(dir)
+        .assert()
+        .success();
+
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("db-convert")
+        .arg(format!("{}/db.syldb", dir))
+        .arg("-o")
+        .arg(format!("{}/two", dir))
+        .assert()
+        .success();
+
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    let out = cmd
+        .arg("inspect")
+        .arg("--genomes")
+        .arg(format!("{}/two.syl2db", dir))
+        .output()
+        .expect("failed");
+    assert!(out.status.success());
+    let listed = str::from_utf8(&out.stdout).expect("not UTF-8");
+    assert!(listed.contains("e.coli-EC590.fasta.gz"));
+    assert!(listed.contains("e.coli-K12.fasta.gz"));
+    assert!(listed.contains("first_contig_name:"));
+    assert!(listed.contains("genome_size:"));
+    // Reference-only fields are omitted for this format rather than reported empty.
+    assert!(!listed.contains("species:"));
+    assert!(!listed.contains("distinctive_kmers:"));
+}

@@ -238,6 +238,9 @@ place without rebuilding it — see the next bullet.
   `.sylspr` samples directly via `--reference <ref.sylref>`. `ref-build` is streaming and parallel
   with RAM bounded by `--max-ram`, and the two-stage `.sylref` loads only the genome blocks a sample
   needs. `ref-compress` also supports `--decompress`, `inspect`, and `verify` modes.
+  `weebill inspect --genomes gtdb.sylref` lists what the reference records per genome — its
+  genome id, file name, species/representative assignment and k-mer counts — and the summary
+  reports the `fingerprint` a `.sylspr` must match to decode against it.
 - **Error-k-mer encoding** — `ref-build --store-genomes` additionally stores each species
   representative's nucleotide sequence (2-bit packed, ~0.25 byte/bp) in the `.sylref`. `ref-compress`
   then recognises sample hashes that are a *single-base substitution* of a reference k-mer — the

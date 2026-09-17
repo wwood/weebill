@@ -93,6 +93,51 @@ struct SeekableDatabaseInspect {
     /// `.sylref` only: whether genome sequences are stored (`ref-build --store-genomes`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stores_genome_sequences: Option<bool>,
+    /// `.sylref` only: the content fingerprint that binds a `.sylspr` to its
+    /// reference, as a hex string. A `.sylspr` decodes only against a reference
+    /// with this exact value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fingerprint: Option<String>,
+    /// Per-genome metadata, listed only with `--genomes`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub genomes: Option<Vec<SeekableGenomeInspect>>,
+}
+
+/// One genome of a seekable database, as listed by `inspect --genomes`. The
+/// `.sylref` and `.syl2db` formats record different per-genome metadata, so the
+/// fields that only one of them has are skipped for the other.
+#[derive(Deserialize, Serialize, Debug, PartialEq)]
+struct SeekableGenomeInspect {
+    /// The genome's id in this database — the index a `.sylspr` refers to, and the
+    /// order genomes are stored in.
+    pub genome_id: u32,
+    pub file_name: String,
+    /// `.syl2db` only: name of the genome's first contig.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_contig_name: Option<String>,
+    /// `.syl2db` only: genome size in bases.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub genome_size: Option<usize>,
+    /// `.sylref` only: the species this genome was grouped under (its own file name
+    /// when `ref-build` got no `--taxonomy`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub species: Option<String>,
+    /// `.sylref` only: id of that species, shared by a species' representative and
+    /// its strains.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub species_id: Option<u32>,
+    /// `.sylref` only: whether this genome is its species' representative.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_rep: Option<bool>,
+    /// `.sylref` only: distinctive k-mers owned by this genome.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub distinctive_kmers: Option<usize>,
+    /// `.sylref` only: how many of those live in the stage-1 sparse index.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stage1_kmers: Option<usize>,
+    /// `.sylref` only: whether this genome's nucleotide sequence is stored.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stores_sequence: Option<bool>,
 }
 
 #[derive(Debug, Default)]
@@ -182,7 +227,7 @@ pub fn inspect(args: InspectArgs) {
 
     let mut seekable_dbs_inspect = Vec::new();
     for file in seekable_db_files.iter() {
-        seekable_dbs_inspect.push(get_seekable_db_inspect(file));
+        seekable_dbs_inspect.push(get_seekable_db_inspect(file, args.genomes));
     }
     if !seekable_dbs_inspect.is_empty() {
         let yaml = serde_yaml::to_string(&seekable_dbs_inspect).unwrap();
@@ -214,7 +259,7 @@ pub fn inspect(args: InspectArgs) {
 /// Open a seekable database, verify the checksum in its header against its actual
 /// contents, and summarise it. A corrupt database is fatal: reporting metadata read
 /// out of a file we know to be damaged would be worse than useless.
-fn get_seekable_db_inspect(path: &String) -> SeekableDatabaseInspect {
+fn get_seekable_db_inspect(path: &String, list_genomes: bool) -> SeekableDatabaseInspect {
     let fatal = |e: std::io::Error| -> ! {
         error!("{}: {}", path, e);
         std::process::exit(1);
@@ -225,6 +270,24 @@ fn get_seekable_db_inspect(path: &String) -> SeekableDatabaseInspect {
         let idx = crate::refdelta::open_ref_index_file(file).unwrap_or_else(|e| fatal(e));
         idx.verify_checksum().unwrap_or_else(|e| fatal(e));
         info!("Reference database {} verified", path);
+        let genomes = list_genomes.then(|| {
+            idx.genomes
+                .iter()
+                .enumerate()
+                .map(|(g, meta)| SeekableGenomeInspect {
+                    genome_id: g as u32,
+                    file_name: meta.file_name.clone(),
+                    first_contig_name: None,
+                    genome_size: None,
+                    species: Some(meta.species.clone()),
+                    species_id: Some(meta.species_id),
+                    is_rep: Some(meta.is_rep),
+                    distinctive_kmers: Some(meta.distinctive_kmers()),
+                    stage1_kmers: Some(meta.stage1_kmers()),
+                    stores_sequence: Some(meta.stores_seq()),
+                })
+                .collect()
+        });
         SeekableDatabaseInspect {
             database_file: path.clone(),
             format: REF_DB_SUFFIX.to_string(),
@@ -235,6 +298,8 @@ fn get_seekable_db_inspect(path: &String) -> SeekableDatabaseInspect {
             num_genomes: idx.genomes.len(),
             pool_kmers: Some(idx.pool.len()),
             stores_genome_sequences: Some(idx.has_genome_seqs()),
+            fingerprint: Some(format!("{:016x}", idx.fingerprint())),
+            genomes,
         }
     } else {
         let db = crate::twostage_db::open_file(path).unwrap_or_else(|e| fatal(e));
@@ -249,6 +314,25 @@ fn get_seekable_db_inspect(path: &String) -> SeekableDatabaseInspect {
                 path
             );
         }
+        let genomes = list_genomes.then(|| {
+            (0..db.len() as u32)
+                .map(|g| {
+                    let meta = db.genome_meta(g);
+                    SeekableGenomeInspect {
+                        genome_id: g,
+                        file_name: meta.file_name.clone(),
+                        first_contig_name: Some(meta.first_contig_name.clone()),
+                        genome_size: Some(meta.gn_size),
+                        species: None,
+                        species_id: None,
+                        is_rep: None,
+                        distinctive_kmers: None,
+                        stage1_kmers: None,
+                        stores_sequence: None,
+                    }
+                })
+                .collect()
+        });
         SeekableDatabaseInspect {
             database_file: path.clone(),
             format: TWO_STAGE_DB_SUFFIX.to_string(),
@@ -259,6 +343,8 @@ fn get_seekable_db_inspect(path: &String) -> SeekableDatabaseInspect {
             num_genomes: db.len(),
             pool_kmers: None,
             stores_genome_sequences: None,
+            fingerprint: None,
+            genomes,
         }
     }
 }

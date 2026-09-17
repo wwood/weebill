@@ -678,6 +678,25 @@ pub struct RefGenomeMeta {
     seq_offset: u64,
 }
 
+impl RefGenomeMeta {
+    /// Whether this genome's nucleotide sequence is stored in the reference
+    /// (`ref-build --store-genomes`, representatives only).
+    pub fn stores_seq(&self) -> bool {
+        self.seq_offset != 0
+    }
+
+    /// Total distinctive k-mers owned by this genome (stage-1 sparse + dense block).
+    pub fn distinctive_kmers(&self) -> usize {
+        self.dense_domain as usize
+    }
+
+    /// How many of this genome's distinctive k-mers are held in the stage-1
+    /// sparse index.
+    pub fn stage1_kmers(&self) -> usize {
+        self.sparse_count as usize
+    }
+}
+
 /// Backing store for on-demand block reads. `File` uses positional `read_at`
 /// (pread) with no shared cursor, so concurrent dense-block / sequence loads from
 /// any number of threads need no lock; `Owned` holds the whole file in memory
@@ -768,6 +787,13 @@ impl RefIndex {
     /// The stage-1 sparse FracMinHash rate.
     pub fn sparse_c(&self) -> usize {
         self.sparse_c
+    }
+
+    /// The content fingerprint a compressed sample records to bind itself to this
+    /// reference. Two references match only if this is equal; `weebill inspect`
+    /// reports it so a "reference does not match" error can be diagnosed.
+    pub fn fingerprint(&self) -> u64 {
+        self.fingerprint
     }
 
     /// Re-hash the whole file and compare against the checksum in its header. This
