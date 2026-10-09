@@ -3137,3 +3137,42 @@ fn test_ref_build_genome_order_rejects_incomplete_list() {
         .assert()
         .failure();
 }
+
+/// Genomes finish sketching in a scheduling-dependent order, so a multi-threaded
+/// `sketch` must sort them back into input order before writing, or the same
+/// inputs give a different `.syldb` from run to run.
+#[serial]
+#[test]
+fn test_sketch_genome_db_is_reproducible_across_threads() {
+    fresh();
+    let dir = "./tests/results/test_sketch_dir";
+    fs::create_dir_all(dir).unwrap();
+    let mut genomes = Vec::new();
+    for i in 0..8 {
+        for name in ["EC590", "K12", "o157"] {
+            let dst = format!("{}/{}_{}.fasta.gz", dir, name, i);
+            fs::copy(format!("test_files/e.coli-{}.fasta.gz", name), &dst).unwrap();
+            genomes.push(dst);
+        }
+    }
+    let mut dbs = Vec::new();
+    for run in 0..4 {
+        let out = format!("{}/db_run{}", dir, run);
+        let mut cmd = Command::cargo_bin("weebill").unwrap();
+        cmd.arg("sketch")
+            .args(&genomes)
+            .arg("-o")
+            .arg(&out)
+            .arg("-t")
+            .arg("4")
+            .assert()
+            .success();
+        dbs.push(fs::read(format!("{}.syldb", out)).unwrap());
+    }
+    for db in &dbs[1..] {
+        assert!(
+            *db == dbs[0],
+            "the same genomes sketched twice gave different databases"
+        );
+    }
+}

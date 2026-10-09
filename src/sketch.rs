@@ -950,7 +950,10 @@ pub fn sketch(args: SketchArgs) {
         let prefix = path.parent().unwrap();
         std::fs::create_dir_all(prefix)
             .expect("Could not create directory for output database file (-o). Exiting...");
-        let all_genome_sketches = Mutex::new(vec![]);
+        // Sketches are collected with their input index and sorted back into input
+        // order before writing: genomes finish in a thread-scheduling-dependent
+        // order, which would otherwise make the database differ from run to run.
+        let all_genome_sketches: Mutex<Vec<(usize, Vec<GenomeSketch>)>> = Mutex::new(vec![]);
 
         iter_vec.into_par_iter().for_each(|i| {
             let genome_file = &genome_inputs[i];
@@ -965,7 +968,7 @@ pub fn sketch(args: SketchArgs) {
                 all_genome_sketches
                     .lock()
                     .unwrap()
-                    .extend(indiv_gn_sketches);
+                    .push((i, indiv_gn_sketches));
             } else {
                 let genome_sketch = sketch_genome(
                     args.c,
@@ -974,11 +977,11 @@ pub fn sketch(args: SketchArgs) {
                     args.min_spacing_kmer,
                     !args.no_pseudotax,
                 );
-                if genome_sketch.is_some() {
+                if let Some(genome_sketch) = genome_sketch {
                     all_genome_sketches
                         .lock()
                         .unwrap()
-                        .push(genome_sketch.unwrap());
+                        .push((i, vec![genome_sketch]));
                 }
             }
             let mut c = counter.lock().unwrap();
@@ -988,7 +991,14 @@ pub fn sketch(args: SketchArgs) {
             }
         });
 
-        if all_genome_sketches.lock().unwrap().is_empty() {
+        let mut all_genome_sketches = all_genome_sketches.into_inner().unwrap();
+        all_genome_sketches.sort_by_key(|(i, _)| *i);
+        let all_genome_sketches: Vec<GenomeSketch> = all_genome_sketches
+            .into_iter()
+            .flat_map(|(_, sketches)| sketches)
+            .collect();
+
+        if all_genome_sketches.is_empty() {
             warn!(
                 "No valid genomes to sketch; {} is not output",
                 file_path_str
@@ -999,7 +1009,6 @@ pub fn sketch(args: SketchArgs) {
                     .unwrap_or_else(|_| panic!("{} not valid ", file_path_str)),
             );
             info!("Wrote all genome sketches to {}", file_path_str);
-            let all_genome_sketches = all_genome_sketches.into_inner().unwrap();
             if db_compressed {
                 crate::compress::write_genome_sketches_compressed(
                     &mut genome_sk_file,
