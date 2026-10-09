@@ -292,6 +292,15 @@ Smaller improvements and fixes beyond the headline features above:
   seeded, so repeated sketching of the same input is deterministic regardless of thread count. Sylph
   v1.0.0 has since adopted the same fix (a differently-seeded RNG, same effect), so this is no longer
   a difference between the tools.
+- **Reproducible genome databases and references** — `sketch` writes a genome database
+  (`.syldb`/`.syldbc`) with its genomes in input order, so the same genomes give a byte-identical file
+  at any `-t`. Sylph v1.0.0 sketches genomes in parallel but appends each as it finishes, so with more
+  than one thread the genome order — and so the file — differs from run to run (each genome's own
+  sketch is the same). That order matters downstream: in `ref-build`, a k-mer shared by too few
+  genomes to go in the shared pool is owned by whichever contender is seen first, so two builds from
+  the same FASTAs could produce different `.sylref` files, and a `.sylspr` compressed against one would
+  not decode against the other. `ref-build --genome-order <file>` pins that order explicitly, so a
+  reference is rebuilt identically whatever order the database holds its genomes in.
 - **More accurate paired read lengths** — the read-length estimate for paired-end data uses the
   mean of both mates and excludes sub-*k* mates, improving `--estimate-unknown` coverage scaling.
 - **Corruption detection in the new sketch/database formats** — the compressed sketches are
