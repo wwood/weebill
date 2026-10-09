@@ -3041,3 +3041,99 @@ fn test_profile_apply_unknown() {
         "output file was truncated before the input TSV was rejected"
     );
 }
+
+/// `ref-build --genome-order` must fully determine the contested-k-mer
+/// ownership: the same order file gives the same reference whatever order the
+/// genome sketches sit in, which is what makes a build reproducible.
+#[serial]
+#[test]
+fn test_ref_build_genome_order_is_reproducible() {
+    fresh();
+    let dir = "./tests/results/test_sketch_dir";
+    let a = "test_files/e.coli-EC590.fasta.gz";
+    let b = "test_files/e.coli-K12.fasta.gz";
+    let c = "test_files/e.coli-o157.fasta.gz";
+
+    // Two databases holding the same genomes in different orders.
+    for (name, order) in [("db1", [a, b, c]), ("db2", [c, b, a])] {
+        let mut cmd = Command::cargo_bin("weebill").unwrap();
+        cmd.arg("sketch")
+            .args(order)
+            .arg("-o")
+            .arg(format!("{}/{}", dir, name))
+            .arg("-d")
+            .arg(dir)
+            .assert()
+            .success();
+    }
+
+    let order_path = format!("{}/order.txt", dir);
+    fs::write(&order_path, format!("{}\n{}\n{}\n", a, c, b)).unwrap();
+
+    let mut refs = Vec::new();
+    for name in ["db1", "db2"] {
+        let out = format!("{}/ref_{}", dir, name);
+        let mut cmd = Command::cargo_bin("weebill").unwrap();
+        cmd.arg("ref-build")
+            .arg(format!("{}/{}.syldb", dir, name))
+            .arg("--genome-order")
+            .arg(&order_path)
+            .arg("-o")
+            .arg(&out)
+            .assert()
+            .success();
+        refs.push(fs::read(format!("{}.sylref", out)).unwrap());
+    }
+    assert!(
+        refs[0] == refs[1],
+        "--genome-order must pin the reference regardless of the .syldb order"
+    );
+
+    // A different order file must give a different reference, or the flag is
+    // not reaching the tie-break at all.
+    let other = format!("{}/order2.txt", dir);
+    fs::write(&other, format!("{}\n{}\n{}\n", a, b, c)).unwrap();
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("ref-build")
+        .arg(format!("{}/db1.syldb", dir))
+        .arg("--genome-order")
+        .arg(&other)
+        .arg("-o")
+        .arg(format!("{}/ref_other", dir))
+        .assert()
+        .success();
+    let other_ref = fs::read(format!("{}/ref_other.sylref", dir)).unwrap();
+    assert!(refs[0] != other_ref);
+}
+
+/// An order file that does not cover the input is a silent corruption risk -- it
+/// would leave holes in the file-id space and shift every later tie-break -- so
+/// it must fail loudly instead.
+#[serial]
+#[test]
+fn test_ref_build_genome_order_rejects_incomplete_list() {
+    fresh();
+    let dir = "./tests/results/test_sketch_dir";
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("sketch")
+        .arg("test_files/e.coli-EC590.fasta.gz")
+        .arg("test_files/e.coli-K12.fasta.gz")
+        .arg("-o")
+        .arg(format!("{}/db", dir))
+        .arg("-d")
+        .arg(dir)
+        .assert()
+        .success();
+
+    let order_path = format!("{}/short.txt", dir);
+    fs::write(&order_path, "test_files/e.coli-EC590.fasta.gz\n").unwrap();
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("ref-build")
+        .arg(format!("{}/db.syldb", dir))
+        .arg("--genome-order")
+        .arg(&order_path)
+        .arg("-o")
+        .arg(format!("{}/ref", dir))
+        .assert()
+        .failure();
+}

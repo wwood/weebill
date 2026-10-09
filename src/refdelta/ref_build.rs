@@ -224,11 +224,38 @@ fn fingerprint(db: &RefDb) -> u64 {
     h
 }
 
+/// Ownership tally for one k-mer. `rep_id`/`strain_id` hold the *lowest* id seen
+/// at that tier, not the first one encountered: the two coincide when ids arrive
+/// in increasing order (as they do in `build_refdb`, and in `ref-build` without
+/// `--genome-order`), but taking the minimum is what makes the id — and so a
+/// caller-supplied order — decide the tie-break instead of the order the
+/// sketches happened to be streamed in.
 struct OwnAccum {
     rep_count: u32,
     rep_id: u32,
     strain_count: u32,
     strain_id: u32,
+}
+
+impl OwnAccum {
+    fn empty() -> Self {
+        OwnAccum {
+            rep_count: 0,
+            rep_id: u32::MAX,
+            strain_count: 0,
+            strain_id: u32::MAX,
+        }
+    }
+
+    fn add(&mut self, id: u32, is_rep: bool) {
+        if is_rep {
+            self.rep_id = self.rep_id.min(id);
+            self.rep_count += 1;
+        } else {
+            self.strain_id = self.strain_id.min(id);
+            self.strain_count += 1;
+        }
+    }
 }
 
 const POOL: u32 = u32::MAX;
@@ -445,23 +472,9 @@ pub fn build_refdb_with_pool_min_genomes(
             if seen.insert(h, ()).is_some() {
                 continue;
             }
-            let e = acc.entry(h).or_insert(OwnAccum {
-                rep_count: 0,
-                rep_id: 0,
-                strain_count: 0,
-                strain_id: 0,
-            });
-            if is_rep {
-                if e.rep_count == 0 {
-                    e.rep_id = new_id;
-                }
-                e.rep_count += 1;
-            } else {
-                if e.strain_count == 0 {
-                    e.strain_id = new_id;
-                }
-                e.strain_count += 1;
-            }
+            acc.entry(h)
+                .or_insert_with(OwnAccum::empty)
+                .add(new_id, is_rep);
         }
     }
 
@@ -1126,37 +1139,25 @@ fn process_shard(path: &Path, remap: &[u32], pool_min_genomes: u32) -> io::Resul
         let mut rep = [0u8; 1];
         r.read_exact(&mut rep)?;
         let is_rep = rep[0] != 0;
-        let gid = remap[fid as usize];
+        let fid = fid as u32;
         let hashes = read_hashes(&mut r)?;
         for h in hashes {
-            let e = acc.entry(h).or_insert(OwnAccum {
-                rep_count: 0,
-                rep_id: 0,
-                strain_count: 0,
-                strain_id: 0,
-            });
-            if is_rep {
-                if e.rep_count == 0 {
-                    e.rep_id = gid;
-                }
-                e.rep_count += 1;
-            } else {
-                if e.strain_count == 0 {
-                    e.strain_id = gid;
-                }
-                e.strain_count += 1;
-            }
+            acc.entry(h)
+                .or_insert_with(OwnAccum::empty)
+                .add(fid, is_rep);
         }
     }
 
     let mut by_gid: FxHashMap<u32, Vec<u64>> = FxHashMap::default();
     let mut pool: Vec<u64> = Vec::new();
     for (h, a) in acc {
+        // Owners are tallied by file id (the tie-break axis); the reference
+        // stores them by genome id, so remap the winner here.
         let owner = owner_for_accum(&a, pool_min_genomes);
         if owner == POOL {
             pool.push(h);
         } else {
-            by_gid.entry(owner).or_default().push(h);
+            by_gid.entry(remap[owner as usize]).or_default().push(h);
         }
     }
     // Not sorted here: modular partitioning isn't order-preserving, so the merge
@@ -1226,6 +1227,61 @@ fn parse_taxonomy(path: &str) -> FxHashMap<String, (String, bool)> {
         );
     }
     map
+}
+
+/// Read a `--genome-order` file: one genome file name per line, in the order the
+/// owner-assignment pass should see them. Blank lines and `#` comments are
+/// skipped. Both the full name and its basename are indexed, so an order file
+/// written from one path spelling still matches sketches made from another.
+fn parse_genome_order(path: &str) -> FxHashMap<String, u32> {
+    let text = std::fs::read_to_string(path)
+        .unwrap_or_else(|e| panic!("Could not read --genome-order file {}: {}", path, e));
+    let mut map: FxHashMap<String, u32> = FxHashMap::default();
+    let mut rank = 0u32;
+    for (lineno, line) in text.lines().enumerate() {
+        let name = line.trim();
+        if name.is_empty() || name.starts_with('#') {
+            continue;
+        }
+        if map.insert(name.to_string(), rank).is_some() {
+            error!(
+                "--genome-order line {}: {} is listed more than once; exiting",
+                lineno + 1,
+                name
+            );
+            std::process::exit(1);
+        }
+        // Basenames are a fallback only.
+        if let Some(base) = Path::new(name).file_name().and_then(|s| s.to_str()) {
+            if base != name {
+                map.entry(base.to_string()).or_insert(rank);
+            }
+        }
+        rank += 1;
+    }
+    if rank == 0 {
+        error!("--genome-order file {} lists no genomes; exiting", path);
+        std::process::exit(1);
+    }
+    // `len()` must be the genome count, not the key count (basenames add keys).
+    map.insert(ORDER_LEN_KEY.to_string(), rank);
+    map
+}
+
+/// Sentinel key holding the genome count in a parsed order map, so the map's own
+/// `len()` (inflated by basename aliases) is never mistaken for it.
+const ORDER_LEN_KEY: &str = "\0weebill_genome_order_len";
+
+fn order_len(ranks: &FxHashMap<String, u32>) -> usize {
+    ranks[ORDER_LEN_KEY] as usize
+}
+
+fn lookup_order_rank(ranks: &FxHashMap<String, u32>, file_name: &str) -> Option<u32> {
+    if let Some(&r) = ranks.get(file_name) {
+        return Some(r);
+    }
+    let base = Path::new(file_name).file_name().and_then(|s| s.to_str())?;
+    ranks.get(base).copied()
 }
 
 /// Open a `.sylref` for querying/compression (CLI helper).
@@ -1338,22 +1394,56 @@ pub fn run_ref_build(args: RefBuildArgs) {
             )
         })
         .collect();
-    let mut meta: Vec<(String, String, bool)> = Vec::new();
+    // `--genome-order` fixes the file ids, and so the tie-break for contested
+    // k-mers, instead of letting the order the sketches sit in decide it.
+    let forced_order: Option<FxHashMap<String, u32>> =
+        args.genome_order.as_deref().map(parse_genome_order);
+    let mut meta_by_fid: Vec<Option<(String, String, bool)>> = match &forced_order {
+        Some(m) => vec![None; order_len(m)],
+        None => Vec::new(),
+    };
     let mut c = 0usize;
     let mut k = 0usize;
     let mut total_instances: u64 = 0;
+    let mut seen = 0usize;
     let pu = p as u64;
     {
-        let mut fid = 0u32;
+        let mut next_fid = 0u32;
         // reused per genome: one bucket of k-mers per partition
         let mut buckets: Vec<Vec<u64>> = vec![Vec::new(); p];
         for_each_genome(&args.files, |s| {
-            if meta.is_empty() {
+            if seen == 0 {
                 c = s.c;
                 k = s.k;
             }
+            seen += 1;
             let (species, is_rep) = resolve(&s.file_name);
-            meta.push((s.file_name.clone(), species, is_rep));
+            let fid = match &forced_order {
+                Some(ranks) => match lookup_order_rank(ranks, &s.file_name) {
+                    Some(r) => r,
+                    None => {
+                        error!(
+                            "--genome-order does not list {} (nor its basename); exiting",
+                            s.file_name
+                        );
+                        std::process::exit(1);
+                    }
+                },
+                None => {
+                    let f = next_fid;
+                    next_fid += 1;
+                    meta_by_fid.push(None);
+                    f
+                }
+            };
+            if let Some(prev) = &meta_by_fid[fid as usize] {
+                error!(
+                    "--genome-order maps both {} and {} to the same position; exiting",
+                    prev.0, s.file_name
+                );
+                std::process::exit(1);
+            }
+            meta_by_fid[fid as usize] = Some((s.file_name.clone(), species, is_rep));
             let rep_byte = is_rep as u8;
             let mut kmers = s.genome_kmers;
             kmers.sort_unstable();
@@ -1374,7 +1464,6 @@ pub fn run_ref_build(args: RefBuildArgs) {
                 w.write_all(&[rep_byte])?;
                 write_hashes(w, b)?;
             }
-            fid += 1;
             Ok(())
         });
     }
@@ -1383,12 +1472,25 @@ pub fn run_ref_build(args: RefBuildArgs) {
             .unwrap_or_else(|e| panic!("Failed to flush scratch shard: {}", e));
     }
 
-    let ng = meta.len();
-    if ng == 0 {
+    if seen == 0 {
         std::fs::remove_dir_all(&tmp_dir).ok();
         error!("No genome sketches found; exiting");
         std::process::exit(1);
     }
+    // An order file listing genomes that never arrived would leave holes in the
+    // file-id space, silently shifting every later genome's tie-break.
+    if let Some(i) = meta_by_fid.iter().position(|m| m.is_none()) {
+        std::fs::remove_dir_all(&tmp_dir).ok();
+        error!(
+            "--genome-order lists {} genomes but position {} was never supplied by the input sketches ({} arrived); exiting",
+            meta_by_fid.len(),
+            i,
+            seen
+        );
+        std::process::exit(1);
+    }
+    let meta: Vec<(String, String, bool)> = meta_by_fid.into_iter().map(|m| m.unwrap()).collect();
+    let ng = meta.len();
     info!(
         "Routed {} genomes ({} k-mers) into {} partitions; assigning owners...",
         ng, total_instances, p

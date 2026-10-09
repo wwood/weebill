@@ -152,6 +152,12 @@ pub struct RefBuildArgs {
     )]
     pub taxonomy: Option<String>,
     #[clap(
+        long = "genome-order",
+        help_heading = "INPUT",
+        help = "File listing genome file names (or basenames), one per line, in the order the owner-assignment pass should see them. This decides which of several same-tier genomes owns a k-mer too few genomes share to go in the shared pool (see --pool-min-genomes); by default that is the order the sketches sit in their .syldb, which `sketch` does not make reproducible. Giving the same order makes two builds identical. Must list every input genome exactly once."
+    )]
+    pub genome_order: Option<String>,
+    #[clap(
         short = 'o',
         long = "output",
         help = "Output reference database name (.sylref appended)"
