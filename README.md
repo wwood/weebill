@@ -236,6 +236,19 @@ place without rebuilding it — see the next bullet.
   coded, so the existing blocks are copied through byte for byte and the new ones appended; only the
   small stage-1 screen index is rebuilt (its pooled MPHF cannot absorb new keys). The result is
   identical to converting all the genomes at once. See [Adding genomes to a `.syl2db`](#adding-genomes-to-a-syl2db).
+- **Small genomes screened at profile time** — sylph 1.0's `convert-db-two-screen` keeps small
+  genomes (viruses, plasmids, short contigs) visible by giving each at least `--min-sparse-kmers`
+  (default 50) stage-1 screen k-mers, which widens the whole screen index to the densest rate any
+  of them needed and so slows stage 1 for every sample. Weebill's `db-convert`/`db-add` instead
+  default to `--small-genome-screen profile`, which stores no such floor: the index stays at the
+  nominal `--screen-c`, and `profile --screen-small-genomes` (default 50) reads those genomes'
+  smallest k-mers back out of their dense blocks when the database is opened and screens them
+  directly. This is a port of sylph's reader mode
+  ([sylph#89](https://github.com/bluenote-1577/sylph/pull/89)), made the default here. It gives the
+  same survivors as the sylph approach, with a smaller index and a faster stage 1. sylph's behaviour
+  is still available as `--small-genome-screen loosen`, and a sylph-built database, which already
+  carries the floor, profiles unchanged. See
+  [the two-stage notes](#from-reads-to-a-profile-two-stage) above.
 - **Compressed sketches** — `weebill sketch --compressed-output`/`--compressed-database` write
   `.sylspc` samples and `.syldbc` databases (~55% smaller samples, ~30%+ smaller databases). Hashes
   are sorted, delta-encoded and Golomb–Rice coded, then wrapped in a zstd frame. `query`, `profile`,
