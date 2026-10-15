@@ -375,6 +375,46 @@ pub(crate) fn screen_threshold(screen_c: usize) -> u64 {
     u64::MAX / screen_c.max(1) as u64
 }
 
+/// How a build treats genomes too small to reach `--min-sparse-kmers` screen k-mers
+/// at the nominal `--screen-c` (viruses, plasmids, short contigs).
+///
+/// Both modes leave every genome's dense block untouched; they differ in what the
+/// stage-1 index stores.
+#[derive(clap::ArgEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SmallGenomeMode {
+    /// No floor: every genome gets strictly its nominal `--screen-c` subsample, so the
+    /// stage-1 index stays small and fast however many small genomes there are.
+    /// `profile` recovers the small genomes reader-side (`--screen-small-genomes`,
+    /// on by default) by reading their smallest dense k-mers back out of the dense
+    /// blocks when the database is opened.
+    None,
+    /// Give each short genome its `--min-sparse-kmers` smallest dense hashes, and
+    /// widen the single pooled index to the densest rate any genome needed. One small
+    /// genome therefore slows the stage-1 screen of every sample against the whole
+    /// database. The behaviour of upstream sylph (and of earlier weebill releases).
+    Loosen,
+}
+
+impl std::fmt::Display for SmallGenomeMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str(match self {
+            SmallGenomeMode::None => "none",
+            SmallGenomeMode::Loosen => "loosen",
+        })
+    }
+}
+
+impl SmallGenomeMode {
+    /// The per-genome sparse floor a build in this mode applies, given the user's
+    /// `--min-sparse-kmers`. `0` means no floor (see [`select_sparse`]).
+    pub fn sparse_floor(self, min_sparse_kmers: usize) -> usize {
+        match self {
+            SmallGenomeMode::None => 0,
+            SmallGenomeMode::Loosen => min_sparse_kmers,
+        }
+    }
+}
+
 /// Pooled stage-1 screen index: one MPHF over the distinct sparse k-mers of all
 /// genomes, plus a multi-owner CSR (a k-mer may belong to several genomes).
 /// Owners are a *multiset* -- a genome appears once per occurrence of the k-mer
@@ -625,7 +665,8 @@ fn smallest_n_and_next(hashes: &[u64], n: usize) -> (Vec<u64>, Option<u64>) {
 
 /// A genome's stage-1 sparse set: the FracMinHash subset at `screen_c`, unless that
 /// falls short of `min_sparse_kmers`, in which case the `min_sparse_kmers` smallest
-/// hashes are taken instead — a denser, genome-specific screen rate.
+/// hashes are taken instead — a denser, genome-specific screen rate. A
+/// `min_sparse_kmers` of 0 applies no floor (see [`SmallGenomeMode::None`]).
 ///
 /// Without the floor a small genome is nearly invisible to the screen: at
 /// `--screen-c 3000` a 50 kbp plasmid has ~17 sparse k-mers, so a couple of chance
@@ -701,7 +742,7 @@ pub struct DbBuilder<W: Write + Seek> {
     /// Nominal stage-1 screen rate requested by the caller (`--screen-c`). The rate
     /// actually recorded may be denser; see [`DbBuilder::finish`].
     screen_c: usize,
-    /// Floor on each genome's sparse k-mer count (`--min-sparse-kmers`).
+    /// Floor on each genome's sparse k-mer count (`--min-sparse-kmers`); 0 for none.
     min_sparse_kmers: usize,
     genomes: Vec<GenomeMeta>,
     sparse_per_genome: Vec<Vec<u64>>,
@@ -728,7 +769,7 @@ impl<W: Write + Seek> DbBuilder<W> {
             c,
             k,
             screen_c,
-            min_sparse_kmers: min_sparse_kmers.max(1),
+            min_sparse_kmers,
             genomes: Vec::new(),
             sparse_per_genome: Vec::new(),
         })
@@ -876,9 +917,10 @@ fn meta_of(gs: &GenomeSketch, dense_offset: u64) -> GenomeMeta {
 
 /// Re-pack genome sketches into the two-stage seekable layout and write to `w`.
 /// `screen_c` is the (coarser) stage-1 subsampling rate; it must be `>= c`.
-/// `min_sparse_kmers` is the per-genome sparse floor (see [`select_sparse`]) and must
-/// be `>= 1` -- 0 would let a genome's screen entry be empty, making it invisible to
-/// the stage-1 screen forever. Dense blocks are Golomb-Rice coded.
+/// `min_sparse_kmers` is the per-genome sparse floor (see [`select_sparse`]); 0 applies
+/// none, which can leave a small genome with an empty screen entry -- invisible to the
+/// stage-1 screen unless the reader recovers it ([`TwoStageDb::enable_small_genome_screen`]).
+/// Dense blocks are Golomb-Rice coded.
 pub fn write_two_stage_db<W: Write + Seek>(
     w: W,
     sketches: &[GenomeSketch],
@@ -941,8 +983,54 @@ pub struct TwoStageDb {
     /// Pooled stage-1 screen index (Path B). Replaces the per-genome sparse
     /// sketches; querying a sample against it yields the contained genomes.
     pub screen_index: ScreenIndex,
+    /// Reader-side small-genome screen (see [`SmallGenomeScreen`]); `None` until
+    /// [`TwoStageDb::enable_small_genome_screen`] is called.
+    pub small_screen: Option<SmallGenomeScreen>,
     data: DenseData,
     cache: Mutex<FxHashMap<u32, Arc<GenomeSketch>>>,
+}
+
+/// Reader-side small-genome screen: the stage-1 screen k-mers of genomes the
+/// *stored* index left short are reconstructed from their dense blocks when the
+/// database is opened, and intersected with the sample directly instead of through
+/// the pooled index.
+///
+/// This needs no index change at all -- a database built with
+/// `--small-genome-screen none` (the default) is what a build with no small-genome
+/// handling writes -- so it also gives small-genome sensitivity on databases built
+/// elsewhere. The trade-off is where the work goes: the cost is O(retained
+/// reference k-mers) per sample, rather than widening the pooled index and so
+/// slowing the lookup of every sample k-mer. That is a win while the short genomes
+/// are a minority of the reference, and for a viral or plasmid collection mixed
+/// into a prokaryotic reference it is a large one.
+///
+/// Retained k-mers are stored flat (CSR), not as a `Vec` per genome: a viral
+/// reference can put millions of genomes in here, and a `Vec` each would add an
+/// allocation header per genome and a pointer chase per genome per sample.
+pub struct SmallGenomeScreen {
+    /// Genomes the stored index left below the floor, ascending.
+    genome_ids: Vec<u32>,
+    /// Row offsets into `hashes`, length `genome_ids.len() + 1`.
+    offsets: Vec<u32>,
+    /// Each genome's `floor` smallest dense hashes -- exactly the set a
+    /// `--small-genome-screen loosen` build stores for it.
+    hashes: Vec<u64>,
+    /// Screen k-mer counts (the ANI denominator) for those genomes.
+    counts: FxHashMap<u32, u32>,
+    /// One past the largest retained hash, i.e. the densest rate this screen
+    /// reaches (the reader's analogue of a `loosen` build's widened threshold).
+    densest_thresh: u64,
+}
+
+impl SmallGenomeScreen {
+    /// Number of genomes screened reader-side.
+    pub fn num_genomes(&self) -> usize {
+        self.genome_ids.len()
+    }
+    /// Total number of k-mers read back for them.
+    pub fn num_kmers(&self) -> usize {
+        self.hashes.len()
+    }
 }
 
 /// One genome of an existing database, ready to be pushed into another one by
@@ -1031,6 +1119,7 @@ fn build_db(
         index_offset: header.index_offset,
         genomes: footer.genomes,
         screen_index,
+        small_screen: None,
         data,
         cache: Mutex::new(FxHashMap::default()),
     }
@@ -1074,6 +1163,136 @@ impl TwoStageDb {
     /// Source file name of genome `g` (for `--screen-dump` and diagnostics).
     pub fn genome_file_name(&self, g: u32) -> &str {
         &self.genomes[g as usize].file_name
+    }
+
+    /// The `n` smallest hashes of genome `g`'s dense block -- exactly the sparse set a
+    /// `--min-sparse-kmers n` (`loosen`) build would have stored for it, since
+    /// `read_hashes` returns the block in ascending order. Decodes only the
+    /// `genome_kmers` part of the block, not the (longer) pseudotax one.
+    pub fn dense_sparse_prefix(&self, g: u32, n: usize) -> io::Result<Vec<u64>> {
+        let mut hashes = self.with_block(g, |bytes| {
+            let mut cur = bytes;
+            read_hashes(&mut cur)
+        })?;
+        hashes.truncate(n);
+        Ok(hashes)
+    }
+
+    /// Build the reader-side small-genome screen (see [`SmallGenomeScreen`]): every
+    /// genome with fewer than `floor` *stored* screen k-mers gets its `floor`
+    /// smallest dense hashes read back and retained in memory. `floor` plays the part
+    /// of a build's `--min-sparse-kmers`; 0 disables the screen.
+    ///
+    /// A retained set is a superset of whatever the stored index holds for that
+    /// genome (both are value-ordered prefixes of its dense hashes), so on a database
+    /// that was already built with a floor this changes nothing.
+    pub fn enable_small_genome_screen(&mut self, floor: usize) -> io::Result<()> {
+        if floor == 0 {
+            self.small_screen = None;
+            return Ok(());
+        }
+        let genome_ids: Vec<u32> = (0..self.len() as u32)
+            .filter(|&g| (self.screen_index.sparse_count[g as usize] as usize) < floor)
+            .collect();
+        let per_genome: Vec<Vec<u64>> = genome_ids
+            .par_iter()
+            .map(|&g| self.dense_sparse_prefix(g, floor))
+            .collect::<io::Result<Vec<_>>>()?;
+
+        // Row offsets are u32, as everywhere else in this format. A large enough
+        // `floor` on a large enough reference would wrap silently, so refuse.
+        let total_kmers: usize = per_genome.iter().map(Vec::len).sum();
+        if total_kmers > u32::MAX as usize {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "--screen-small-genomes {} would retain {} k-mers across {} genomes, more \
+                     than this index can address; use a smaller value",
+                    floor,
+                    total_kmers,
+                    genome_ids.len()
+                ),
+            ));
+        }
+        let mut offsets: Vec<u32> = Vec::with_capacity(genome_ids.len() + 1);
+        offsets.push(0);
+        let mut hashes: Vec<u64> = Vec::with_capacity(total_kmers);
+        let mut counts: FxHashMap<u32, u32> =
+            FxHashMap::with_capacity_and_hasher(genome_ids.len(), Default::default());
+        let mut densest_thresh = 0u64;
+        for (&g, v) in genome_ids.iter().zip(&per_genome) {
+            counts.insert(g, v.len() as u32);
+            // `dense_sparse_prefix` returns the block in ascending order, so the
+            // last hash is this genome's own (densest) screen threshold.
+            if let Some(&last) = v.last() {
+                densest_thresh = densest_thresh.max(last.saturating_add(1));
+            }
+            hashes.extend_from_slice(v);
+            offsets.push(hashes.len() as u32);
+        }
+        self.small_screen = Some(SmallGenomeScreen {
+            genome_ids,
+            offsets,
+            hashes,
+            counts,
+            densest_thresh,
+        });
+        Ok(())
+    }
+
+    /// Stage-1 screen k-mer count for genome `g` (the screen-ANI denominator), taking
+    /// whichever screen actually covers it.
+    #[inline]
+    pub fn screen_kmers(&self, g: u32) -> u32 {
+        if let Some(s) = &self.small_screen {
+            if let Some(&c) = s.counts.get(&g) {
+                return c;
+            }
+        }
+        self.screen_index.sparse_count[g as usize]
+    }
+
+    /// The densest stage-1 screen rate anything in this database is screened at.
+    /// Coarse-rate assumptions (e.g. scaling `-M` from the dense rate to the screen
+    /// rate) must use this, not the footer's nominal `screen_c`, or they over-reject
+    /// the genomes that needed a denser rate.
+    pub fn effective_screen_c(&self) -> usize {
+        let mut thresh = screen_threshold(self.screen_c);
+        if let Some(s) = &self.small_screen {
+            thresh = thresh.max(s.densest_thresh);
+        }
+        (u64::MAX / thresh.max(1)).max(1) as usize
+    }
+
+    /// Stage 1: matched coverage counts per genome, from the pooled index and, if
+    /// enabled, the reader-side small-genome screen.
+    pub fn screen(&self, sample: &SequencesSketch) -> FxHashMap<u32, Vec<u32>> {
+        let mut hits = self.screen_index.gather_hits(sample);
+        if let Some(s) = &self.small_screen {
+            // The retained prefix is a superset of whatever the stored index holds
+            // for these genomes, so it replaces (never adds to) their entry --
+            // otherwise shared k-mers would be counted twice.
+            let extra: Vec<(u32, Vec<u32>)> = (0..s.genome_ids.len())
+                .into_par_iter()
+                .filter_map(|i| {
+                    let (lo, hi) = (s.offsets[i] as usize, s.offsets[i + 1] as usize);
+                    let covs: Vec<u32> = s.hashes[lo..hi]
+                        .iter()
+                        .filter_map(|h| sample.kmer_counts.get(h).copied())
+                        .filter(|&cnt| cnt != 0)
+                        .collect();
+                    if covs.is_empty() {
+                        None
+                    } else {
+                        Some((s.genome_ids[i], covs))
+                    }
+                })
+                .collect();
+            for (g, covs) in extra {
+                hits.insert(g, covs);
+            }
+        }
+        hits
     }
 
     /// `(file_name, gn_size)` for every genome. Used by `profile --apply-unknown`
@@ -1346,10 +1565,10 @@ pub fn run_db_convert(args: DbConvertArgs) {
         );
         std::process::exit(1);
     }
-    if args.min_sparse_kmers < 1 {
+    if args.small_genome_screen == SmallGenomeMode::Loosen && args.min_sparse_kmers < 1 {
         error!(
-            "--min-sparse-kmers must be >= 1: a genome with an empty stage-1 screen entry \
-             could never pass the screen. Exiting"
+            "--min-sparse-kmers must be >= 1 with --small-genome-screen loosen: a genome with \
+             an empty stage-1 screen entry could never pass the screen. Exiting"
         );
         std::process::exit(1);
     }
@@ -1365,15 +1584,17 @@ pub fn run_db_convert(args: DbConvertArgs) {
         }
     }
     info!(
-        "Converting {} genomes (dense -c {}, stage-1 screen -c {}) -> {}",
+        "Converting {} genomes (dense -c {}, stage-1 screen -c {}, small-genome screen {}) -> {}",
         sketches.len(),
         c,
         args.screen_c,
+        args.small_genome_screen,
         out
     );
     let w =
         BufWriter::new(File::create(&out).unwrap_or_else(|_| panic!("Could not create {}", out)));
-    write_two_stage_db(w, &sketches, args.screen_c, args.min_sparse_kmers)
+    let floor = args.small_genome_screen.sparse_floor(args.min_sparse_kmers);
+    write_two_stage_db(w, &sketches, args.screen_c, floor)
         .unwrap_or_else(|e| panic!("Failed to write {}: {}", out, e));
     info!("Wrote two-stage database to {}", out);
 }
@@ -1612,11 +1833,15 @@ pub fn run_db_add(args: DbAddArgs) {
         }
         let w = BufWriter::with_capacity(1 << 20, file);
         // The existing genomes' sparse sets are reproduced from their stored counts, so
-        // the floor only applies to the genomes being added. The rate those are selected
-        // at is set once the existing genomes have been copied through, to the nominal
-        // rate recovered from them (see `nominal_screen_c`); the database's recorded rate
-        // is only the fallback for a database that says nothing about its nominal one.
-        let mut builder = DbBuilder::new(w, db.c, db.k, db.screen_c, args.min_sparse_kmers.max(1))?;
+        // the floor (if any) only applies to the genomes being added. The rate those are
+        // selected at is set once the existing genomes have been copied through, to the
+        // nominal rate recovered from them (see `nominal_screen_c`); the database's
+        // recorded rate is only the fallback for a database that says nothing about its
+        // nominal one.
+        let floor = args
+            .small_genome_screen
+            .sparse_floor(args.min_sparse_kmers.max(1));
+        let mut builder = DbBuilder::new(w, db.c, db.k, db.screen_c, floor)?;
         // Chunked so the reads/decodes of a chunk run in parallel while the writer
         // stays sequential (block order defines the footer offsets). Keeping at most
         // one decoded block per Rayon worker bounds transient dense-block memory by
@@ -2219,5 +2444,167 @@ mod tests {
             all.screen_index.sparse_count
         );
         assert_eq!(grown.screen_c, all.screen_c);
+    }
+
+    // --- reader-side small-genome screen ------------------------------------
+
+    const MODE_SCREEN_C: usize = 3000;
+    const FLOOR: usize = 50;
+
+    /// One genome big enough to have plenty of k-mers at the nominal screen rate, and
+    /// one so small that *all* of its k-mers sit above the nominal threshold (the
+    /// viral/plasmid case that motivates the floor).
+    fn big_and_tiny() -> (Vec<GenomeSketch>, Vec<u64>, Vec<u64>) {
+        let nominal_thresh = screen_threshold(MODE_SCREEN_C);
+        let dense_thresh = screen_threshold(50); // c=50, matching `gsketch`
+        let big: Vec<u64> = (1..=100u64).map(|i| i * (nominal_thresh / 200)).collect();
+        let step = (dense_thresh - nominal_thresh) / 100;
+        let tiny: Vec<u64> = (0..40u64).map(|i| nominal_thresh + 1 + i * step).collect();
+        assert!(big.iter().all(|&h| h < nominal_thresh));
+        assert!(tiny.iter().all(|&h| h > nominal_thresh && h < dense_thresh));
+        let sketches = vec![
+            gsketch("big.fa", big.clone(), Some(vec![1])),
+            gsketch("tiny.fa", tiny.clone(), Some(vec![2])),
+        ];
+        (sketches, big, tiny)
+    }
+
+    fn sorted_hits(hits: &FxHashMap<u32, Vec<u32>>) -> Vec<(u32, Vec<u32>)> {
+        let mut out: Vec<(u32, Vec<u32>)> = hits
+            .iter()
+            .map(|(&g, v)| {
+                let mut v = v.clone();
+                v.sort_unstable();
+                (g, v)
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// `loosen` and `none` + the reader-side screen are different *storage* for the
+    /// same stage-1 screen, so they must give the same per-genome k-mer counts and
+    /// matched coverages. `none` on its own is the sensitivity loss they exist to
+    /// avoid, so it must (and does) miss the tiny genome entirely.
+    #[test]
+    fn reader_screen_matches_loosen() {
+        let (sketches, big, tiny) = big_and_tiny();
+        let sample = sample_from(&[(big[0], 4), (tiny[0], 7), (tiny[39], 9)]);
+
+        let loosen = open(std::io::Cursor::new(write_db_to_vec_min_sparse(
+            &sketches,
+            MODE_SCREEN_C,
+            SmallGenomeMode::Loosen.sparse_floor(FLOOR),
+        )))
+        .unwrap();
+        let mut none = open(std::io::Cursor::new(write_db_to_vec_min_sparse(
+            &sketches,
+            MODE_SCREEN_C,
+            SmallGenomeMode::None.sparse_floor(FLOOR),
+        )))
+        .unwrap();
+
+        // Without a floor the tiny genome has no screen k-mers at all and is
+        // invisible, however much of it the sample contains.
+        assert_eq!(none.screen_kmers(1), 0);
+        assert!(none.screen(&sample).get(&1).is_none());
+        assert_eq!(none.screen_c, MODE_SCREEN_C);
+
+        none.enable_small_genome_screen(FLOOR).unwrap();
+        let reader = none;
+
+        for db in [&loosen, &reader] {
+            assert_eq!(db.screen_kmers(0) as usize, big.len());
+            assert_eq!(db.screen_kmers(1) as usize, tiny.len());
+        }
+        let expected = sorted_hits(&loosen.screen(&sample));
+        assert_eq!(expected, vec![(0, vec![4]), (1, vec![7, 9])]);
+        assert_eq!(sorted_hits(&reader.screen(&sample)), expected);
+
+        // Only `loosen` pays for the tiny genome database-wide (the stored rate); both
+        // report the same densest (effective) rate for downstream k-mer-count scaling.
+        assert!(loosen.screen_c < MODE_SCREEN_C);
+        assert_eq!(reader.screen_c, MODE_SCREEN_C);
+        assert_eq!(reader.effective_screen_c(), loosen.effective_screen_c());
+    }
+
+    /// A `none` build is strictly smaller than a `loosen` one -- the extra keys are
+    /// what widening the pooled index costs -- and ignores `--min-sparse-kmers`.
+    #[test]
+    fn none_mode_adds_no_keys_and_ignores_the_floor() {
+        let (sketches, _, _) = big_and_tiny();
+        let none = write_db_to_vec_min_sparse(&sketches, MODE_SCREEN_C, 0);
+        let loosen = write_db_to_vec_min_sparse(&sketches, MODE_SCREEN_C, FLOOR);
+        assert!(none.len() < loosen.len());
+        assert_eq!(
+            none,
+            write_db_to_vec_min_sparse(
+                &sketches,
+                MODE_SCREEN_C,
+                SmallGenomeMode::None.sparse_floor(500)
+            )
+        );
+    }
+
+    /// The reader reconstructs a genome's sparse prefix from its dense block: the `n`
+    /// smallest hashes, which is exactly what a `loosen` build stores. Enabling it on
+    /// a database that already densified must therefore change nothing.
+    #[test]
+    fn reader_screen_is_a_noop_on_a_loosened_database() {
+        let (sketches, big, tiny) = big_and_tiny();
+        let db = open(std::io::Cursor::new(write_db_to_vec_min_sparse(
+            &sketches,
+            MODE_SCREEN_C,
+            0,
+        )))
+        .unwrap();
+        let mut expected: Vec<u64> = big.clone();
+        expected.sort_unstable();
+        expected.truncate(10);
+        assert_eq!(db.dense_sparse_prefix(0, 10).unwrap(), expected);
+        // Asking for more than the genome has yields all of it, sorted.
+        assert_eq!(db.dense_sparse_prefix(1, 1000).unwrap(), tiny);
+
+        let mut loosened = open(std::io::Cursor::new(write_db_to_vec_min_sparse(
+            &sketches,
+            MODE_SCREEN_C,
+            FLOOR,
+        )))
+        .unwrap();
+        let sample = sample_from(&[(tiny[0], 7)]);
+        let before = sorted_hits(&loosened.screen(&sample));
+        let kmers_before = loosened.screen_kmers(1);
+        let effective_before = loosened.effective_screen_c();
+        loosened.enable_small_genome_screen(FLOOR).unwrap();
+        // `big` already cleared the floor, so only the 40-k-mer `tiny` is picked up --
+        // and its reconstructed set is the one already stored.
+        let small = loosened.small_screen.as_ref().unwrap();
+        assert_eq!(small.num_genomes(), 1);
+        assert_eq!(small.num_kmers(), tiny.len());
+        assert_eq!(loosened.screen_kmers(1), kmers_before);
+        assert_eq!(loosened.effective_screen_c(), effective_before);
+        assert_eq!(sorted_hits(&loosened.screen(&sample)), before);
+
+        // A floor of 0 turns the reader off again.
+        loosened.enable_small_genome_screen(0).unwrap();
+        assert!(loosened.small_screen.is_none());
+    }
+
+    /// A database made only of genomes with no nominal screen k-mers must still build,
+    /// open and screen (reader-side) rather than failing on an empty MPHF.
+    #[test]
+    fn database_of_only_small_genomes_builds_and_screens() {
+        let (sketches, _, tiny) = big_and_tiny();
+        let only_tiny = vec![sketches[1].clone()];
+        let mut db = open(std::io::Cursor::new(write_db_to_vec_min_sparse(
+            &only_tiny,
+            MODE_SCREEN_C,
+            0,
+        )))
+        .unwrap();
+        assert_eq!(db.screen_kmers(0), 0);
+        db.enable_small_genome_screen(FLOOR).unwrap();
+        let hits = db.screen(&sample_from(&[(tiny[3], 6)]));
+        assert_eq!(sorted_hits(&hits), vec![(0, vec![6])]);
     }
 }

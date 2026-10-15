@@ -106,14 +106,24 @@ weebill-built ones in the other direction. `db-convert` also answers to sylph's 
 `convert-db-two-screen`.
 
 Very small genomes — plasmids, phage, short contigs — have few k-mers at the stage-1 screen rate
-(`--screen-c`, default 3000), so `db-convert`/`db-add` give any genome that falls below
-`--min-sparse-kmers` (default 50) a denser, genome-specific screen rate, and loosen the rate
-recorded in the file enough to keep those k-mers matchable. That last part is database-wide: one
-tiny genome can pull the whole screen index denser (and so bigger and slower for every sample), which
-`db-convert` logs. Keeping tiny genomes in a plain `.syldb` avoids that; `--min-sparse-kmers 1`
-disables the floor. `db-add` recovers the nominal `--screen-c` from the genomes already in the
-database, so genomes added to such a database are still selected at that rate rather than at the
-denser one recorded in the file.
+(`--screen-c`, default 3000): a 50 kbp plasmid has ~17, so its screen ANI is noise. Weebill handles
+this on the **reader** side. `db-convert`/`db-add` store every genome at strictly the nominal
+`--screen-c` (`--small-genome-screen none`, the default), so a database mixing, say, 100,000 viral
+genomes with a few thousand prokaryotic ones keeps a small, fast stage-1 index. `profile` then
+finds the genomes left with fewer than `--screen-small-genomes` stored screen k-mers (default 50,
+the same per-genome minimum as sylph 1.0's `--min-sparse-kmers`) when it opens the database, reads
+each one's 50 smallest k-mers back out of its dense block, and intersects those with the sample
+directly. The result is the same screen — identical per-genome k-mer counts, matches and survivors —
+as the older approach, `--small-genome-screen loosen` (upstream sylph's behaviour), which instead
+stores the floor in the index and widens the whole index to the densest rate any genome needed, so
+one tiny genome slows the screen of every sample. In a benchmark of 2,000 GTDB genomes plus 100,000
+vOTUs the reader approach had full recall, a 3x smaller index and a stage-1 screen 8-11x faster
+than `loosen`, at a cost of ~10 ms per sample. `--screen-small-genomes 0` turns the reader off, and
+it is a no-op on databases already built with a floor (`loosen`, or built by sylph), so those
+profile as before. `--min-sparse-kmers` now only matters with `--small-genome-screen loosen`.
+`db-add` recovers the nominal `--screen-c` from the genomes already in the database, so genomes
+added to a `loosen` database are still selected at that rate rather than at the denser one recorded
+in the file.
 
 ### Pre-sketching samples
 

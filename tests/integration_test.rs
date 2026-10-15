@@ -1124,6 +1124,136 @@ fn test_two_stage_db_convert_and_profile() {
         .failure();
 }
 
+/// `--small-genome-screen loosen` (floor stored in the index) and `none` (the default)
+/// with the reader-side `--screen-small-genomes` are different storage for the same
+/// stage-1 screen, so they must profile identically. A deliberately coarse
+/// `--screen-c` with a high floor puts even these multi-Mbp genomes below the floor,
+/// which is what makes them exercise the mixed-rate paths. With the reader off, the
+/// `none` database must lose the genomes the floor exists to keep.
+#[serial]
+#[test]
+fn test_two_stage_small_genome_screen_modes_agree() {
+    fresh();
+    let dir = "./tests/results/two_stage_screen_modes";
+    let _ = fs::remove_dir_all(dir);
+    fs::create_dir_all(dir).unwrap();
+
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("sketch")
+        .arg("-c")
+        .arg("50")
+        .arg("./test_files/e.coli-o157.fasta.gz")
+        .arg("./test_files/e.coli-K12.fasta.gz")
+        .arg("./test_files/e.coli-EC590.fasta.gz")
+        .arg("-o")
+        .arg(format!("{}/db", dir))
+        .assert()
+        .success()
+        .code(0);
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("sketch")
+        .arg("-c")
+        .arg("50")
+        .arg("./test_files/o157_reads.fastq.gz")
+        .arg("-d")
+        .arg(dir)
+        .assert()
+        .success()
+        .code(0);
+    let sample = format!("{}/o157_reads.fastq.gz.sylsp", dir);
+
+    let floor = "4000";
+    let convert = |mode: Option<&str>| -> String {
+        let out = format!("{}/db_{}", dir, mode.unwrap_or("default"));
+        let mut cmd = Command::cargo_bin("weebill").unwrap();
+        cmd.arg("db-convert")
+            .arg(format!("{}/db.syldb", dir))
+            .arg("--screen-c")
+            .arg("20000")
+            .arg("--min-sparse-kmers")
+            .arg(floor)
+            .arg("-o")
+            .arg(&out);
+        if let Some(m) = mode {
+            cmd.arg("--small-genome-screen").arg(m);
+        }
+        cmd.assert().success().code(0);
+        format!("{}.syl2db", out)
+    };
+    let loosen_db = convert(Some("loosen"));
+    let none_db = convert(Some("none"));
+    let default_db = convert(None);
+
+    // No floor means no extra keys, and `none` is the default.
+    let size = |p: &str| fs::metadata(p).unwrap().len();
+    assert!(
+        size(&none_db) < size(&loosen_db),
+        "the floor must add keys to the index"
+    );
+    assert_eq!(
+        fs::read(&none_db).unwrap(),
+        fs::read(&default_db).unwrap(),
+        "--small-genome-screen should default to none"
+    );
+
+    // Each profile also dumps its stage-1 survivors: the two storage schemes hold the
+    // same screen k-mer set, so that dump must be identical, not merely lead to the
+    // same profile.
+    let profile = |db: &str, tag: &str, extra: &[&str]| -> (String, String) {
+        let dump = format!("{}/screen_{}.tsv", dir, tag);
+        let mut cmd = Command::cargo_bin("weebill").unwrap();
+        let out = cmd
+            .arg("profile")
+            .arg(db)
+            .arg(&sample)
+            .args(extra)
+            .arg("--screen-dump")
+            .arg(&dump)
+            .output()
+            .expect("Output failed");
+        assert!(out.status.success());
+        (
+            str::from_utf8(&out.stdout).expect("not UTF-8").to_string(),
+            fs::read_to_string(&dump).unwrap(),
+        )
+    };
+    let (loosen, loosen_screen) = profile(&loosen_db, "loosen", &["--screen-small-genomes", "0"]);
+    assert!(loosen.contains("e.coli-o157.fasta.gz"));
+    assert!(loosen_screen.lines().count() > 1);
+
+    // The reader is on by default, at the same floor as a default `db-convert` build.
+    // Here the floor is raised to match the build above.
+    let (reader, reader_screen) = profile(&none_db, "reader", &["--screen-small-genomes", floor]);
+    assert_eq!(
+        reader, loosen,
+        "reader-side small-genome screening profiled differently from loosen mode"
+    );
+    assert_eq!(
+        reader_screen, loosen_screen,
+        "reader-side small-genome screening passed different stage-1 survivors"
+    );
+
+    // Enabling the reader on an already-densified database must be a no-op.
+    let (both, both_screen) = profile(
+        &loosen_db,
+        "loosen_reader",
+        &["--screen-small-genomes", floor],
+    );
+    assert_eq!(
+        both, loosen,
+        "reader-side screening changed a database that was already densified at build time"
+    );
+    assert_eq!(both_screen, loosen_screen);
+
+    // Without the reader the unfloored database screens at the coarse --screen-c, which
+    // sees far fewer screen k-mers per genome.
+    let (_, off_screen) = profile(&none_db, "off", &["--screen-small-genomes", "0"]);
+    assert_ne!(
+        off_screen, loosen_screen,
+        "--screen-small-genomes 0 should leave the small genomes at the coarse screen rate"
+    );
+}
+
 /// `profile --two-stage` against a .syl2db with RAW reads (no pre-sketched sample):
 /// the reads are sketched in memory and must give exactly the profile that the
 /// equivalent pre-sketched sample gives. This is the documented "reads straight to

@@ -237,7 +237,10 @@ fn compute_dense_survivors(
     // genomes (viruses, plasmids, short contigs) that single-stage profiling
     // would report. Scale the floor to the screen resolution so a genome that
     // could clear the dense floor also clears the screen; genomes truly below the
-    // floor are still rejected at the dense stage.
+    // floor are still rejected at the dense stage. For a .syl2db, `screen_c` is the
+    // *densest* rate anything in it is screened at (see
+    // `TwoStageDb::effective_screen_c`), so this becomes less aggressive when small
+    // genomes are screened at a denser rate.
     screen_args.min_number_kmers = args.min_number_kmers * dense_c as f64 / screen_c as f64;
 
     // The densify fallback (no .syl2db) re-sketches whole FASTA files keyed by
@@ -269,18 +272,25 @@ fn compute_dense_survivors(
             None => plain_genome_sketches.unwrap()[g].file_name.clone(),
         }
     };
-    let hits: Vec<(u32, Vec<u32>)> = screen_index
-        .gather_hits(sequence_sketch)
-        .into_iter()
-        .collect();
+    // A .syl2db also screens its small genomes reader-side (if enabled); the plain
+    // in-memory index has no such thing.
+    let hits: Vec<(u32, Vec<u32>)> = match two_stage_db {
+        Some(db) => db.screen(sequence_sketch),
+        None => screen_index.gather_hits(sequence_sketch),
+    }
+    .into_iter()
+    .collect();
     // Optional per-survivor dump: (genome, matched k-mers, total screen k-mers,
     // naive ANI, adjusted ANI, median coverage).
-    let dump: Mutex<Vec<(String, usize, usize, f64, f64, f64)>> = Mutex::new(vec![]);
+    let dump: Mutex<Vec<(usize, String, usize, usize, f64, f64, f64)>> = Mutex::new(vec![]);
     let mut survivors: Vec<usize> = hits
         .into_par_iter()
         .filter_map(|(g, covs)| {
             let g = g as usize;
-            let n_kmers = screen_index.sparse_count[g] as usize;
+            let n_kmers = match two_stage_db {
+                Some(db) => db.screen_kmers(g as u32),
+                None => screen_index.sparse_count[g],
+            } as usize;
             // Mirror get_stats: reject genomes below the (scaled) k-mer floor.
             if (n_kmers as f64) < screen_args.min_number_kmers {
                 return None;
@@ -297,6 +307,7 @@ fn compute_dense_survivors(
             }
             if args.screen_dump.is_some() {
                 dump.lock().unwrap().push((
+                    g,
                     name_of(g),
                     contain_count,
                     n_kmers,
@@ -321,7 +332,11 @@ fn compute_dense_survivors(
         let mut f =
             BufWriter::new(File::create(path).expect("could not create --screen-dump file"));
         writeln!(f, "Genome_file\tscreen_matched_kmers\tscreen_total_kmers\tnaive_ani\tscreen_adjusted_ani\tscreen_median_cov").unwrap();
-        for (g, m, t, na, ea, mc) in dump.into_inner().unwrap() {
+        // Sorted by genome, so two runs' dumps are directly comparable: the parallel
+        // filter above collects survivors in whatever order threads finish.
+        let mut rows = dump.into_inner().unwrap();
+        rows.sort_unstable_by_key(|r| r.0);
+        for (_, g, m, t, na, ea, mc) in rows {
             writeln!(f, "{}\t{}\t{}\t{:.3}\t{:.3}\t{}", g, m, t, na, ea, mc).unwrap();
         }
         log::info!("Wrote stage-1 screen dump to {}", path);
@@ -585,12 +600,36 @@ pub fn contain(mut args: ContainArgs, pseudotax_in: bool) {
             "Opening two-stage database {} (loading stage-1 sparse index)...",
             two_stage_db_files[0]
         );
-        let db = crate::twostage_db::open_file(two_stage_db_files[0]).unwrap_or_else(|e| {
+        let mut db = crate::twostage_db::open_file(two_stage_db_files[0]).unwrap_or_else(|e| {
             panic!(
                 "{} is not a valid two-stage database: {}",
                 two_stage_db_files[0], e
             )
         });
+        // Reader-side small-genome screen: genomes the *stored* index left with fewer
+        // than `--screen-small-genomes` screen k-mers get their smallest dense k-mers
+        // read back, so they are detectable without the stored index having been
+        // widened for them at build time. A no-op on a database that was built with a
+        // floor (`--small-genome-screen loosen`, or upstream sylph's default).
+        if args.screen_small_genomes > 0 {
+            db.enable_small_genome_screen(args.screen_small_genomes)
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "Could not read back the dense blocks of small genomes in {}: {}",
+                        two_stage_db_files[0], e
+                    )
+                });
+            if let Some(s) = &db.small_screen {
+                log::info!(
+                    "{}: screening {} genome(s) with < {} stored stage-1 k-mers directly, from {} \
+                     k-mers read back out of their dense blocks",
+                    two_stage_db_files[0],
+                    s.num_genomes(),
+                    args.screen_small_genomes,
+                    s.num_kmers()
+                );
+            }
+        }
         // The database is inherently two-stage; enable the screen-then-densify path.
         args.two_stage = true;
         Some(db)
@@ -638,7 +677,7 @@ pub fn contain(mut args: ContainArgs, pseudotax_in: bool) {
     // A .syl2db dictates its own dense rate (`c`) and stage-1 screen rate
     // (`screen_c`); otherwise they come from the database `-c` and the flags.
     let (db_c, db_k, screen_c, dense_c) = match &two_stage_db {
-        Some(db) => (db.c, db.k, db.screen_c, db.c),
+        Some(db) => (db.c, db.k, db.effective_screen_c(), db.c),
         None => {
             let db_c = genome_sketches[0].c;
             (
