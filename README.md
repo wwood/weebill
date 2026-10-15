@@ -218,18 +218,6 @@ uncompressed samples — reference-delta compression is lossless.
 
 The binary is installed as `weebill`. Weebill changes:
 
-- **Two-stage profiling (now merged into sylph)** - weebill introduced a "2 stage" profiling approach — a
-sparse first-stage screen followed by dense per-genome decoding only for genomes that pass — which is
-~7–27× faster and uses ~6× less RAM (a flat ~4.4 GB vs the whole ~26 GB database) than standard profiling
-(when input is sketches - FASTA/FASTQ inputs are also faster but more modestly), with an ~22% smaller
-on-disk database and profiles effectively identical to standard profiling. **Sylph v1.0.0 merged this
-upstream** (as `convert-db-two-screen`/`.syl2db`, crediting weebill in its changelog), so it is no longer
-weebill-exclusive — compatibility is one-way, though: weebill reads a sylph-built `.syl2db` directly,
-but sylph 1.0 does not read a weebill-built one (see
-[compatibility notes](#from-reads-to-a-profile-two-stage) above). To use this mode: `weebill db-convert`
-(= sylph's `convert-db-two-screen`) and `weebill profile --two-stage` (implied automatically for a
-`.syl2db` input, in both tools). What weebill still adds on top of sylph here is growing a `.syl2db` in
-place without rebuilding it — see the next bullet.
 - **Growable two-stage databases** — `weebill db-add` adds genomes to an existing `.syl2db`
   without rebuilding it (sylph has no equivalent; growing a database there means re-running
   `convert-db-two-screen` on the whole source `.syldb`). Each genome's dense block is independently
@@ -243,8 +231,7 @@ place without rebuilding it — see the next bullet.
   default to `--small-genome-screen profile`, which stores no such floor: the index stays at the
   nominal `--screen-c`, and `profile --screen-small-genomes` (default 50) reads those genomes'
   smallest k-mers back out of their dense blocks when the database is opened and screens them
-  directly. This is a port of sylph's reader mode
-  ([sylph#89](https://github.com/bluenote-1577/sylph/pull/89)), made the default here. It gives the
+  directly. It gives the
   same survivors as the sylph approach, with a smaller index and a faster stage 1. sylph's behaviour
   is still available as `--small-genome-screen loosen`, and a sylph-built database, which already
   carries the floor, profiles unchanged. See
@@ -281,16 +268,6 @@ place without rebuilding it — see the next bullet.
 
 Smaller improvements and fixes beyond the headline features above:
 
-- **Multi-threaded read sketching (now merged into sylph)** — sketching a read input uses threads at
-  two levels. Across inputs, single-end, paired-end and interleaved passes are drained concurrently
-  rather than one at a time. Within a single input, a dedicated reader thread does the IO/decompression
-  while rayon workers extract k-mers from batches of reads in parallel; only the order-dependent dedup
-  fold stays serial, so the sketch is byte-for-byte identical to the single-threaded result (and
-  independent of `-t`). This let one large read file scale across cores (~2× on 4 threads for a
-  single-end input) where it previously ran the k-mer work on one core regardless of `-t`. **Sylph
-  v1.0.0 has since merged this too** (crediting weebill in its changelog), via its own `parallel_sketch`
-  module, which adds further tunables (`--sketch-batch-size`, `--sketch-shards`, `--no-sketch-pipeline`,
-  …) that weebill does not currently expose — so this is no longer a difference between the tools.
 - **`profile --apply-unknown`** — converts a profile produced *without* `-u`/`--estimate-unknown`
   into the profile `-u` would have produced, without re-profiling. `-u`'s effect is a per-sample
   rescale of just two columns (`Eff_cov` → `True_cov`, and `Sequence_abundance` by the estimated
@@ -310,11 +287,7 @@ Smaller improvements and fixes beyond the headline features above:
   FIFO with no unpaired reads) as a valid zero-read sketch instead of an error, so a single empty
   stream does not abort a `--merge`. A run where *every* input is empty is still an error.
 - **AVX-512 k-mer extraction** — an 8-lane AVX-512 seeding path (with `vpcompressq`) alongside the
-  existing AVX2 path, for faster k-mer extraction on capable CPUs.
-- **Reproducible sketching (now also in sylph)** — the read-deduplication cuckoo filter's RNG is
-  seeded, so repeated sketching of the same input is deterministic regardless of thread count. Sylph
-  v1.0.0 has since adopted the same fix (a differently-seeded RNG, same effect), so this is no longer
-  a difference between the tools.
+  existing AVX2 path, for faster k-mer extraction on capable CPUs. Only applied on longer reads (2kb+), since it slows processing down on short reads.
 - **Reproducible genome databases and references** — `sketch` writes a genome database
   (`.syldb`/`.syldbc`) with its genomes in input order, so the same genomes give a byte-identical file
   at any `-t`. Sylph v1.0.0 sketches genomes in parallel but appends each as it finishes, so with more
