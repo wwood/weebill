@@ -95,7 +95,7 @@ pub struct DbAddArgs {
     pub min_spacing_kmer: Option<usize>,
     #[clap(long="min-sparse-kmers", default_value_t = SPARSE_TARGET_MIN_DEFAULT, help = "Only with --small-genome-screen loosen: minimum stage-1 sparse/screen k-mers for the genomes being added (see `db-convert --min-sparse-kmers`). The existing genomes keep the screen k-mers they were built with. Must be >= 1.")]
     pub min_sparse_kmers: usize,
-    #[clap(long="small-genome-screen", arg_enum, default_value_t = SmallGenomeMode::None, help = "How genomes being added that are too small to reach --min-sparse-kmers screen k-mers are handled (see `db-convert --small-genome-screen`). Default `none`: no floor; `profile` recovers small genomes reader-side.")]
+    #[clap(long="small-genome-screen", arg_enum, default_value_t = SmallGenomeMode::Profile, help = "How genomes being added that are too small to reach --min-sparse-kmers screen k-mers are handled (see `db-convert --small-genome-screen`). `none` and `profile` (default) store no floor, so nothing is widened and `profile` recovers small genomes reader-side; `loosen` stores one.")]
     pub small_genome_screen: SmallGenomeMode,
     #[clap(
         short,
@@ -125,7 +125,7 @@ pub struct DbConvertArgs {
     pub output: String,
     #[clap(long="screen-c", default_value_t = SCREEN_C_DEFAULT, help = "Subsampling rate -c of the small in-memory stage-1 SCREEN index (the bincoded sparse hashes). Must be >= the database -c. A coarser (larger) value gives a smaller/faster screen index. The dense per-genome blocks always keep every k-mer at the database -c.")]
     pub screen_c: usize,
-    #[clap(long="small-genome-screen", arg_enum, default_value_t = SmallGenomeMode::None, help = "How genomes too small to reach --min-sparse-kmers screen k-mers at --screen-c (viruses, plasmids, short contigs) are handled. `none` (default): no floor, so the stage-1 index stays small and fast however many small genomes there are; `profile` screens them reader-side instead, by reading their smallest dense k-mers back out of the database when it is opened (see `profile --screen-small-genomes`). `loosen`: give each its --min-sparse-kmers smallest k-mers and widen the whole index to the densest rate any genome needed, which slows the screen of every sample (upstream sylph's behaviour).")]
+    #[clap(long="small-genome-screen", arg_enum, default_value_t = SmallGenomeMode::Profile, help = "How genomes too small to reach --min-sparse-kmers screen k-mers at --screen-c (viruses, plasmids, short contigs) are handled. `profile` (default) and `none`: no floor is stored, so the stage-1 index stays small and fast however many small genomes there are; `profile` screens them reader-side instead, by reading their smallest dense k-mers back out of the database when it is opened (see `profile --screen-small-genomes`). `loosen`: give each its --min-sparse-kmers smallest k-mers and widen the whole index to the densest rate any genome needed, which slows the screen of every sample (upstream sylph's behaviour).")]
     pub small_genome_screen: SmallGenomeMode,
     #[clap(long="min-sparse-kmers", default_value_t = SPARSE_TARGET_MIN_DEFAULT, help = "Only with --small-genome-screen loosen: minimum stage-1 sparse/screen k-mers per genome; genomes whose nominal --screen-c subsample would fall short use a denser, genome-specific screen rate to reach this floor (or all of their dense k-mers if they have fewer than this to begin with). Must be >= 1.")]
     pub min_sparse_kmers: usize,

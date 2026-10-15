@@ -1182,9 +1182,10 @@ fn test_two_stage_small_genome_screen_modes_agree() {
     };
     let loosen_db = convert(Some("loosen"));
     let none_db = convert(Some("none"));
+    let profile_db = convert(Some("profile"));
     let default_db = convert(None);
 
-    // No floor means no extra keys, and `none` is the default.
+    // No floor means no extra keys, and `profile` (like `none`) stores none.
     let size = |p: &str| fs::metadata(p).unwrap().len();
     assert!(
         size(&none_db) < size(&loosen_db),
@@ -1193,7 +1194,12 @@ fn test_two_stage_small_genome_screen_modes_agree() {
     assert_eq!(
         fs::read(&none_db).unwrap(),
         fs::read(&default_db).unwrap(),
-        "--small-genome-screen should default to none"
+        "--small-genome-screen should default to a build with no floor"
+    );
+    assert_eq!(
+        fs::read(&profile_db).unwrap(),
+        fs::read(&default_db).unwrap(),
+        "--small-genome-screen should default to profile"
     );
 
     // Each profile also dumps its stage-1 survivors: the two storage schemes hold the

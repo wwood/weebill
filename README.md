@@ -108,7 +108,7 @@ weebill-built ones in the other direction. `db-convert` also answers to sylph's 
 Very small genomes — plasmids, phage, short contigs — have few k-mers at the stage-1 screen rate
 (`--screen-c`, default 3000): a 50 kbp plasmid has ~17, so its screen ANI is noise. Weebill handles
 this on the **reader** side. `db-convert`/`db-add` store every genome at strictly the nominal
-`--screen-c` (`--small-genome-screen none`, the default), so a database mixing, say, 100,000 viral
+`--screen-c` (`--small-genome-screen profile`, the default), so a database mixing, say, 100,000 viral
 genomes with a few thousand prokaryotic ones keeps a small, fast stage-1 index. `profile` then
 finds the genomes left with fewer than `--screen-small-genomes` stored screen k-mers (default 50,
 the same per-genome minimum as sylph 1.0's `--min-sparse-kmers`) when it opens the database, reads

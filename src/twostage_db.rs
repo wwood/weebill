@@ -388,6 +388,10 @@ pub enum SmallGenomeMode {
     /// on by default) by reading their smallest dense k-mers back out of the dense
     /// blocks when the database is opened.
     None,
+    /// The default. Builds exactly like `none` -- no floor is stored, so the index
+    /// stays small and fast -- and is the mode in which the small genomes are meant to
+    /// be recovered at `profile` time (`--screen-small-genomes`, on by default).
+    Profile,
     /// Give each short genome its `--min-sparse-kmers` smallest dense hashes, and
     /// widen the single pooled index to the densest rate any genome needed. One small
     /// genome therefore slows the stage-1 screen of every sample against the whole
@@ -399,6 +403,7 @@ impl std::fmt::Display for SmallGenomeMode {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         f.write_str(match self {
             SmallGenomeMode::None => "none",
+            SmallGenomeMode::Profile => "profile",
             SmallGenomeMode::Loosen => "loosen",
         })
     }
@@ -409,7 +414,7 @@ impl SmallGenomeMode {
     /// `--min-sparse-kmers`. `0` means no floor (see [`select_sparse`]).
     pub fn sparse_floor(self, min_sparse_kmers: usize) -> usize {
         match self {
-            SmallGenomeMode::None => 0,
+            SmallGenomeMode::None | SmallGenomeMode::Profile => 0,
             SmallGenomeMode::Loosen => min_sparse_kmers,
         }
     }
