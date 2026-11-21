@@ -3557,3 +3557,22 @@ fn test_profile_em_reassignment_ecoli_efergusonii() {
     );
     assert!(rare_coli.2 >= rare_coli_wta.2 - 0.1, "{:?}", rare_coli);
 }
+
+/// `--debug` logs the sample's estimated read identity, which only exists under
+/// -u; it used to unwrap it and panic on every run without -u.
+#[serial]
+#[test]
+fn test_debug_logging_without_estimate_unknown() {
+    for sub in ["profile", "query"] {
+        for extra in [vec![], vec!["-u"]] {
+            let mut cmd = Command::cargo_bin("weebill").unwrap();
+            cmd.arg(sub)
+                .arg("./test_files/e.coli-K12.fasta.gz")
+                .arg("./test_files/o157_reads.fastq.gz")
+                .args(&extra)
+                .arg("--debug")
+                .assert()
+                .success();
+        }
+    }
+}

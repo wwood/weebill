@@ -820,11 +820,14 @@ pub fn contain(mut args: ContainArgs, pseudotax_in: bool) {
                 kmer_id_opt = Some((args.seq_id.unwrap() / 100.).powf(sequence_sketch.k as f64));
             } else {
                 kmer_id_opt = get_kmer_identity(&sequence_sketch, args.estimate_unknown);
-                log::debug!(
-                    "{} has estimated identity {:.3}.",
-                    &first_read_file,
-                    kmer_id_opt.unwrap().powf(1. / sequence_sketch.k as f64) * 100.
-                );
+                // None without -u/--estimate-unknown: identity is not estimated.
+                if let Some(id) = kmer_id_opt {
+                    log::debug!(
+                        "{} has estimated identity {:.3}.",
+                        &first_read_file,
+                        id.powf(1. / sequence_sketch.k as f64) * 100.
+                    );
+                }
             }
 
             // Under two-stage, screen first and replace the full database
