@@ -6,6 +6,7 @@ pub mod contain;
 pub mod inference;
 pub mod inspect;
 pub mod merge;
+pub mod reassign;
 pub mod refdelta;
 pub mod seeding;
 pub mod sketch;

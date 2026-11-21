@@ -3312,3 +3312,248 @@ fn test_sketch_genome_db_is_reproducible_across_threads() {
         );
     }
 }
+
+/// splitmix64: a tiny seeded RNG so the simulated reads below are reproducible
+/// without a dev-dependency.
+struct SplitMix(u64);
+impl SplitMix {
+    fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+    fn below(&mut self, n: usize) -> usize {
+        (self.next() % n as u64) as usize
+    }
+    fn unit(&mut self) -> f64 {
+        (self.next() >> 11) as f64 / (1u64 << 53) as f64
+    }
+}
+
+fn read_gz_fasta(path: &str) -> Vec<Vec<u8>> {
+    use std::io::Read;
+    let mut text = String::new();
+    flate2::read::MultiGzDecoder::new(fs::File::open(path).unwrap())
+        .read_to_string(&mut text)
+        .unwrap();
+    let mut seqs: Vec<Vec<u8>> = vec![];
+    for line in text.lines() {
+        if line.starts_with('>') {
+            seqs.push(vec![]);
+        } else {
+            seqs.last_mut()
+                .unwrap()
+                .extend(line.trim().bytes().map(|b| b.to_ascii_uppercase()));
+        }
+    }
+    seqs
+}
+
+/// Write single-end 150 bp reads (random strand, 0.2% substitution errors) drawn
+/// uniformly from each `(genome, coverage)` to `out`.
+fn simulate_reads(out: &str, genomes: &[(&str, f64)], seed: u64) {
+    use std::io::Write;
+    const L: usize = 150;
+    let mut rng = SplitMix(seed);
+    let mut w = std::io::BufWriter::new(fs::File::create(out).unwrap());
+    let mut n = 0;
+    for (path, cov) in genomes {
+        let seqs = read_gz_fasta(path);
+        let total: usize = seqs.iter().map(|s| s.len()).sum();
+        let n_reads = (cov * total as f64 / L as f64) as usize;
+        for _ in 0..n_reads {
+            // Pick a position uniformly over the genome, then its contig.
+            let mut pos = rng.below(total);
+            let seq = seqs
+                .iter()
+                .find(|s| {
+                    if pos < s.len() {
+                        true
+                    } else {
+                        pos -= s.len();
+                        false
+                    }
+                })
+                .unwrap();
+            if seq.len() < L {
+                continue;
+            }
+            let start = pos.min(seq.len() - L);
+            let mut read: Vec<u8> = seq[start..start + L].to_vec();
+            if rng.below(2) == 1 {
+                read = read
+                    .iter()
+                    .rev()
+                    .map(|b| match b {
+                        b'A' => b'T',
+                        b'C' => b'G',
+                        b'G' => b'C',
+                        b'T' => b'A',
+                        x => *x,
+                    })
+                    .collect();
+            }
+            for b in read.iter_mut() {
+                if rng.unit() < 0.002 {
+                    let alts: Vec<u8> = b"ACGT".iter().copied().filter(|x| x != b).collect();
+                    *b = alts[rng.below(3)];
+                }
+            }
+            writeln!(
+                w,
+                "@r{}\n{}\n+\n{}",
+                n,
+                str::from_utf8(&read).unwrap(),
+                "I".repeat(L)
+            )
+            .unwrap();
+            n += 1;
+        }
+    }
+}
+
+/// One parsed `profile` row: (genome, abundance, ANI, eff_cov, kmers_reassigned).
+fn profile_rows(tsv: &str) -> Vec<(String, f64, f64, f64, usize)> {
+    tsv.lines()
+        .skip(1)
+        .map(|l| {
+            let f: Vec<&str> = l.split('\t').collect();
+            (
+                f[1].to_string(),
+                f[2].parse().unwrap(),
+                f[4].parse().unwrap(),
+                f[5].parse().unwrap(),
+                f[13].parse().unwrap(),
+            )
+        })
+        .collect()
+}
+
+fn run_profile(db: &str, sample: &str, extra: &[&str]) -> Vec<(String, f64, f64, f64, usize)> {
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    let out = cmd
+        .arg("profile")
+        .arg(db)
+        .arg(sample)
+        .args(extra)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    profile_rows(str::from_utf8(&out.stdout).unwrap())
+}
+
+/// `profile --reassign em` on real genomes: E. coli K-12 and E. fergusonii ATCC
+/// 35469 (GTDB r226 species representative, RS_GCF_000026225.1) share ~16% of their
+/// sketched k-mers. Winner-take-all hands every shared k-mer to E. coli, so in a
+/// mixed sample E. fergusonii loses ~3300 contained k-mers and its ANI drops to ~99.4
+/// even though its reads come from that exact genome. The EM gives those k-mers back,
+/// and still reports nothing but E. coli in a pure E. coli sample.
+#[serial]
+#[test]
+fn test_profile_em_reassignment_ecoli_efergusonii() {
+    let dir = "./tests/results/em_reassign";
+    let _ = fs::remove_dir_all(dir);
+    fs::create_dir_all(dir).unwrap();
+    let coli = "./test_files/e.coli-K12.fasta.gz";
+    let ferg = "./test_files/e.fergusonii-ATCC35469.fasta.gz";
+
+    simulate_reads(&format!("{}/coli2x.fq", dir), &[(coli, 2.)], 11);
+    simulate_reads(
+        &format!("{}/coli2x_ferg3x.fq", dir),
+        &[(coli, 2.), (ferg, 3.)],
+        12,
+    );
+    // Rare E. coli next to abundant E. fergusonii.
+    simulate_reads(
+        &format!("{}/coli0.05x_ferg3x.fq", dir),
+        &[(coli, 0.05), (ferg, 3.)],
+        13,
+    );
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("sketch")
+        .arg("-g")
+        .arg(coli)
+        .arg(ferg)
+        .arg("-o")
+        .arg(format!("{}/db", dir))
+        .arg("-r")
+        .arg(format!("{}/coli2x.fq", dir))
+        .arg(format!("{}/coli2x_ferg3x.fq", dir))
+        .arg(format!("{}/coli0.05x_ferg3x.fq", dir))
+        .arg("-d")
+        .arg(dir)
+        .assert()
+        .success();
+    // The simulated reads are ~70 MB; only their sketches are needed from here on.
+    let _ = fs::remove_file(format!("{}/coli2x.fq", dir));
+    let _ = fs::remove_file(format!("{}/coli2x_ferg3x.fq", dir));
+    let _ = fs::remove_file(format!("{}/coli0.05x_ferg3x.fq", dir));
+    let db = format!("{}/db.syldb", dir);
+    let pure = format!("{}/coli2x.fq.sylsp", dir);
+    let mixed = format!("{}/coli2x_ferg3x.fq.sylsp", dir);
+    let is_coli = |g: &str| g.contains("K12");
+
+    // Pure E. coli: only E. coli, under both rules -- also when -m 90 lets
+    // E. fergusonii (~94% ANI to this sample) through pass 1 as an EM candidate.
+    for extra in [
+        vec!["--reassign", "winner-take-all"],
+        vec!["--reassign", "em"],
+        vec!["--reassign", "em", "-m", "90"],
+    ] {
+        let rows = run_profile(&db, &pure, &extra);
+        assert_eq!(rows.len(), 1, "{:?}: {:?}", extra, rows);
+        assert!(is_coli(&rows[0].0));
+        assert!(rows[0].2 > 99.8, "{:?}", rows);
+        // 2x read coverage = 2 * (150-31+1)/150 * 0.998^31 ~ 1.50 k-mer coverage.
+        assert!((rows[0].3 - 1.5).abs() < 0.12, "{:?}", rows);
+    }
+
+    // Mixed 2x E. coli + 3x E. fergusonii.
+    let wta = run_profile(&db, &mixed, &["--reassign", "winner-take-all"]);
+    let em = run_profile(&db, &mixed, &["--reassign", "em"]);
+    assert_eq!(wta.len(), 2, "{:?}", wta);
+    assert_eq!(em.len(), 2, "{:?}", em);
+    let pick = |rows: &Vec<(String, f64, f64, f64, usize)>, coli_row: bool| {
+        rows.iter()
+            .find(|r| is_coli(&r.0) == coli_row)
+            .unwrap()
+            .clone()
+    };
+    let (wta_ferg, em_ferg) = (pick(&wta, false), pick(&em, false));
+    let em_coli = pick(&em, true);
+
+    // Winner-take-all starves E. fergusonii of the k-mers it shares with E. coli ...
+    assert!(wta_ferg.4 > 2500, "{:?}", wta_ferg);
+    assert!(wta_ferg.2 < 99.6, "{:?}", wta_ferg);
+    // ... the EM hands them back: ANI ~100, and only the k-mers whose sampled copies
+    // genuinely came from E. coli (thinning) are lost.
+    assert!(em_ferg.4 < 1000, "{:?}", em_ferg);
+    assert!(em_ferg.2 > 99.8, "{:?}", em_ferg);
+    assert!(em_coli.2 > 99.8, "{:?}", em_coli);
+    // Coverages ~1.5 and ~2.25 (3x); abundances ~40/60 (genomes of equal size).
+    assert!((em_coli.3 - 1.5).abs() < 0.12, "{:?}", em_coli);
+    assert!((em_ferg.3 - 2.25).abs() < 0.15, "{:?}", em_ferg);
+    assert!((em_coli.1 - 40.).abs() < 3., "{:?}", em);
+    assert!((em_ferg.1 - 60.).abs() < 3., "{:?}", em);
+
+    // Rare (0.05x) E. coli beside 3x E. fergusonii: still detected, and its
+    // coverage (~0.05 * 0.8 * 0.94 ~ 0.038) not inflated by E. fergusonii's counts.
+    // With only ~600 contained k-mers the estimate is noisy (+-50%) under either
+    // rule, so the bound only excludes the failure of an earlier mean-based M-step
+    // (consistently ~0.09, ANI ~97), and asks EM to be no worse than winner-take-all.
+    let rare_sample = format!("{}/coli0.05x_ferg3x.fq.sylsp", dir);
+    let rare = run_profile(&db, &rare_sample, &["--reassign", "em"]);
+    let rare_wta = run_profile(&db, &rare_sample, &["--reassign", "winner-take-all"]);
+    assert_eq!(rare.len(), 2, "{:?}", rare);
+    let (rare_coli, rare_coli_wta) = (pick(&rare, true), pick(&rare_wta, true));
+    assert!(rare_coli.3 > 0.02 && rare_coli.3 < 0.075, "{:?}", rare_coli);
+    assert!(
+        (rare_coli.3 - 0.038).abs() <= (rare_coli_wta.3 - 0.038).abs() + 0.01,
+        "{:?} vs {:?}",
+        rare_coli,
+        rare_coli_wta
+    );
+    assert!(rare_coli.2 >= rare_coli_wta.2 - 0.1, "{:?}", rare_coli);
+}

@@ -2,6 +2,7 @@ use crate::cmdline::*;
 use crate::constants::*;
 use crate::inference::*;
 use crate::merge::merge_sketches;
+use crate::reassign::{em_reassign, EmCandidate};
 use crate::sketch::*;
 use crate::twostage_db::{ScreenIndex, TwoStageDb};
 use crate::types::*;
@@ -885,27 +886,33 @@ pub fn contain(mut args: ContainArgs, pseudotax_in: bool) {
                     &first_read_file,
                     stats_vec_seq.len()
                 );
-                let winner_map = winner_table(&stats_vec_seq, args.log_reassignments);
-                let remaining_genomes = stats_vec_seq
-                    .iter()
-                    .map(|x| x.genome_sketch)
-                    .collect::<Vec<&GenomeSketch>>();
-                let stats_vec_seq_2 = Mutex::new(vec![]);
-                remaining_genomes.into_par_iter().for_each(|genome_sketch| {
-                    let res = get_stats(
-                        &args,
-                        genome_sketch,
-                        &sequence_sketch,
-                        Some(&winner_map),
-                        args.log_reassignments,
-                    );
-                    if res.is_some() {
-                        stats_vec_seq_2.lock().unwrap().push(res.unwrap());
+                let stats_vec_seq_2 = match args.reassign {
+                    ReassignMode::WinnerTakeAll => {
+                        let winner_map = winner_table(&stats_vec_seq, args.log_reassignments);
+                        let remaining_genomes = stats_vec_seq
+                            .iter()
+                            .map(|x| x.genome_sketch)
+                            .collect::<Vec<&GenomeSketch>>();
+                        let stats_vec_seq_2 = Mutex::new(vec![]);
+                        remaining_genomes.into_par_iter().for_each(|genome_sketch| {
+                            let res = get_stats(
+                                &args,
+                                genome_sketch,
+                                &sequence_sketch,
+                                Some(&winner_map),
+                                args.log_reassignments,
+                            );
+                            if res.is_some() {
+                                stats_vec_seq_2.lock().unwrap().push(res.unwrap());
+                            }
+                        });
+                        stats_vec_seq_2.into_inner().unwrap()
                     }
-                });
+                    ReassignMode::Em => em_profile_pass(&args, &stats_vec_seq, &sequence_sketch),
+                };
                 stats_vec_seq = derep_if_reassign_threshold(
                     &stats_vec_seq,
-                    stats_vec_seq_2.into_inner().unwrap(),
+                    stats_vec_seq_2,
                     args.redundant_ani,
                     sequence_sketch.k,
                 );
@@ -1083,6 +1090,52 @@ pub fn contain(mut args: ContainArgs, pseudotax_in: bool) {
     }
 
     log::info!("sylph finished.");
+}
+
+/// Pseudotax pass 2 under `--reassign em`: deconvolve shared k-mer counts across
+/// the pass-1 candidates (see `reassign`), then re-estimate each genome from its
+/// share of the counts.
+fn em_profile_pass<'a>(
+    args: &ContainArgs,
+    pass1: &[AniResult<'a>],
+    sequence_sketch: &SequencesSketch,
+) -> Vec<AniResult<'a>> {
+    let cands: Vec<EmCandidate> = pass1
+        .iter()
+        .map(|r| EmCandidate {
+            genome: r.genome_sketch,
+            ani: r.final_est_ani,
+            cov: r.final_est_cov,
+            median_cov: r.median_cov,
+        })
+        .collect();
+    let assigned = em_reassign(&cands, &sequence_sketch.kmer_counts);
+    pass1
+        .par_iter()
+        .zip(assigned.into_par_iter())
+        .filter_map(|(r, a)| {
+            if args.log_reassignments {
+                log::info!(
+                    "EM\t{}\t{}\tlambda={:.4}\tpi={:.4}\tcontained {} -> {}",
+                    r.gn_name,
+                    r.contig_name,
+                    a.lambda,
+                    a.pi,
+                    r.containment_index.0,
+                    a.covs.len()
+                );
+            }
+            let lost = r.containment_index.0.saturating_sub(a.covs.len());
+            result_from_covs(
+                args,
+                r.genome_sketch,
+                sequence_sketch,
+                a.covs,
+                Some(lost),
+                args.log_reassignments,
+            )
+        })
+        .collect()
 }
 
 fn derep_if_reassign_threshold<'a>(
@@ -1761,7 +1814,6 @@ fn get_stats<'a>(
         );
         std::process::exit(1);
     }
-    let mut contain_count = 0;
     let mut covs = vec![];
     let gn_kmers = &genome_sketch.genome_kmers;
     if (gn_kmers.len() as f64) < args.min_number_kmers {
@@ -1780,16 +1832,37 @@ fn get_stats<'a>(
                     kmers_lost_count += 1;
                     continue;
                 }
-                contain_count += 1;
                 covs.push(sequence_sketch.kmer_counts[kmer]);
             } else {
-                contain_count += 1;
                 covs.push(sequence_sketch.kmer_counts[kmer]);
             }
         }
     }
 
-    let n_kmers = gn_kmers.len();
+    let kmers_lost = winner_map.is_some().then_some(kmers_lost_count);
+    result_from_covs(
+        args,
+        genome_sketch,
+        sequence_sketch,
+        covs,
+        kmers_lost,
+        log_reassign,
+    )
+}
+
+/// Turn a genome's contained-k-mer counts (`covs`, all non-zero) into its
+/// `AniResult`, applying the evidence floor and the ANI gate. `kmers_lost` is
+/// `Some` during pseudotax reassignment (winner-take-all or EM).
+fn result_from_covs<'a>(
+    args: &ContainArgs,
+    genome_sketch: &'a GenomeSketch,
+    sequence_sketch: &SequencesSketch,
+    covs: Vec<u32>,
+    kmers_lost: Option<usize>,
+    log_reassign: bool,
+) -> Option<AniResult<'a>> {
+    let contain_count = covs.len();
+    let n_kmers = genome_sketch.genome_kmers.len();
     // Absolute evidence floor, independent of genome size: `-M` scales with the
     // genome's k-mer count, so lowering it to admit small genomes would also admit
     // hits carried by a couple of chance matches. Both gates have to pass.
@@ -1803,14 +1876,13 @@ fn get_stats<'a>(
         );
         return None;
     }
-    let reassign_log = if winner_map.is_some() && log_reassign {
-        Some((
+    let reassign_log = match kmers_lost {
+        Some(lost) if log_reassign => Some((
             genome_sketch.file_name.as_str(),
             genome_sketch.first_contig_name.as_str(),
-            kmers_lost_count,
-        ))
-    } else {
-        None
+            lost,
+        )),
+        _ => None,
     };
     let fin = finalize_stats(
         args,
@@ -1826,12 +1898,6 @@ fn get_stats<'a>(
     } else {
         sequence_sketch.file_name.clone()
     };
-    let kmers_lost = if winner_map.is_some() {
-        Some(kmers_lost_count)
-    } else {
-        None
-    };
-
     Some(AniResult {
         naive_ani: fin.naive_ani,
         final_est_ani: fin.final_est_ani,

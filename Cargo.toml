@@ -50,6 +50,8 @@ tikv-jemallocator = "0"
 assert_cmd = "2"
 predicates = "3"
 serial_test = "3"
+# Read gzipped genomes when simulating reads in integration tests.
+flate2 = "1.0.17"
 
 
 [profile.release]

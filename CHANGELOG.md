@@ -5,6 +5,10 @@ changes made in weebill.
 
 ## Unreleased
 
+### Added
+
+- `profile --reassign em`: coverage-aware reassignment of k-mers shared between candidate genomes. The default, `winner-take-all` (sylph's rule), gives each shared k-mer and its whole count to the highest-ANI genome. When two relatives are both present, a shared k-mer's count is really about λ_X + λ_Y, so the winner's coverage is inflated and the loser is starved of k-mers it does contain. `em` models each genome by a coverage λ and a k-mer presence rate π (a zero-inflated Poisson for unshared k-mers, a superposition of Poissons over the genomes present for shared ones), fits them by EM starting from the winner-take-all assignment (the M-step reads λ from each genome's expected count histogram with sylph's modal-ratio estimator, not the mean, so a low-coverage genome's λ is not inflated by the few k-mers that carry a co-present relative's counts) (which also breaks ties for redundant near-copies: they start at π ≈ 0 and stay there), and then splits each shared k-mer's count into integer per-genome shares drawn from the posterior. The draws are seeded by the k-mer hash, so output does not depend on thread count. On simulated 150 bp reads from 2x E. coli K-12 + 3x E. fergusonii (~16% of sketch k-mers shared), E. fergusonii's ANI goes from 99.39 to 100.00 and its lost k-mers from 3,286 to 272. E. coli's coverage goes from an inflated 1.636 to 1.481 (expected ~1.50). A pure E. coli sample still reports only E. coli, including when `-m 90` admits E. fergusonii as a candidate. `src/reassign.rs`; test `test_profile_em_reassignment_ecoli_efergusonii` (adds `test_files/e.fergusonii-ATCC35469.fasta.gz`, GTDB r226 RS_GCF_000026225.1).
+
 ## Version 0.4.0
 
 ### Added

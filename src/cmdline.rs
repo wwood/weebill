@@ -2,6 +2,17 @@ use crate::constants::*;
 use crate::twostage_db::SmallGenomeMode;
 use clap::{Args, Parser, Subcommand};
 
+/// How `profile` resolves k-mers shared between several candidate genomes.
+#[derive(clap::ArgEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReassignMode {
+    /// sylph's original rule: every shared k-mer, with its whole count, goes to the
+    /// candidate with the highest ANI.
+    WinnerTakeAll,
+    /// Coverage-aware EM: a shared k-mer's count is deconvolved into per-genome
+    /// shares, using each genome's coverage and k-mer presence rate.
+    Em,
+}
+
 #[derive(Parser)]
 #[clap(
     author,
@@ -741,6 +752,15 @@ pub struct ContainArgs {
         help = "Output information for how k-mers for genomes are reassigned during `profile`. Caution: can be verbose and slows down computation."
     )]
     pub log_reassignments: bool,
+
+    #[clap(
+        long = "reassign",
+        arg_enum,
+        default_value_t = ReassignMode::WinnerTakeAll,
+        help_heading = "ALGORITHM",
+        help = "How `profile` resolves k-mers shared between candidate genomes. `winner-take-all` (default, sylph's behaviour): each shared k-mer and its whole count go to the highest-ANI genome, which inflates the winner's coverage and can starve a co-occurring relative of k-mers. `em`: estimate each genome's coverage and k-mer presence rate by EM, starting from the winner-take-all assignment, and split each shared k-mer's count between the genomes consistent with it."
+    )]
+    pub reassign: ReassignMode,
 
     #[clap(
         long = "two-stage",

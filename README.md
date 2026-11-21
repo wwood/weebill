@@ -236,6 +236,12 @@ The binary is installed as `weebill`. Weebill changes:
   is still available as `--small-genome-screen loosen`, and a sylph-built database, which already
   carries the floor, profiles unchanged. See
   [the two-stage notes](#from-reads-to-a-profile-two-stage) above.
+- **Coverage-aware k-mer reassignment (opt-in)** — `profile --reassign em` replaces sylph's
+  winner-take-all handling of k-mers shared between candidate genomes (all of a shared k-mer's count
+  goes to the highest-ANI genome) with an EM that estimates each genome's coverage and k-mer presence
+  rate, then splits each shared k-mer's count between the genomes consistent with it. This avoids
+  inflating the winner's coverage and starving a co-occurring relative (e.g. E. coli + E.
+  fergusonii) of the k-mers it shares. The default is still `winner-take-all`.
 - **Compressed sketches** — `weebill sketch --compressed-output`/`--compressed-database` write
   `.sylspc` samples and `.syldbc` databases (~55% smaller samples, ~30%+ smaller databases). Hashes
   are sorted, delta-encoded and Golomb–Rice coded, then wrapped in a zstd frame. `query`, `profile`,
