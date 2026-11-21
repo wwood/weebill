@@ -1098,51 +1098,79 @@ pub fn contain(mut args: ContainArgs, pseudotax_in: bool) {
 /// Pseudotax pass 2 under `--reassign em`: deconvolve shared k-mer counts across
 /// the pass-1 candidates (see `reassign`), then re-estimate each genome from its
 /// share of the counts.
+///
+/// A candidate that the EM gives shares to can still fail the evidence floor, the
+/// ANI gate or the redundancy filter afterwards, and the counts it was given would
+/// then be lost to everyone. So the EM is re-run over the survivors until none is
+/// dropped; each round only removes genomes, so this ends within `pass1.len()`
+/// rounds. (Winner-take-all mostly avoids the problem because shared k-mers go to
+/// the best-ANI candidate, which is rarely the one filtered out.)
 fn em_profile_pass<'a>(
     args: &ContainArgs,
     pass1: &[AniResult<'a>],
     sequence_sketch: &SequencesSketch,
 ) -> Vec<AniResult<'a>> {
-    let cands: Vec<EmCandidate> = pass1
-        .iter()
-        .map(|r| EmCandidate {
-            genome: r.genome_sketch,
-            ani: r.final_est_ani,
-            cov: r.final_est_cov,
-            median_cov: r.median_cov,
-        })
-        .collect();
-    let assigned = em_reassign(&cands, &sequence_sketch.kmer_counts);
-    pass1
-        .par_iter()
-        .zip(assigned.into_par_iter())
-        .filter_map(|(r, a)| {
-            if args.log_reassignments {
-                log::info!(
-                    "EM\t{}\t{}\tlambda={:.4}\tpi={:.4}\tcontained {} -> {}",
-                    r.gn_name,
-                    r.contig_name,
-                    a.lambda,
-                    a.pi,
-                    r.containment_index.0,
-                    a.covs.len()
-                );
-            }
-            let lost = r.containment_index.0.saturating_sub(a.covs.len());
-            result_from_covs(
-                args,
-                r.genome_sketch,
-                sequence_sketch,
-                a.covs,
-                Some(lost),
-                args.log_reassignments,
-            )
-        })
-        .collect()
+    let mut active: Vec<&AniResult<'a>> = pass1.iter().collect();
+    for round in 1.. {
+        let cands: Vec<EmCandidate> = active
+            .iter()
+            .map(|r| EmCandidate {
+                genome: r.genome_sketch,
+                ani: r.final_est_ani,
+                cov: r.final_est_cov,
+                median_cov: r.median_cov,
+            })
+            .collect();
+        let assigned = em_reassign(&cands, &sequence_sketch.kmer_counts);
+        let results: Vec<AniResult<'a>> = active
+            .par_iter()
+            .zip(assigned.into_par_iter())
+            .filter_map(|(r, a)| {
+                if args.log_reassignments {
+                    log::info!(
+                        "EM\tround {}\t{}\t{}\tlambda={:.4}\tpi={:.4}\tcontained {} -> {}",
+                        round,
+                        r.gn_name,
+                        r.contig_name,
+                        a.lambda,
+                        a.pi,
+                        r.containment_index.0,
+                        a.covs.len()
+                    );
+                }
+                let lost = r.containment_index.0.saturating_sub(a.covs.len());
+                result_from_covs(
+                    args,
+                    r.genome_sketch,
+                    sequence_sketch,
+                    a.covs,
+                    Some(lost),
+                    args.log_reassignments,
+                )
+            })
+            .collect();
+        let results =
+            derep_if_reassign_threshold(pass1, results, args.redundant_ani, sequence_sketch.k);
+        if results.len() == active.len() || results.is_empty() {
+            return results;
+        }
+        log::debug!(
+            "EM round {}: {} of {} candidates dropped; re-running EM over the rest",
+            round,
+            active.len() - results.len(),
+            active.len()
+        );
+        let kept: std::collections::HashSet<*const GenomeSketch> = results
+            .iter()
+            .map(|r| r.genome_sketch as *const GenomeSketch)
+            .collect();
+        active.retain(|r| kept.contains(&(r.genome_sketch as *const GenomeSketch)));
+    }
+    unreachable!()
 }
 
 fn derep_if_reassign_threshold<'a>(
-    results_old: &Vec<AniResult>,
+    results_old: &[AniResult],
     results_new: Vec<AniResult<'a>>,
     ani_thresh: f64,
     k: usize,

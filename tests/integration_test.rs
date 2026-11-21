@@ -3556,6 +3556,26 @@ fn test_profile_em_reassignment_ecoli_efergusonii() {
         rare_coli_wta
     );
     assert!(rare_coli.2 >= rare_coli_wta.2 - 0.1, "{:?}", rare_coli);
+
+    // K-12 reads against two other E. coli strains: O157 takes EM shares of the
+    // k-mers it shares with EC590 but is then filtered out, and its shares must go
+    // back to EC590 (EM is re-run over the survivors). Before that fix EC590 lost
+    // ~220 k-mers and ~2% of its coverage relative to winner-take-all.
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("sketch")
+        .arg("./test_files/e.coli-EC590.fasta.gz")
+        .arg("./test_files/e.coli-o157.fasta.gz")
+        .arg("-o")
+        .arg(format!("{}/strains", dir))
+        .assert()
+        .success();
+    let strains = format!("{}/strains.syldb", dir);
+    let s_wta = run_profile(&strains, &pure, &["--reassign", "winner-take-all"]);
+    let s_em = run_profile(&strains, &pure, &["--reassign", "em"]);
+    assert_eq!(s_em.len(), 1, "{:?}", s_em);
+    assert!(s_em[0].0.contains("EC590"), "{:?}", s_em);
+    assert_eq!(s_em[0].4, 0, "{:?}", s_em);
+    assert_eq!(s_em, s_wta);
 }
 
 /// `--debug` logs the sample's estimated read identity, which only exists under
