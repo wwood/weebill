@@ -1110,7 +1110,17 @@ fn em_profile_pass<'a>(
     pass1: &[AniResult<'a>],
     sequence_sketch: &SequencesSketch,
 ) -> Vec<AniResult<'a>> {
+    // Pass 1 collects its results in thread-completion order. The candidate order
+    // sets each shared k-mer's member order, and with it how the seeded draws split
+    // its count, so fix it or the output changes from run to run.
     let mut active: Vec<&AniResult<'a>> = pass1.iter().collect();
+    active.sort_by(|a, b| {
+        (a.gn_name, a.contig_name, a.genome_sketch.genome_kmers.len()).cmp(&(
+            b.gn_name,
+            b.contig_name,
+            b.genome_sketch.genome_kmers.len(),
+        ))
+    });
     for round in 1.. {
         let cands: Vec<EmCandidate> = active
             .iter()
@@ -1121,7 +1131,7 @@ fn em_profile_pass<'a>(
                 median_cov: r.median_cov,
             })
             .collect();
-        let assigned = em_reassign(&cands, &sequence_sketch.kmer_counts);
+        let assigned = em_reassign(&cands, &sequence_sketch.kmer_counts, args.mean_coverage);
         let results: Vec<AniResult<'a>> = active
             .par_iter()
             .zip(assigned.into_par_iter())

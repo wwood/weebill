@@ -3596,3 +3596,254 @@ fn test_debug_logging_without_estimate_unknown() {
         }
     }
 }
+
+/// The EM's per-genome λ for every `--reassign em` genome, parsed from
+/// `--log-reassignments` (last EM round wins).
+fn em_lambdas(db: &str, sample: &str) -> std::collections::HashMap<String, f64> {
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    let out = cmd
+        .arg("profile")
+        .arg(db)
+        .arg(sample)
+        .args(["--reassign", "em", "--log-reassignments"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let mut lambdas = std::collections::HashMap::new();
+    for l in str::from_utf8(&out.stderr).unwrap().lines() {
+        let f: Vec<&str> = l.split('\t').collect();
+        if f.len() > 5 && f[0].ends_with("EM") && f[4].starts_with("lambda=") {
+            lambdas.insert(f[2].to_string(), f[4]["lambda=".len()..].parse().unwrap());
+        }
+    }
+    lambdas
+}
+
+/// sylph's high-coverage (median 3-14) coverage estimate implied by an EM λ: the
+/// zero-truncated Poisson mean, i.e. the mean of the non-zero counts.
+fn ztp_mean(lam: f64) -> f64 {
+    lam / (1. - (-lam).exp())
+}
+
+/// At high coverage (median k-mer count > 2) sylph does not fit a Poisson: it
+/// reports the mean of the contained k-mers' counts (or their median from 15 up).
+/// The EM must estimate each genome's λ from the same statistic (as the Poisson
+/// rate with that zero-truncated mean), or it splits shared k-mers by coverages
+/// that disagree with the ones reported. Its modal-ratio estimate used to be biased
+/// low there (K-12 alone at 8x: 5.87 vs sylph's 5.96; 8x K-12 + 8x E. fergusonii:
+/// 5.68 vs 5.96 for E. fergusonii).
+#[serial]
+#[test]
+fn test_profile_em_high_coverage_matches_sylph() {
+    let dir = "./tests/results/em_reassign_high_cov";
+    let _ = fs::remove_dir_all(dir);
+    fs::create_dir_all(dir).unwrap();
+    let coli = "./test_files/e.coli-K12.fasta.gz";
+    let ferg = "./test_files/e.fergusonii-ATCC35469.fasta.gz";
+    simulate_reads(&format!("{}/coli8x.fq", dir), &[(coli, 8.)], 21);
+    simulate_reads(
+        &format!("{}/coli8x_ferg8x.fq", dir),
+        &[(coli, 8.), (ferg, 8.)],
+        24,
+    );
+    simulate_reads(
+        &format!("{}/coli1x_ferg8x.fq", dir),
+        &[(coli, 1.), (ferg, 8.)],
+        25,
+    );
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("sketch")
+        .arg("-g")
+        .arg(coli)
+        .arg(ferg)
+        .arg("-o")
+        .arg(format!("{}/db", dir))
+        .arg("-r")
+        .arg(format!("{}/coli8x.fq", dir))
+        .arg(format!("{}/coli8x_ferg8x.fq", dir))
+        .arg(format!("{}/coli1x_ferg8x.fq", dir))
+        .arg("-d")
+        .arg(dir)
+        .assert()
+        .success();
+    let _ = fs::remove_file(format!("{}/coli8x.fq", dir));
+    let _ = fs::remove_file(format!("{}/coli8x_ferg8x.fq", dir));
+    let _ = fs::remove_file(format!("{}/coli1x_ferg8x.fq", dir));
+    let db = format!("{}/db.syldb", dir);
+    let pure = format!("{}/coli8x.fq.sylsp", dir);
+    let mixed = format!("{}/coli8x_ferg8x.fq.sylsp", dir);
+
+    // Pure K-12: a single candidate whose k-mers are all unique, so the EM's λ
+    // gives exactly sylph's coverage estimate (8x reads ~ 6.0 k-mer coverage).
+    let rows = run_profile(&db, &pure, &["--reassign", "em"]);
+    assert_eq!(rows.len(), 1, "{:?}", rows);
+    let lambdas = em_lambdas(&db, &pure);
+    let lam = ztp_mean(lambdas[&rows[0].0]);
+    assert!((lam - rows[0].3).abs() < 2e-3, "{} vs {:?}", lam, rows);
+    assert!((rows[0].3 - 6.).abs() < 0.15, "{:?}", rows);
+
+    // 8x + 8x: each genome's EM λ agrees with its reported coverage, both are
+    // ~6.0, and the abundances are ~50/50 (genomes of about equal size).
+    let rows = run_profile(&db, &mixed, &["--reassign", "em"]);
+    assert_eq!(rows.len(), 2, "{:?}", rows);
+    let lambdas = em_lambdas(&db, &mixed);
+    for r in rows.iter() {
+        let lam = ztp_mean(lambdas[&r.0]);
+        assert!(
+            (lam - r.3).abs() < 0.005 * r.3,
+            "EM lambda {} vs Eff_cov {:?}",
+            lam,
+            r
+        );
+        assert!((r.3 - 6.).abs() < 0.15, "{:?}", rows);
+        assert!((r.1 - 50.).abs() < 1., "{:?}", rows);
+        assert!(r.2 > 99.8, "{:?}", rows);
+    }
+
+    // 1x K-12 beside 8x E. fergusonii: the low-coverage genome goes through the
+    // modal-ratio branch, the high-coverage one through sylph's mean, within one
+    // EM. Expected k-mer coverages ~0.75 and ~6.0, abundances ~11/89.
+    let mixed = format!("{}/coli1x_ferg8x.fq.sylsp", dir);
+    let wta = run_profile(&db, &mixed, &["--reassign", "winner-take-all"]);
+    let rows = run_profile(&db, &mixed, &["--reassign", "em"]);
+    assert_eq!(rows.len(), 2, "{:?}", rows);
+    let lambdas = em_lambdas(&db, &mixed);
+    let is_coli = |g: &str| g.contains("K12");
+    let coli_row = rows.iter().find(|r| is_coli(&r.0)).unwrap();
+    let ferg_row = rows.iter().find(|r| !is_coli(&r.0)).unwrap();
+    let wta_ferg = wta.iter().find(|r| !is_coli(&r.0)).unwrap();
+    // E. fergusonii (median 6): EM λ gives sylph's estimate; with the modal ratio
+    // it gave 5.99 vs a reported 6.01.
+    let lam = ztp_mean(lambdas[&ferg_row.0]);
+    assert!(
+        (lam - ferg_row.3).abs() < 0.002 * ferg_row.3,
+        "EM lambda {} vs Eff_cov {:?}",
+        lam,
+        ferg_row
+    );
+    assert!((ferg_row.3 - 6.).abs() < 0.15, "{:?}", rows);
+    assert!((ferg_row.1 - 88.9).abs() < 1., "{:?}", rows);
+    // Winner-take-all strips E. fergusonii of the k-mers it shares with E. coli;
+    // the EM gives them back.
+    assert!(wta_ferg.4 > 2500 && wta_ferg.2 < 99.6, "{:?}", wta_ferg);
+    assert!(ferg_row.4 < 100 && ferg_row.2 > 99.8, "{:?}", ferg_row);
+    // E. coli (median 1): modal ratio, close to its reported coverage.
+    let lam = lambdas[&coli_row.0];
+    assert!(
+        (lam - coli_row.3).abs() < 0.03 * coli_row.3,
+        "EM lambda {} vs Eff_cov {:?}",
+        lam,
+        coli_row
+    );
+    assert!((coli_row.3 - 0.75).abs() < 0.05, "{:?}", rows);
+    assert!((coli_row.1 - 11.1).abs() < 1., "{:?}", rows);
+    assert!(coli_row.2 > 99.8, "{:?}", rows);
+}
+
+fn profile_stdout(db: &str, sample: &str) -> String {
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    let out = cmd
+        .arg("profile")
+        .arg(db)
+        .arg(sample)
+        .args(["--reassign", "em", "-t", "4"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    String::from_utf8(out.stdout).unwrap()
+}
+
+/// Two very close E. coli strains (K-12 and EC590), both at high coverage, share
+/// most of their k-mers, so how the EM splits those decides the abundances. With
+/// the old modal-ratio M-step their λs were biased low by different amounts
+/// (6.17 vs 5.69 at 8x each), and the profile came out 51.7/48.3 with coverages
+/// 6.19/5.79 instead of 50/50 at ~6.0.
+#[serial]
+#[test]
+fn test_profile_em_high_coverage_close_strains() {
+    let dir = "./tests/results/em_reassign_strains";
+    let _ = fs::remove_dir_all(dir);
+    fs::create_dir_all(dir).unwrap();
+    let k12 = "./test_files/e.coli-K12.fasta.gz";
+    let ec590 = "./test_files/e.coli-EC590.fasta.gz";
+    let o157 = "./test_files/e.coli-o157.fasta.gz";
+    simulate_reads(
+        &format!("{}/k12_8x_ec590_8x.fq", dir),
+        &[(k12, 8.), (ec590, 8.)],
+        32,
+    );
+    simulate_reads(
+        &format!("{}/k12_20x_ec590_5x.fq", dir),
+        &[(k12, 20.), (ec590, 5.)],
+        33,
+    );
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("sketch")
+        .arg("-g")
+        .arg(k12)
+        .arg(o157)
+        .arg(ec590)
+        .arg("-o")
+        .arg(format!("{}/db", dir))
+        .arg("-r")
+        .arg(format!("{}/k12_8x_ec590_8x.fq", dir))
+        .arg(format!("{}/k12_20x_ec590_5x.fq", dir))
+        .arg("-d")
+        .arg(dir)
+        .assert()
+        .success();
+    let _ = fs::remove_file(format!("{}/k12_8x_ec590_8x.fq", dir));
+    let _ = fs::remove_file(format!("{}/k12_20x_ec590_5x.fq", dir));
+    let db = format!("{}/db.syldb", dir);
+    let pick = |rows: &Vec<(String, f64, f64, f64, usize)>, name: &str| {
+        rows.iter()
+            .find(|r| r.0.contains(name))
+            .unwrap_or_else(|| panic!("{} missing: {:?}", name, rows))
+            .clone()
+    };
+
+    // 8x + 8x: ~6.0 k-mer coverage each (6.02 expected, 5.96 for K-12 alone),
+    // genomes of about equal size, so 50/50.
+    let rows = run_profile(
+        &db,
+        &format!("{}/k12_8x_ec590_8x.fq.sylsp", dir),
+        &["--reassign", "em"],
+    );
+    assert_eq!(rows.len(), 2, "{:?}", rows);
+    for name in ["K12", "EC590"] {
+        let r = pick(&rows, name);
+        assert!((r.1 - 50.).abs() < 0.6, "{:?}", rows);
+        assert!((r.3 - 6.).abs() < 0.1, "{:?}", rows);
+        assert!(r.2 > 99.9, "{:?}", rows);
+    }
+
+    // 20x K-12 + 5x EC590 (alone they give 15.0 and 3.80, so ~79.8/20.2).
+    // Winner-take-all loses EC590 altogether here. Three ways the EM overshot it:
+    // - taking π as the plain contained fraction at high coverage shrank it each
+    //   iteration (to 0.90): ~2000 EC590 k-mers lost, ANI 99.64, coverage 4.19;
+    // - outlier caps from EC590's pass-1 median (18, as its k-mers also carry
+    //   K-12's counts) let ~25 K-12 repeat k-mers that K-12's sketch dropped as
+    //   duplicates into EC590's fit: 4.04 -> 3.96 when refitted;
+    // - using sylph's non-zero mean itself as the Poisson rate: -> 3.78.
+    let rows = run_profile(
+        &db,
+        &format!("{}/k12_20x_ec590_5x.fq.sylsp", dir),
+        &["--reassign", "em"],
+    );
+    assert_eq!(rows.len(), 2, "{:?}", rows);
+    let (k, e) = (pick(&rows, "K12"), pick(&rows, "EC590"));
+    assert!((k.3 - 15.).abs() < 0.5, "{:?}", rows);
+    assert!(e.2 > 99.8, "{:?}", rows);
+    assert!(e.4 < 1000, "{:?}", rows);
+    assert!((e.3 - 3.8).abs() < 0.1, "{:?}", rows);
+    assert!((e.1 - 20.2).abs() < 0.5, "{:?}", rows);
+
+    // The output does not depend on the order pass 1 happens to collect the
+    // candidates in (thread completion order): it used to vary between runs, e.g.
+    // 51.69 or 51.80 for K-12 in the 8x + 8x sample.
+    let sample = format!("{}/k12_8x_ec590_8x.fq.sylsp", dir);
+    let first = profile_stdout(&db, &sample);
+    for _ in 0..7 {
+        assert_eq!(profile_stdout(&db, &sample), first);
+    }
+}
