@@ -191,6 +191,15 @@ pub struct GenomeSketch {
     pub k: usize,
     pub gn_size: usize,
     pub min_spacing: usize,
+    /// Sampled k-mers that occur more than once in the genome. They are left out of
+    /// `genome_kmers` (and `pseudotax_tracked_nonused_kmers`) because a repeat's read
+    /// count is its copy number times the coverage, but the genome still carries
+    /// them: `profile --reassign em` uses them to keep other genomes' copies of these
+    /// k-mers out of their coverage fits. Filled in when a genome is sketched from
+    /// sequence; stored only by a version-4 `.syl2db` (never by a `.syldb`, which keeps
+    /// sylph's layout, hence `serde(skip)`). `None` when unknown.
+    #[serde(skip)]
+    pub repeat_kmers: Option<Vec<Kmer>>,
 }
 
 #[derive(Deserialize, Serialize, Debug, PartialEq, Default, Clone)]
@@ -220,4 +229,21 @@ pub struct AniResult<'a> {
     pub rel_abund: Option<f64>,
     pub seq_abund: Option<f64>,
     pub kmers_lost: Option<usize>,
+    /// `--reassign em`: contained k-mers left out because another candidate carries
+    /// them as a repeat. They are not "lost" to reassignment, so the redundancy
+    /// filter does not count them.
+    pub kmers_masked_contained: usize,
+    /// `--reassign em` only: the extra per-genome report columns.
+    pub em_report: Option<EmReport>,
+}
+
+/// Per-genome diagnostics printed after the standard columns under `--reassign em`.
+#[derive(Debug, PartialEq, Default)]
+pub struct EmReport {
+    /// Genomes (file names) that carry every k-mer of this genome found in the sample,
+    /// while none of this genome's own k-mers was found: the data cannot tell the two
+    /// apart (see `reassign::shared_only_partners`).
+    pub shared_only_with: Vec<String>,
+    /// `--detect-missing-relatives`: the two-rate fit (None when not attempted).
+    pub mixture: Option<crate::reassign::MixtureFit>,
 }

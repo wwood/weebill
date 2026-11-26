@@ -25,6 +25,9 @@
 //! of the contained counts (see `fit_params`). Counts above a genome's outlier
 //! cap are left out of the fit; the caps start from the pass-1 medians and are
 //! then refitted from the EM's own histograms until they settle.
+//! k-mers that any candidate carries as a repeat (`GenomeSketch::repeat_kmers`, from a
+//! version-4 `.syl2db`) are left out of every candidate's fit and k-mer total, because
+//! their counts include an unknown copy number (see `repeat_mask`).
 //! It starts from the winner-take-all assignment: each genome's initial parameters
 //! come from the k-mers it wins, with lost k-mers treated as missing rather than as
 //! zeros. That start doubles as the tie-break the model cannot make by itself: a
@@ -40,7 +43,7 @@
 
 use crate::constants::*;
 use crate::types::*;
-use fxhash::FxHashMap;
+use fxhash::{FxHashMap, FxHashSet};
 use rayon::prelude::*;
 use smallvec::SmallVec;
 use statrs::distribution::{DiscreteCDF, Poisson};
@@ -81,6 +84,32 @@ pub struct EmAssignment {
     pub covs: Vec<u32>,
     pub lambda: f64,
     pub pi: f64,
+    /// The genome's k-mers left out because another candidate carries them as a
+    /// repeat (see [`repeat_mask`]): out of `covs` and out of the k-mer count the
+    /// containment and ANI are taken over.
+    pub n_masked: usize,
+    /// How many of those masked k-mers were in the sample.
+    pub n_masked_contained: usize,
+}
+
+/// The k-mers any of `genomes` carries more than once (`GenomeSketch::repeat_kmers`).
+///
+/// A repeat's read count is its copy number times its genome's coverage, so when
+/// another genome has the same k-mer as one of its (single-copy) counted k-mers, the
+/// count cannot be split by coverage: the repeat-carrier's share is unknown. Such
+/// k-mers are left out of every genome's fit and of its k-mer total. This matters
+/// most when a low-coverage genome sits beside an abundant relative: the relative's
+/// repeats (rRNA operons, IS elements) otherwise land in the low-coverage genome's
+/// counts at the relative's coverage. Repeats are only known for genomes from a
+/// version-4 `.syl2db`; `None` repeats contribute nothing.
+pub fn repeat_mask<'a>(genomes: impl IntoIterator<Item = &'a GenomeSketch>) -> FxHashSet<Kmer> {
+    let mut mask = FxHashSet::default();
+    for g in genomes {
+        if let Some(r) = &g.repeat_kmers {
+            mask.extend(r.iter().copied());
+        }
+    }
+    mask
 }
 
 struct SharedKmer {
@@ -458,20 +487,27 @@ pub fn em_reassign(
 ) -> Vec<EmAssignment> {
     let n = cands.len();
     assert!(n < TRACKED_BIT as usize);
+    let mask = repeat_mask(cands.iter().map(|c| c.genome));
 
     // Observed k-mer -> carrying candidates.
     let mut carriers: FxHashMap<Kmer, SmallVec<[u32; 4]>> = FxHashMap::default();
     let mut n_obs = vec![0usize; n];
+    let mut n_masked = vec![0usize; n];
+    let mut n_masked_contained = vec![0usize; n];
     for (g, cand) in cands.iter().enumerate() {
         for kmer in cand.genome.genome_kmers.iter() {
-            if kmer_counts.get(kmer).copied().unwrap_or(0) > 0 {
+            let observed = kmer_counts.get(kmer).copied().unwrap_or(0) > 0;
+            if mask.contains(kmer) {
+                n_masked[g] += 1;
+                n_masked_contained[g] += observed as usize;
+            } else if observed {
                 n_obs[g] += 1;
                 carriers.entry(*kmer).or_default().push(g as u32);
             }
         }
         if let Some(tracked) = &cand.genome.pseudotax_tracked_nonused_kmers {
             for kmer in tracked.iter() {
-                if kmer_counts.get(kmer).copied().unwrap_or(0) > 0 {
+                if !mask.contains(kmer) && kmer_counts.get(kmer).copied().unwrap_or(0) > 0 {
                     let m = carriers.entry(*kmer).or_default();
                     if !m.iter().any(|&x| x & !TRACKED_BIT == g as u32) {
                         m.push(g as u32 | TRACKED_BIT);
@@ -502,7 +538,8 @@ pub fn em_reassign(
     shared.sort_unstable_by_key(|s| s.kmer);
     let n_kmers: Vec<f64> = cands
         .iter()
-        .map(|c| c.genome.genome_kmers.len() as f64)
+        .zip(&n_masked)
+        .map(|(c, &m)| (c.genome.genome_kmers.len() - m) as f64)
         .collect();
 
     // Outlier caps start from the pass-1 medians, but a genome sharing most of its
@@ -636,10 +673,329 @@ pub fn em_reassign(
     }
     covs.into_iter()
         .zip(params)
-        .map(|(covs, p)| EmAssignment {
+        .enumerate()
+        .map(|(g, (covs, p))| EmAssignment {
             covs,
             lambda: p.lambda,
             pi: p.pi,
+            n_masked: n_masked[g],
+            n_masked_contained: n_masked_contained[g],
+        })
+        .collect()
+}
+
+/// For each genome in `reported`, the genomes in `pool` that make its evidence
+/// ambiguous: every one of its (unmasked) k-mers in the sample is also carried by
+/// that pool genome, as a counted, tracked or repeated k-mer, while it has k-mers of
+/// its own that the pool genome lacks and none of those is in the sample. The counts
+/// then fix only the pair's combined coverage. Which of the two the EM keeps is
+/// decided by its winner-take-all start (the higher pass-1 ANI), not by the data. A
+/// genome whose k-mers are all carried by the other (a subset in the sketch) is not
+/// listed: then the other's missing k-mers do count against it. Returned as indices
+/// into `pool`, in `pool` order; a genome is never its own partner.
+pub fn shared_only_partners(
+    reported: &[&GenomeSketch],
+    pool: &[&GenomeSketch],
+    kmer_counts: &FxHashMap<Kmer, u32>,
+    mask: &FxHashSet<Kmer>,
+) -> Vec<Vec<usize>> {
+    // k-mer -> (reported genome, contained) for every reported genome's unmasked
+    // k-mers, so each pool genome is scanned once.
+    let mut index: FxHashMap<Kmer, SmallVec<[(u32, bool); 2]>> = FxHashMap::default();
+    let mut n_all = vec![0usize; reported.len()];
+    let mut n_contained = vec![0usize; reported.len()];
+    for (a, g) in reported.iter().enumerate() {
+        for k in g.genome_kmers.iter().filter(|k| !mask.contains(k)) {
+            let contained = kmer_counts.get(k).copied().unwrap_or(0) > 0;
+            n_all[a] += 1;
+            n_contained[a] += contained as usize;
+            index.entry(*k).or_default().push((a as u32, contained));
+        }
+    }
+    let per_pool: Vec<Vec<usize>> = pool
+        .par_iter()
+        .map(|x| {
+            let mut kmers: Vec<Kmer> = x
+                .genome_kmers
+                .iter()
+                .chain(x.pseudotax_tracked_nonused_kmers.iter().flatten())
+                .chain(x.repeat_kmers.iter().flatten())
+                .copied()
+                .collect();
+            kmers.sort_unstable();
+            kmers.dedup();
+            let mut shared_all = vec![0usize; reported.len()];
+            let mut shared_contained = vec![0usize; reported.len()];
+            for k in &kmers {
+                if let Some(owners) = index.get(k) {
+                    for &(a, contained) in owners {
+                        shared_all[a as usize] += 1;
+                        shared_contained[a as usize] += contained as usize;
+                    }
+                }
+            }
+            (0..reported.len())
+                .filter(|&a| {
+                    !std::ptr::eq(reported[a], *x)
+                        && n_contained[a] > 0
+                        && shared_contained[a] == n_contained[a]
+                        && shared_all[a] < n_all[a]
+                })
+                .collect()
+        })
+        .collect();
+    let mut out = vec![vec![]; reported.len()];
+    for (xi, as_) in per_pool.into_iter().enumerate() {
+        for a in as_ {
+            out[a].push(xi);
+        }
+    }
+    out
+}
+
+/// Two-rate fit to a genome's counts, from [`missing_relative_test`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct MixtureFit {
+    /// Non-zero counts of k-mers no other reported genome carries, that the fit used.
+    pub n: usize,
+    /// Log-likelihood gain of two (truncated) Poisson rates over one.
+    pub llr: f64,
+    /// The two rates, lower first. When a relative missing from the database shares
+    /// some of this genome's k-mers, `rate_low` is this genome's own coverage and
+    /// `rate_high - rate_low` the relative's.
+    pub rate_low: f64,
+    pub rate_high: f64,
+    /// Fraction of the counts at `rate_high`.
+    pub weight_high: f64,
+    /// `llr >= MIXTURE_MIN_LLR` and both rates carry at least `MIXTURE_MIN_WEIGHT`
+    /// of the counts.
+    pub flagged: bool,
+}
+
+/// Fewest single-carrier non-zero counts the mixture test is attempted on.
+pub const MIXTURE_MIN_KMERS: usize = 100;
+/// Smallest log-likelihood gain flagged. Simulated controls (16 genomes, 21 mixes,
+/// repeats tracked) stayed below 7; detected missing relatives gave 86 to 97,000.
+pub const MIXTURE_MIN_LLR: f64 = 50.;
+/// Smallest fraction of counts either rate must carry to be flagged. In the same
+/// controls, residual high-count k-mers (of repeats a sketch had dropped) formed a
+/// second rate of at most 5% of the counts; missing relatives gave 12% to 88%.
+pub const MIXTURE_MIN_WEIGHT: f64 = 0.1;
+
+/// Poisson(r) truncated to counts `1..=cap`: `ln P(c)` and the truncated mean.
+struct TruncPoisson<'a> {
+    ln_fact: &'a [f64],
+    cap: usize,
+}
+
+impl TruncPoisson<'_> {
+    /// `ln Σ_{c=1}^{cap} e^-r r^c / c!` and the mean over that range.
+    fn norm_and_mean(&self, r: f64) -> (f64, f64) {
+        let lr = r.ln();
+        let terms: Vec<f64> = (1..=self.cap)
+            .map(|c| c as f64 * lr - r - self.ln_fact[c])
+            .collect();
+        let m = terms.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let (mut z, mut zc) = (0., 0.);
+        for (i, t) in terms.iter().enumerate() {
+            let e = (t - m).exp();
+            z += e;
+            zc += (i + 1) as f64 * e;
+        }
+        (m + z.ln(), zc / z)
+    }
+    fn ln_p(&self, c: usize, r: f64, ln_norm: f64) -> f64 {
+        c as f64 * r.ln() - r - self.ln_fact[c] - ln_norm
+    }
+    /// The rate whose truncated mean is `mean` (the maximum-likelihood rate for
+    /// counts with that mean); the truncated mean is increasing in the rate.
+    fn rate_for_mean(&self, mean: f64) -> f64 {
+        if mean <= 1. + 1e-9 {
+            return 1e-6;
+        }
+        let (mut lo, mut hi) = (1e-6, (self.cap as f64) * 4. + 10.);
+        if mean >= self.norm_and_mean(hi).1 {
+            return hi;
+        }
+        for _ in 0..100 {
+            let mid = 0.5 * (lo + hi);
+            if self.norm_and_mean(mid).1 < mean {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        0.5 * (lo + hi)
+    }
+}
+
+/// One- vs two-component fit to a histogram of counts in `1..=cap` (`hist[c]` =
+/// number of k-mers with count `c`; the histogram's length is `cap + 1`). Each
+/// component is a Poisson truncated to that range, so leaving out the counts above
+/// the cap does not pull the higher rate down. EM from a few starts; the best
+/// two-component fit is kept. Returns `(llr, rate_low, rate_high, weight_high)`.
+fn fit_ztp_mixture(hist: &[f64]) -> Option<(f64, f64, f64, f64)> {
+    let n: f64 = hist.iter().skip(1).sum();
+    if n <= 0. || hist.len() < 3 {
+        return None;
+    }
+    let cap = hist.len() - 1;
+    let mut ln_fact = vec![0f64; cap + 1];
+    for c in 2..=cap {
+        ln_fact[c] = ln_fact[c - 1] + (c as f64).ln();
+    }
+    let tp = TruncPoisson {
+        ln_fact: &ln_fact,
+        cap,
+    };
+    let mean = hist
+        .iter()
+        .enumerate()
+        .map(|(c, w)| c as f64 * w)
+        .sum::<f64>()
+        / n;
+    if mean <= 1. + 1e-9 {
+        // Every count is 1: no rate information at all.
+        return None;
+    }
+    let ll = |w: f64, r1: f64, r2: f64| -> f64 {
+        let (z1, z2) = (tp.norm_and_mean(r1).0, tp.norm_and_mean(r2).0);
+        hist.iter()
+            .enumerate()
+            .skip(1)
+            .filter(|(_, &h)| h > 0.)
+            .map(|(c, &h)| {
+                let a = (1. - w).ln() + tp.ln_p(c, r1, z1);
+                let b = w.ln() + tp.ln_p(c, r2, z2);
+                let m = a.max(b);
+                h * (m + ((a - m).exp() + (b - m).exp()).ln())
+            })
+            .sum()
+    };
+    let r0 = tp.rate_for_mean(mean);
+    let z0 = tp.norm_and_mean(r0).0;
+    let ll1: f64 = hist
+        .iter()
+        .enumerate()
+        .skip(1)
+        .map(|(c, &h)| h * tp.ln_p(c, r0, z0))
+        .sum();
+    let mut best: Option<(f64, f64, f64, f64)> = None;
+    for &(w0, f1, f2) in &[
+        (0.5, 0.7, 1.5),
+        (0.2, 0.9, 2.0),
+        (0.8, 0.5, 1.1),
+        (0.1, 1.0, 3.0),
+    ] {
+        let (mut w, mut r1, mut r2): (f64, f64, f64) = (w0, r0 * f1, r0 * f2);
+        let mut prev = f64::NEG_INFINITY;
+        for _ in 0..500 {
+            let (z1, z2) = (tp.norm_and_mean(r1).0, tp.norm_and_mean(r2).0);
+            let (mut sw, mut s1, mut s2) = (0., 0., 0.);
+            for (c, &h) in hist.iter().enumerate().skip(1) {
+                if h <= 0. {
+                    continue;
+                }
+                let a = (1. - w).ln() + tp.ln_p(c, r1, z1);
+                let b = w.ln() + tp.ln_p(c, r2, z2);
+                let q = 1. / (1. + (a - b).exp());
+                sw += h * q;
+                s2 += h * q * c as f64;
+                s1 += h * (1. - q) * c as f64;
+            }
+            w = (sw / n).clamp(1e-6, 1. - 1e-6);
+            r1 = tp.rate_for_mean(s1 / (n - sw).max(1e-9));
+            r2 = tp.rate_for_mean(s2 / sw.max(1e-9));
+            let cur = ll(w, r1, r2);
+            if (cur - prev).abs() < 1e-7 {
+                break;
+            }
+            prev = cur;
+        }
+        // Orient so the second component is the higher rate.
+        let (rl, rh, wh) = if r1 <= r2 {
+            (r1, r2, w)
+        } else {
+            (r2, r1, 1. - w)
+        };
+        let llr = ll(w, r1, r2) - ll1;
+        if best.is_none_or(|b| llr > b.0) {
+            best = Some((llr, rl, rh, wh));
+        }
+    }
+    best
+}
+
+/// Does a genome's coverage look like one rate or two? Run on the final EM
+/// candidates, i.e. the reported genomes, with their fitted `(π, λ)`.
+///
+/// Only k-mers that no other reported genome carries (as a counted, tracked or
+/// repeated k-mer) are used, with repeats masked (see [`repeat_mask`]) and counts
+/// above `cap = max(4πλ, πλ + 15)` left out (high-copy elements the sketches do not
+/// know about). Their non-zero counts should follow one Poisson truncated to
+/// `1..=cap`. A related genome that is in the sample but not in the
+/// database adds its coverage to the k-mers it shares with this one, giving a
+/// second, higher rate on that fraction of them. A strain present *instead* of this
+/// genome gives no second rate (it shows as a low ANI and π instead).
+///
+/// Not attempted (None) with fewer than [`MIXTURE_MIN_KMERS`] such counts or when
+/// they are all 1: below about 0.5x the counts carry no rate information. Two rates
+/// also arise without any missing relative from heterozygosity (k-mers over
+/// heterozygous sites at half coverage) and from repeats an assembly collapsed, so
+/// a flag on a eukaryote is weak evidence.
+pub fn missing_relative_test(
+    genomes: &[&GenomeSketch],
+    params: &[(f64, f64)],
+    kmer_counts: &FxHashMap<Kmer, u32>,
+    mask: &FxHashSet<Kmer>,
+) -> Vec<Option<MixtureFit>> {
+    // How many reported genomes carry each k-mer, counting every way of carrying it.
+    let mut n_carriers: FxHashMap<Kmer, u32> = FxHashMap::default();
+    for g in genomes {
+        let mut ks: Vec<Kmer> = g
+            .genome_kmers
+            .iter()
+            .chain(g.pseudotax_tracked_nonused_kmers.iter().flatten())
+            .chain(g.repeat_kmers.iter().flatten())
+            .copied()
+            .filter(|k| kmer_counts.contains_key(k))
+            .collect();
+        ks.sort_unstable();
+        ks.dedup();
+        for k in ks {
+            *n_carriers.entry(k).or_default() += 1;
+        }
+    }
+    genomes
+        .par_iter()
+        .zip(params.par_iter())
+        .map(|(g, &(pi, lambda))| {
+            let mu = pi * lambda;
+            let cap = (4. * mu).max(mu + 15.).floor() as usize;
+            let mut hist: Vec<f64> = vec![0.; cap + 1];
+            let mut n = 0;
+            for k in g.genome_kmers.iter() {
+                let c = kmer_counts.get(k).copied().unwrap_or(0) as usize;
+                if c == 0 || c > cap || mask.contains(k) || n_carriers[k] != 1 {
+                    continue;
+                }
+                hist[c] += 1.;
+                n += 1;
+            }
+            if n < MIXTURE_MIN_KMERS {
+                return None;
+            }
+            let (llr, rate_low, rate_high, weight_high) = fit_ztp_mixture(&hist)?;
+            let llr = llr.max(0.);
+            Some(MixtureFit {
+                n,
+                llr,
+                rate_low,
+                rate_high,
+                weight_high,
+                flagged: llr >= MIXTURE_MIN_LLR
+                    && weight_high.min(1. - weight_high) >= MIXTURE_MIN_WEIGHT,
+            })
         })
         .collect()
 }
@@ -1029,5 +1385,177 @@ mod tests {
             assert_eq!(cx, cy);
             assert_eq!(x.lambda.to_bits(), y.lambda.to_bits());
         }
+    }
+
+    /// A rare genome beside an abundant relative whose repeats (dropped from the
+    /// relative's counted k-mers) are among the rare genome's single-copy k-mers.
+    /// Their counts are the relative's coverage times its copy number, so without the
+    /// repeat mask they inflate the rare genome's λ; with it they are left out of its
+    /// fit and its k-mer total.
+    #[test]
+    fn test_em_masks_relatives_repeats() {
+        let mut rng = fastrand::Rng::with_seed(9);
+        let (lx, ly) = (8., 0.5);
+        let ux: Vec<Kmer> = (0..10_000).collect();
+        let uy: Vec<Kmer> = (20_000..22_000).collect();
+        let rep: Vec<Kmer> = (30_000..30_300).collect();
+        let mut counts = FxHashMap::default();
+        for k in ux.iter() {
+            counts.insert(*k, pois(&mut rng, lx));
+        }
+        for k in uy.iter() {
+            counts.insert(*k, pois(&mut rng, ly));
+        }
+        for k in rep.iter() {
+            // Two copies in x, one in y.
+            counts.insert(*k, pois(&mut rng, 2. * lx + ly));
+        }
+        let gx = GenomeSketch {
+            repeat_kmers: Some(rep.clone()),
+            ..genome(ux, "x")
+        };
+        let gy = genome([uy, rep].concat(), "y");
+        fn cands<'a>(gx: &'a GenomeSketch, gy: &'a GenomeSketch) -> Vec<EmCandidate<'a>> {
+            vec![
+                EmCandidate {
+                    genome: gx,
+                    ani: 0.999,
+                    cov: 8.,
+                    median_cov: 8.,
+                },
+                EmCandidate {
+                    genome: gy,
+                    ani: 0.999,
+                    cov: 0.5,
+                    median_cov: 1.,
+                },
+            ]
+        }
+        let res = em_reassign(&cands(&gx, &gy), &counts, false);
+        assert_eq!((res[1].n_masked, res[1].n_masked_contained), (300, 300));
+        assert_eq!(res[0].n_masked, 0);
+        assert!((res[1].lambda - ly).abs() < 0.06, "{}", res[1].lambda);
+        assert!(res[1].covs.iter().all(|&c| c < 10));
+        // Without the repeats known, the same counts inflate y.
+        let gx_unknown = GenomeSketch {
+            repeat_kmers: None,
+            ..gx.clone()
+        };
+        let res = em_reassign(&cands(&gx_unknown, &gy), &counts, false);
+        assert_eq!(res[1].n_masked, 0);
+        assert!(res[1].covs.iter().filter(|&&c| c >= 10).count() > 250);
+    }
+
+    /// The shared-only report: a reported genome whose found k-mers are all carried
+    /// by another candidate, while none of its own were found, names that candidate;
+    /// a genome with found k-mers of its own, or one that is a subset of the other
+    /// in the sketch, does not.
+    #[test]
+    fn test_shared_only_partners() {
+        let core: Vec<Kmer> = (0..100).collect();
+        let a = genome([core.clone(), (1000..1050).collect()].concat(), "a");
+        let b = genome([core.clone(), (2000..2050).collect()].concat(), "b");
+        let sub = genome(core[..50].to_vec(), "sub");
+        let mut counts = FxHashMap::default();
+        for k in core.iter() {
+            counts.insert(*k, 3);
+        }
+        let none = FxHashSet::default();
+        let pool = [&a, &b, &sub];
+        let p = shared_only_partners(&[&a, &sub], &pool, &counts, &none);
+        // a's found k-mers (the core) are all in b, and a's own 50 were not found.
+        assert_eq!(p[0], vec![1]);
+        // `sub` is a subset of a and of b: their missing k-mers count against them.
+        assert!(p[1].is_empty());
+        // Once one of a's own k-mers is found, a has evidence of its own.
+        counts.insert(1000, 1);
+        assert!(shared_only_partners(&[&a], &pool, &counts, &none)[0].is_empty());
+        // A k-mer b carries only as a repeat still counts as carried by b.
+        counts.remove(&1000);
+        let b_rep = GenomeSketch {
+            repeat_kmers: Some(vec![99]),
+            ..genome(core[..99].to_vec(), "b_rep")
+        };
+        let b_rep_and_own = GenomeSketch {
+            genome_kmers: [b_rep.genome_kmers.clone(), (3000..3010).collect()].concat(),
+            ..b_rep.clone()
+        };
+        let p = shared_only_partners(&[&a], &[&a, &b_rep_and_own], &counts, &none);
+        assert_eq!(p[0], vec![1]);
+    }
+
+    /// The two-rate fit recovers both rates and the mixing weight, and finds
+    /// nothing in counts from a single rate.
+    #[test]
+    fn test_fit_ztp_mixture() {
+        let mut rng = fastrand::Rng::with_seed(5);
+        // Counts above 18 are left out, as `missing_relative_test` caps them.
+        let mut two = vec![0.; 19];
+        let mut one = vec![0.; 19];
+        for i in 0..20_000 {
+            let c = if i % 4 == 0 {
+                pois(&mut rng, 12.)
+            } else {
+                pois(&mut rng, 6.)
+            } as usize;
+            if c > 0 && c <= 18 {
+                two[c] += 1.;
+            }
+            let c = pois(&mut rng, 6.) as usize;
+            if c > 0 && c <= 18 {
+                one[c] += 1.;
+            }
+        }
+        let (llr, lo, hi, w) = fit_ztp_mixture(&two).unwrap();
+        assert!(llr > 500., "{}", llr);
+        assert!(
+            (lo - 6.).abs() < 0.2 && (hi - 12.).abs() < 0.4,
+            "{} {}",
+            lo,
+            hi
+        );
+        assert!((w - 0.25).abs() < 0.03, "{}", w);
+        let (llr, ..) = fit_ztp_mixture(&one).unwrap();
+        assert!(llr < 10., "{}", llr);
+        // All counts 1: nothing to fit.
+        assert!(fit_ztp_mixture(&[0., 500., 0., 0.]).is_none());
+    }
+
+    /// `missing_relative_test` uses only k-mers no other reported genome carries:
+    /// k-mers shared with a reported genome (or its tracked/repeat k-mers) are left
+    /// out, so a reported relative never looks like a missing one.
+    #[test]
+    fn test_missing_relative_test_single_carrier_only() {
+        let mut rng = fastrand::Rng::with_seed(6);
+        let ux: Vec<Kmer> = (0..6000).collect();
+        let hidden: Vec<Kmer> = (10_000..12_000).collect();
+        let shared_reported: Vec<Kmer> = (20_000..22_000).collect();
+        let mut counts = FxHashMap::default();
+        for k in ux.iter() {
+            counts.insert(*k, pois(&mut rng, 6.));
+        }
+        for k in hidden.iter().chain(shared_reported.iter()) {
+            // x plus a second genome at 6x
+            counts.insert(*k, pois(&mut rng, 12.));
+        }
+        let gx = genome([ux.clone(), shared_reported.clone()].concat(), "x");
+        // y is reported and carries shared_reported (as tracked k-mers).
+        let gy = GenomeSketch {
+            pseudotax_tracked_nonused_kmers: Some(shared_reported.clone()),
+            ..genome((50_000..50_100).collect(), "y")
+        };
+        let none = FxHashSet::default();
+        let r = missing_relative_test(&[&gx, &gy], &[(1., 6.), (1., 6.)], &counts, &none);
+        let fx = r[0].as_ref().unwrap();
+        assert!(!fx.flagged, "{:?}", fx);
+        assert!(r[1].is_none()); // y's own k-mers were never seen
+                                 // x's k-mers shared with an unreported (missing) genome do give two rates.
+        let gx2 = genome([ux, hidden].concat(), "x2");
+        let r = missing_relative_test(&[&gx2], &[(1., 6.)], &counts, &none);
+        let fx = r[0].as_ref().unwrap();
+        assert!(fx.flagged, "{:?}", fx);
+        assert!((fx.rate_low - 6.).abs() < 0.3, "{:?}", fx);
+        assert!((fx.rate_high - 12.).abs() < 0.6, "{:?}", fx);
+        assert!((fx.weight_high - 0.25).abs() < 0.04, "{:?}", fx);
     }
 }

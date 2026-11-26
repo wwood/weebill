@@ -44,6 +44,16 @@
 //! stage-1 screen are decoded (and cached across samples) to reconstruct their
 //! exact `GenomeSketch` for the dense profiling pass.
 //!
+//! **Repeat tracking (version 4).** A version-4 database also stores, at the end of
+//! each dense block, the genome's *repeated* sampled k-mers (`GenomeSketch::repeat_kmers`):
+//! those occurring more than once in the genome, which sketching leaves out of
+//! `genome_kmers`. They are one more sorted, delta- and Golomb-Rice-coded hash set: for
+//! bacteria a few hundred repeats, ~1.4 kB per genome, ~1% of the database.
+//! `profile --reassign em` and `--detect-missing-relatives` need them, so they need a
+//! version-4 database. Repeats can only be found from sequence, which a `.syldb` does
+//! not keep, so a version-4 database is built from FASTA (`db-convert -g`), and only
+//! when every genome in it was; the header and footer are unchanged from version 3.
+//!
 //! ## Adding genomes
 //!
 //! Because each genome's dense block is independent and self-delimiting, growing a
@@ -90,6 +100,9 @@ const MAGIC: &[u8; 4] = b"SY2D";
 /// Format version written here (dense Golomb-Rice blocks + pooled-MPHF stage-1 screen
 /// index + whole-file checksum).
 const VERSION: u8 = 3;
+/// [`VERSION`] plus each genome's repeated k-mers at the end of its dense block (see
+/// the module docs). Written when every genome's repeats are known.
+const VERSION_REPEATS: u8 = 4;
 /// Upstream sylph's version of the same format, without the whole-file checksum.
 /// Readable here (see [`parse_header`]); anything older must be rebuilt with
 /// `db-convert`.
@@ -610,7 +623,10 @@ impl ScreenIndex {
 /// Golomb-Rice encode one genome's dense region: its `genome_kmers` block, the
 /// pseudotax flag, and (if present) its `pseudotax_tracked_nonused_kmers` block.
 /// The inverse of the closure in [`TwoStageDb::decode_dense`].
-fn encode_dense_block(gs: &GenomeSketch) -> Vec<u8> {
+///
+/// With `repeats` (a version-4 database) the genome's repeated k-mers follow as a
+/// third hash set; the caller guarantees they are known.
+fn encode_dense_block(gs: &GenomeSketch, repeats: bool) -> Vec<u8> {
     let mut block = Vec::new();
     write_hashes(&mut block, &gs.genome_kmers);
     match &gs.pseudotax_tracked_nonused_kmers {
@@ -619,6 +635,9 @@ fn encode_dense_block(gs: &GenomeSketch) -> Vec<u8> {
             write_hashes(&mut block, p);
         }
         None => block.push(0),
+    }
+    if repeats {
+        write_hashes(&mut block, gs.repeat_kmers.as_deref().unwrap_or(&[]));
     }
     block
 }
@@ -751,18 +770,23 @@ pub struct DbBuilder<W: Write + Seek> {
     min_sparse_kmers: usize,
     genomes: Vec<GenomeMeta>,
     sparse_per_genome: Vec<Vec<u64>>,
+    /// Writing a version-4 (repeat-tracking) database.
+    repeats: bool,
 }
 
 impl<W: Write + Seek> DbBuilder<W> {
+    /// `repeats` selects the version-4 layout, which stores every genome's repeated
+    /// k-mers; [`DbBuilder::push_sketch`] then refuses a sketch that lacks them.
     pub fn new(
         mut w: W,
         c: usize,
         k: usize,
         screen_c: usize,
         min_sparse_kmers: usize,
+        repeats: bool,
     ) -> io::Result<DbBuilder<W>> {
         w.write_all(MAGIC)?;
-        w.write_all(&[VERSION])?;
+        w.write_all(&[if repeats { VERSION_REPEATS } else { VERSION }])?;
         w.write_all(&0u64.to_le_bytes())?; // checksum, patched by finish()
         w.write_all(&0u64.to_le_bytes())?; // index offset, patched by finish()
         w.write_all(&0u64.to_le_bytes())?; // footer offset, patched by finish()
@@ -777,11 +801,14 @@ impl<W: Write + Seek> DbBuilder<W> {
             min_sparse_kmers,
             genomes: Vec::new(),
             sparse_per_genome: Vec::new(),
+            repeats,
         })
     }
 
     /// Append a genome whose dense block is *already* encoded — copied verbatim out
-    /// of an existing database, so it is never decoded and re-encoded. `sparse` is
+    /// of an existing database, so it is never decoded and re-encoded. The block must
+    /// be in this builder's layout (with repeats or without), i.e. come from a
+    /// database of the same version. `sparse` is
     /// its stage-1 subset at this builder's `screen_c` and `meta` its metadata; the
     /// `dense_offset` in `meta` is ignored and replaced with the offset in this file.
     pub fn push_encoded(
@@ -803,7 +830,18 @@ impl<W: Write + Seek> DbBuilder<W> {
     /// Append a genome sketch, encoding its dense block and deriving its stage-1
     /// sparse subset.
     pub fn push_sketch(&mut self, gs: &GenomeSketch) -> io::Result<()> {
-        let block = encode_dense_block(gs);
+        if self.repeats && gs.repeat_kmers.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "genome '{}' has no repeated-k-mer information (it was loaded from a \
+                     .syldb, which does not keep it), so it cannot go into a version-{} \
+                     (repeat-tracking) database; sketch it from its FASTA instead",
+                    gs.file_name, VERSION_REPEATS
+                ),
+            ));
+        }
+        let block = encode_dense_block(gs, self.repeats);
         let sparse = select_sparse(&gs.genome_kmers, self.screen_c, self.min_sparse_kmers);
         if sparse.len() < SPARSE_WARN_THRESHOLD.min(self.min_sparse_kmers) {
             warn!(
@@ -926,6 +964,9 @@ fn meta_of(gs: &GenomeSketch, dense_offset: u64) -> GenomeMeta {
 /// none, which can leave a small genome with an empty screen entry -- invisible to the
 /// stage-1 screen unless the reader recovers it ([`TwoStageDb::enable_small_genome_screen`]).
 /// Dense blocks are Golomb-Rice coded.
+///
+/// The database is version 4 (repeat-tracking) when every sketch knows its repeated
+/// k-mers, and version 3 otherwise.
 pub fn write_two_stage_db<W: Write + Seek>(
     w: W,
     sketches: &[GenomeSketch],
@@ -934,7 +975,8 @@ pub fn write_two_stage_db<W: Write + Seek>(
 ) -> io::Result<()> {
     let c = sketches.first().map(|s| s.c).unwrap_or(0);
     let k = sketches.first().map(|s| s.k).unwrap_or(0);
-    let mut builder = DbBuilder::new(w, c, k, screen_c, min_sparse_kmers)?;
+    let repeats = !sketches.is_empty() && sketches.iter().all(|s| s.repeat_kmers.is_some());
+    let mut builder = DbBuilder::new(w, c, k, screen_c, min_sparse_kmers, repeats)?;
     for gs in sketches {
         builder.push_sketch(gs)?;
     }
@@ -981,6 +1023,8 @@ pub struct TwoStageDb {
     checksum: Option<u64>,
     /// Header length of the file as opened; the checksum covers everything after it.
     header_len: u64,
+    /// Version 4: dense blocks end with each genome's repeated k-mers.
+    repeats: bool,
     /// File offset where the dense-block region ends (start of the screen index);
     /// used to bound the last genome's block for positional reads.
     index_offset: u64,
@@ -1055,6 +1099,7 @@ pub struct CopiedGenome {
 /// whose header has no checksum field.
 struct Header {
     len: u64,
+    version: u8,
     checksum: Option<u64>,
     index_offset: u64,
     footer_offset: u64,
@@ -1077,14 +1122,14 @@ fn parse_header(hdr: &[u8]) -> io::Result<Header> {
     }
     let version = hdr[4];
     let (len, checksum_bytes) = match version {
-        VERSION => (HEADER_LEN, Some(5..13)),
+        VERSION | VERSION_REPEATS => (HEADER_LEN, Some(5..13)),
         VERSION_NO_CHECKSUM => (HEADER_LEN_V2, None),
         other => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "two-stage database is version {}, but only versions {} and {} are readable; rebuild it with db-convert",
-                    other, VERSION_NO_CHECKSUM, VERSION
+                    "two-stage database is version {}, but only versions {} to {} are readable; rebuild it with db-convert",
+                    other, VERSION_NO_CHECKSUM, VERSION_REPEATS
                 ),
             ))
         }
@@ -1102,6 +1147,7 @@ fn parse_header(hdr: &[u8]) -> io::Result<Header> {
         u64::from_le_bytes(hdr[offsets_at + 8..offsets_at + 16].try_into().unwrap());
     Ok(Header {
         len,
+        version,
         checksum,
         index_offset,
         footer_offset,
@@ -1121,6 +1167,7 @@ fn build_db(
         screen_c: footer.screen_c,
         checksum: header.checksum,
         header_len: header.len,
+        repeats: header.version == VERSION_REPEATS,
         index_offset: header.index_offset,
         genomes: footer.genomes,
         screen_index,
@@ -1163,6 +1210,23 @@ impl TwoStageDb {
     }
     pub fn is_empty(&self) -> bool {
         self.genomes.is_empty()
+    }
+
+    /// Whether this is a version-4 database, storing every genome's repeated k-mers
+    /// (which `profile --reassign em` requires).
+    pub fn tracks_repeats(&self) -> bool {
+        self.repeats
+    }
+
+    /// The on-disk format version.
+    pub fn version(&self) -> u8 {
+        if self.repeats {
+            VERSION_REPEATS
+        } else if self.checksum.is_some() {
+            VERSION
+        } else {
+            VERSION_NO_CHECKSUM
+        }
     }
 
     /// Source file name of genome `g` (for `--screen-dump` and diagnostics).
@@ -1346,7 +1410,7 @@ impl TwoStageDb {
     /// unless it passes -- so the discarded majority is never cached.
     pub fn decode_dense(&self, g: u32) -> io::Result<GenomeSketch> {
         let meta = &self.genomes[g as usize];
-        let (genome_kmers, pseudotax) = self.with_block(g, |bytes| {
+        let (genome_kmers, pseudotax, repeat_kmers) = self.with_block(g, |bytes| {
             let mut cur = bytes;
             let gk = read_hashes(&mut cur)?;
             let mut flag = [0u8; 1];
@@ -1356,11 +1420,17 @@ impl TwoStageDb {
             } else {
                 None
             };
-            Ok((gk, pt))
+            let rep = if self.repeats {
+                Some(read_hashes(&mut cur)?)
+            } else {
+                None
+            };
+            Ok((gk, pt, rep))
         })?;
         Ok(GenomeSketch {
             genome_kmers,
             pseudotax_tracked_nonused_kmers: pseudotax,
+            repeat_kmers,
             file_name: meta.file_name.clone(),
             first_contig_name: meta.first_contig_name.clone(),
             c: self.c,
@@ -1530,8 +1600,23 @@ pub fn run_db_convert(args: DbConvertArgs) {
         .build_global()
         .ok();
 
-    if args.files.is_empty() {
-        error!("No genome database sketches (*.syldb) supplied; exiting");
+    let mut genome_files = args.genomes.clone();
+    if let Some(list) = &args.list_genomes {
+        let text = std::fs::read_to_string(list).unwrap_or_else(|e| {
+            error!("Could not read genome list {}: {}. Exiting", list, e);
+            std::process::exit(1);
+        });
+        genome_files.extend(
+            text.lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(String::from),
+        );
+    }
+    if args.files.is_empty() && genome_files.is_empty() {
+        error!(
+            "No genomes supplied: give database sketches (*.syldb/*.syldbc) as arguments and/or FASTA files with -g/--gl. Exiting"
+        );
         std::process::exit(1);
     }
 
@@ -1539,6 +1624,33 @@ pub fn run_db_convert(args: DbConvertArgs) {
     for f in &args.files {
         info!("Loading genome sketches from {}", f);
         sketches.extend(load_genome_sketches(f));
+    }
+    if !genome_files.is_empty() {
+        if args.k != 21 && args.k != 31 {
+            error!("-k must be 21 or 31. Exiting");
+            std::process::exit(1);
+        }
+        info!(
+            "Sketching {} genome fasta(s) at -c {} -k {} --min-spacing {}",
+            genome_files.len(),
+            args.c,
+            args.k,
+            args.min_spacing_kmer
+        );
+        let sketched: Vec<GenomeSketch> = genome_files
+            .par_iter()
+            .filter_map(|g| {
+                crate::sketch::sketch_genome(args.c, args.k, g, args.min_spacing_kmer, true)
+            })
+            .collect();
+        if sketched.len() < genome_files.len() {
+            warn!(
+                "Only {} of {} genome fasta(s) could be sketched; the rest were skipped",
+                sketched.len(),
+                genome_files.len()
+            );
+        }
+        sketches.extend(sketched);
     }
     if sketches.is_empty() {
         error!("No genome sketches found in input; exiting");
@@ -1596,6 +1708,28 @@ pub fn run_db_convert(args: DbConvertArgs) {
         args.small_genome_screen,
         out
     );
+    let repeats = sketches.iter().all(|s| s.repeat_kmers.is_some());
+    if repeats {
+        let n: usize = sketches
+            .iter()
+            .map(|s| s.repeat_kmers.as_ref().map_or(0, Vec::len))
+            .sum();
+        info!(
+            "Recording {} repeated k-mers across {} genomes (format version {}, as `profile --reassign em` requires)",
+            n,
+            sketches.len(),
+            VERSION_REPEATS
+        );
+    } else {
+        warn!(
+            "Writing a version-{} database: {} of {} genomes came from a .syldb, which does not \
+             record repeated k-mers, so this database cannot be used with `profile --reassign em`. \
+             Build from FASTA (-g/--gl) for that.",
+            VERSION,
+            sketches.iter().filter(|s| s.repeat_kmers.is_none()).count(),
+            sketches.len()
+        );
+    }
     let w =
         BufWriter::new(File::create(&out).unwrap_or_else(|_| panic!("Could not create {}", out)));
     let floor = args.small_genome_screen.sparse_floor(args.min_sparse_kmers);
@@ -1718,6 +1852,14 @@ pub fn run_db_add(args: DbAddArgs) {
     // made sparser but never denser, and a -c/-k mismatch would silently make the
     // added genomes' k-mers incomparable to the existing ones.
     for s in &new_sketches {
+        if db.tracks_repeats() && s.repeat_kmers.is_none() {
+            error!(
+                "{} is a version-{} database, which records every genome's repeated k-mers, but \
+                 genome '{}' came from a .syldb, which does not; add it from its FASTA with -g. Exiting",
+                args.database, VERSION_REPEATS, s.file_name
+            );
+            std::process::exit(1);
+        }
         if s.c != db.c || s.k != db.k {
             error!(
                 "Genome '{}' was sketched with -c {} -k {}, but {} is -c {} -k {}; re-sketch the added genomes to match. Exiting",
@@ -1846,7 +1988,8 @@ pub fn run_db_add(args: DbAddArgs) {
         let floor = args
             .small_genome_screen
             .sparse_floor(args.min_sparse_kmers.max(1));
-        let mut builder = DbBuilder::new(w, db.c, db.k, db.screen_c, floor)?;
+        // The copied blocks keep their layout, so the output keeps the input's version.
+        let mut builder = DbBuilder::new(w, db.c, db.k, db.screen_c, floor, db.tracks_repeats())?;
         // Chunked so the reads/decodes of a chunk run in parallel while the writer
         // stays sequential (block order defines the footer offsets). Keeping at most
         // one decoded block per Rayon worker bounds transient dense-block memory by
@@ -1965,7 +2108,51 @@ mod tests {
             k: 31,
             gn_size: 12345,
             min_spacing: 30,
+            repeat_kmers: None,
         }
+    }
+
+    /// When every genome knows its repeats the database is version 4 and gives them
+    /// back on decode; one genome without them (as from a .syldb) makes it version 3,
+    /// whose decoded sketches report the repeats as unknown.
+    #[test]
+    fn repeat_kmers_roundtrip_and_version() {
+        let mut g0 = gsketch("g0.fa", vec![1, 2, 3, 40], Some(vec![9]));
+        g0.repeat_kmers = Some(vec![5, 77, 1_000_000_007]);
+        let mut g1 = gsketch("g1.fa", vec![6, 7], Some(vec![]));
+        g1.repeat_kmers = Some(vec![]);
+
+        let db = open(std::io::Cursor::new(write_db_to_vec(
+            &[g0.clone(), g1.clone()],
+            200,
+        )))
+        .unwrap();
+        assert!(db.tracks_repeats());
+        assert_eq!(db.version(), VERSION_REPEATS);
+        let d0 = db.decode_dense(0).unwrap();
+        assert_eq!(d0.repeat_kmers, Some(vec![5, 77, 1_000_000_007]));
+        assert_eq!(d0.genome_kmers, vec![1, 2, 3, 40]);
+        assert_eq!(d0.pseudotax_tracked_nonused_kmers, Some(vec![9]));
+        assert_eq!(db.decode_dense(1).unwrap().repeat_kmers, Some(vec![]));
+        assert!(db.verify_checksum().unwrap());
+
+        g1.repeat_kmers = None;
+        let db3 = open(std::io::Cursor::new(write_db_to_vec(&[g0, g1], 200))).unwrap();
+        assert!(!db3.tracks_repeats());
+        assert_eq!(db3.version(), VERSION);
+        assert_eq!(db3.decode_dense(0).unwrap().repeat_kmers, None);
+    }
+
+    /// A version-4 builder refuses a genome whose repeats are unknown rather than
+    /// silently recording it as repeat-free.
+    #[test]
+    fn repeat_builder_rejects_unknown_repeats() {
+        let mut cur = std::io::Cursor::new(Vec::new());
+        let mut b = DbBuilder::new(&mut cur, 50, 31, 200, 1, true).unwrap();
+        let err = b
+            .push_sketch(&gsketch("g.fa", vec![1, 2], Some(vec![])))
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
 
     #[test]
@@ -2129,7 +2316,8 @@ mod tests {
         )))
         .unwrap();
         let mut cur = std::io::Cursor::new(Vec::new());
-        let mut builder = DbBuilder::new(&mut cur, base.c, base.k, base.screen_c, 1).unwrap();
+        let mut builder =
+            DbBuilder::new(&mut cur, base.c, base.k, base.screen_c, 1, false).unwrap();
         for g in 0..base.len() as u32 {
             let copied = base.raw_block_and_sparse(g).unwrap();
             builder
@@ -2246,9 +2434,16 @@ mod tests {
         // v3 read would fill; that must not be mistaken for truncation.
         assert!(parse_header(&v2[..v2.len() - 1]).is_err());
 
+        // Version 4 shares version 3's header.
+        let mut v4 = v3.clone();
+        v4[4] = VERSION_REPEATS;
+        let h = parse_header(&v4).unwrap();
+        assert_eq!((h.len, h.version), (HEADER_LEN, VERSION_REPEATS));
+        assert_eq!((h.index_offset, h.footer_offset), (111, 222));
+
         // Unknown version, and a v3 header cut short.
         let mut future = v3.clone();
-        future[4] = VERSION + 1;
+        future[4] = VERSION_REPEATS + 1;
         assert!(parse_header(&future).is_err());
         assert!(parse_header(&v3[..HEADER_LEN as usize - 1]).is_err());
         assert!(parse_header(b"NOPE").is_err());
@@ -2324,7 +2519,8 @@ mod tests {
         )))
         .unwrap();
         let mut cur = std::io::Cursor::new(Vec::new());
-        let mut builder = DbBuilder::new(&mut cur, base.c, base.k, base.screen_c, 5).unwrap();
+        let mut builder =
+            DbBuilder::new(&mut cur, base.c, base.k, base.screen_c, 5, false).unwrap();
         for g in 0..base.len() as u32 {
             let copied = base.raw_block_and_sparse(g).unwrap();
             builder
@@ -2417,7 +2613,8 @@ mod tests {
         // What `run_db_add` does: copy the existing blocks through with their stored
         // sparse sets, then select the new genome at the recovered nominal rate.
         let mut cur = std::io::Cursor::new(Vec::new());
-        let mut builder = DbBuilder::new(&mut cur, base.c, base.k, base.screen_c, 5).unwrap();
+        let mut builder =
+            DbBuilder::new(&mut cur, base.c, base.k, base.screen_c, 5, false).unwrap();
         let mut smallest_excluded: Option<u64> = None;
         for g in 0..base.len() as u32 {
             let copied = base.raw_block_and_sparse(g).unwrap();

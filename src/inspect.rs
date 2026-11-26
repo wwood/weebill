@@ -93,6 +93,13 @@ struct SeekableDatabaseInspect {
     /// `.sylref` only: whether genome sequences are stored (`ref-build --store-genomes`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stores_genome_sequences: Option<bool>,
+    /// `.syl2db` only: on-disk format version.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<u8>,
+    /// `.syl2db` only: whether each genome's repeated k-mers are recorded (version 4),
+    /// as `profile --reassign em` requires.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tracks_repeats: Option<bool>,
 }
 
 #[derive(Debug, Default)]
@@ -235,6 +242,8 @@ fn get_seekable_db_inspect(path: &String) -> SeekableDatabaseInspect {
             num_genomes: idx.genomes.len(),
             pool_kmers: Some(idx.pool.len()),
             stores_genome_sequences: Some(idx.has_genome_seqs()),
+            version: None,
+            tracks_repeats: None,
         }
     } else {
         let db = crate::twostage_db::open_file(path).unwrap_or_else(|e| fatal(e));
@@ -259,6 +268,8 @@ fn get_seekable_db_inspect(path: &String) -> SeekableDatabaseInspect {
             num_genomes: db.len(),
             pool_kmers: None,
             stores_genome_sequences: None,
+            version: Some(db.version()),
+            tracks_repeats: Some(db.tracks_repeats()),
         }
     }
 }

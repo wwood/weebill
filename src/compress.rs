@@ -464,6 +464,7 @@ fn read_genome_sketch<R: Read>(r: &mut R) -> io::Result<GenomeSketch> {
         k,
         gn_size,
         min_spacing,
+        repeat_kmers: None,
     })
 }
 

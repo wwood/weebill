@@ -1082,6 +1082,7 @@ pub fn sketch_genome_individual(
 
                 return_genome_sketch.gn_size = record.seq().len();
                 return_genome_sketch.genome_kmers = new_vec;
+                return_genome_sketch.repeat_kmers = Some(sorted_repeats(&duplicate_set));
                 return_genome_sketch.min_spacing = min_spacing;
                 if pseudotax {
                     return_genome_sketch.pseudotax_tracked_nonused_kmers =
@@ -1095,6 +1096,14 @@ pub fn sketch_genome_individual(
         }
         return_vec
     }
+}
+
+/// The distinct sampled k-mers seen more than once in a genome, sorted (see
+/// `GenomeSketch::repeat_kmers`).
+fn sorted_repeats(duplicate_set: &MMHashSet<&u64>) -> Vec<Kmer> {
+    let mut v: Vec<Kmer> = duplicate_set.iter().map(|&&k| k).collect();
+    v.sort_unstable();
+    v
 }
 
 pub fn sketch_genome(
@@ -1165,6 +1174,7 @@ pub fn sketch_genome(
             }
         }
         return_genome_sketch.genome_kmers = new_vec;
+        return_genome_sketch.repeat_kmers = Some(sorted_repeats(&duplicate_set));
         return_genome_sketch.min_spacing = min_spacing;
         if pseudotax {
             return_genome_sketch.pseudotax_tracked_nonused_kmers = Some(pseudotax_track_kmers);

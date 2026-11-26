@@ -16,6 +16,7 @@ fn gsketch(file_name: &str, kmers: Vec<u64>) -> GenomeSketch {
         k: 31,
         gn_size: 1000,
         min_spacing: 30,
+        repeat_kmers: None,
     }
 }
 
@@ -215,6 +216,7 @@ fn error_kmer_fixture(
         k,
         gn_size: len,
         min_spacing: 0,
+        repeat_kmers: None,
     };
     let tax: FxHashMap<String, (String, bool)> = FxHashMap::default();
     let mut db = refdelta::build_refdb(&[gsketch], &tax);
@@ -359,6 +361,7 @@ fn refdelta_error_kmer_roundtrip_and_savings() {
             k,
             gn_size: genome.len(),
             min_spacing: 0,
+            repeat_kmers: None,
         }],
         &tax,
     );
@@ -420,6 +423,7 @@ fn compress_genome_roundtrip() {
             k: 31,
             gn_size: 4_600_000 + g as usize,
             min_spacing: 30,
+            repeat_kmers: None,
         });
     }
 

@@ -125,9 +125,44 @@ pub struct DbAddArgs {
 pub struct DbConvertArgs {
     #[clap(
         multiple = true,
-        help = "Standard genome database sketches (*.syldb, or compressed *.syldbc) to convert"
+        help = "Standard genome database sketches (*.syldb, or compressed *.syldbc) to convert. These carry no repeated-k-mer information, so a database built from any of them is version 3, which `profile --reassign em` does not accept; use -g/--gl for that."
     )]
     pub files: Vec<String>,
+    #[clap(
+        multiple = true,
+        short = 'g',
+        long = "genomes",
+        help_heading = "GENOME INPUT",
+        help = "Genomes in fasta format, sketched here. When every genome comes from FASTA, the database is version 4: it also records each genome's repeated k-mers, which `profile --reassign em` and --detect-missing-relatives require."
+    )]
+    pub genomes: Vec<String>,
+    #[clap(
+        long = "gl",
+        help_heading = "GENOME INPUT",
+        help = "Newline delimited file of genome fastas, as for -g"
+    )]
+    pub list_genomes: Option<String>,
+    #[clap(
+        short,
+        default_value_t = 31,
+        help_heading = "GENOME INPUT",
+        help = "Value of k for -g/--gl genomes. Only k = 21, 31 are currently supported"
+    )]
+    pub k: usize,
+    #[clap(
+        short,
+        default_value_t = 200,
+        help_heading = "GENOME INPUT",
+        help = "Subsampling rate for -g/--gl genomes"
+    )]
+    pub c: usize,
+    #[clap(
+        long = "min-spacing",
+        default_value_t = 30,
+        help_heading = "GENOME INPUT",
+        help = "Minimum spacing between selected k-mers on -g/--gl genomes"
+    )]
+    pub min_spacing_kmer: usize,
     #[clap(
         short = 'o',
         long = "output",
@@ -761,6 +796,12 @@ pub struct ContainArgs {
         help = "How `profile` resolves k-mers shared between candidate genomes. `winner-take-all` (default, sylph's behaviour): each shared k-mer and its whole count go to the highest-ANI genome, which inflates the winner's coverage and can starve a co-occurring relative of k-mers. `em`: estimate each genome's coverage and k-mer presence rate by EM, starting from the winner-take-all assignment, and split each shared k-mer's count between the genomes consistent with it."
     )]
     pub reassign: ReassignMode,
+    #[clap(
+        long = "detect-missing-relatives",
+        help_heading = "ALGORITHM",
+        help = "With --reassign em: test each reported genome for a relative that is in the sample but missing from the database. Fits one and two Poisson rates to the counts of the genome's k-mers that no other reported genome carries; a missing relative adds its coverage to the k-mers it shares, giving a second, higher rate. Adds columns Mixture_LLR, Mixture_rates (low,high: when flagged, low is the genome's own coverage and high-low the relative's), Mixture_high_fraction (fraction of those k-mers at the high rate) and Missing_relative (yes/no; NA when there are too few k-mers or the coverage is too low, roughly below 0.5x). Strains above ~99.8% ANI and heterozygous or repeat-rich eukaryotes are not reliably called. Requires a version-4 .syl2db (db-convert -g)."
+    )]
+    pub detect_missing_relatives: bool,
 
     #[clap(
         long = "two-stage",

@@ -2,7 +2,9 @@ use crate::cmdline::*;
 use crate::constants::*;
 use crate::inference::*;
 use crate::merge::merge_sketches;
-use crate::reassign::{em_reassign, EmCandidate};
+use crate::reassign::{
+    em_reassign, missing_relative_test, repeat_mask, shared_only_partners, EmCandidate,
+};
 use crate::sketch::*;
 use crate::twostage_db::{ScreenIndex, TwoStageDb};
 use crate::types::*;
@@ -18,7 +20,38 @@ use std::io::BufWriter;
 use std::path::Path;
 use std::sync::Mutex;
 
-fn print_ani_result(ani_result: &AniResult, pseudotax: bool, writer: &mut Box<dyn Write + Send>) {
+/// Extra columns after `Contig_name` under `--reassign em`: `Shared_only_with`, then
+/// with `--detect-missing-relatives` the mixture fit.
+fn em_report_columns(report: &EmReport, mixture: bool) -> String {
+    let mut out = String::new();
+    out.push('\t');
+    if report.shared_only_with.is_empty() {
+        out.push_str("NA");
+    } else {
+        out.push_str(&report.shared_only_with.join(","));
+    }
+    if mixture {
+        match &report.mixture {
+            Some(m) => out.push_str(&format!(
+                "\t{:.1}\t{:.3},{:.3}\t{:.3}\t{}",
+                m.llr,
+                m.rate_low,
+                m.rate_high,
+                m.weight_high,
+                if m.flagged { "yes" } else { "no" }
+            )),
+            None => out.push_str("\tNA\tNA\tNA\tNA"),
+        }
+    }
+    out
+}
+
+fn print_ani_result(
+    ani_result: &AniResult,
+    pseudotax: bool,
+    mixture: bool,
+    writer: &mut Box<dyn Write + Send>,
+) {
     let print_final_ani = format!("{:.2}", f64::min(ani_result.final_est_ani * 100., 100.));
     let lambda_print;
     if let AdjustStatus::Lambda(lambda) = ani_result.lambda {
@@ -75,7 +108,7 @@ fn print_ani_result(ani_result: &AniResult, pseudotax: bool, writer: &mut Box<dy
     } else {
         writeln!(
             writer,
-            "{}\t{}\t{:.4}\t{:.4}\t{}\t{:.3}\t{}\t{}\t{}\t{:.0}\t{:.3}\t{}/{}\t{:.2}\t{}\t{}",
+            "{}\t{}\t{:.4}\t{:.4}\t{}\t{:.3}\t{}\t{}\t{}\t{:.0}\t{:.3}\t{}/{}\t{:.2}\t{}\t{}{}",
             ani_result.seq_name,
             ani_result.gn_name,
             ani_result.rel_abund.unwrap(),
@@ -92,6 +125,11 @@ fn print_ani_result(ani_result: &AniResult, pseudotax: bool, writer: &mut Box<dy
             ani_result.naive_ani * 100.,
             ani_result.kmers_lost.unwrap(),
             ani_result.contig_name,
+            ani_result
+                .em_report
+                .as_ref()
+                .map(|r| em_report_columns(r, mixture))
+                .unwrap_or_default(),
         )
         .expect("Error writing to file");
     }
@@ -139,6 +177,9 @@ fn subsample_view(gs: &GenomeSketch, target_c: usize) -> GenomeSketch {
     if let Some(p) = &gs.pseudotax_tracked_nonused_kmers {
         out.pseudotax_tracked_nonused_kmers =
             Some(p.iter().copied().filter(|h| *h < thresh).collect());
+    }
+    if let Some(r) = &gs.repeat_kmers {
+        out.repeat_kmers = Some(r.iter().copied().filter(|h| *h < thresh).collect());
     }
     out
 }
@@ -674,6 +715,37 @@ pub fn contain(mut args: ContainArgs, pseudotax_in: bool) {
         }
     }
 
+    // `--reassign em` keeps other genomes' copies of a genome's repeated k-mers out
+    // of their fits (see `reassign::repeat_mask`), and the mixture test relies on the
+    // same, so both need the repeats a version-4 .syl2db records. Without them the
+    // relatives' repeats would show as a second coverage rate.
+    if args.pseudotax {
+        if args.detect_missing_relatives && args.reassign != ReassignMode::Em {
+            log::error!("--detect-missing-relatives requires --reassign em. Exiting");
+            std::process::exit(1);
+        }
+        if args.reassign == ReassignMode::Em
+            && !two_stage_db.as_ref().is_some_and(|db| db.tracks_repeats())
+        {
+            let found = match &two_stage_db {
+                Some(db) => format!("a version-{} .syl2db", db.version()),
+                None => "a .syldb or FASTA genomes".to_string(),
+            };
+            log::error!(
+                "--reassign em{} requires a version-4 two-stage database (.syl2db), which records \
+                 each genome's repeated k-mers, but was given {}. Build one from the genome \
+                 FASTA files with `weebill db-convert -g <genomes...> -o <db>` (or --gl <list>). Exiting",
+                if args.detect_missing_relatives {
+                    " (and --detect-missing-relatives)"
+                } else {
+                    ""
+                },
+                found
+            );
+            std::process::exit(1);
+        }
+    }
+
     // ---- Two-stage profiling setup ----------------------------------------
     // A .syl2db dictates its own dense rate (`c`) and stage-1 screen rate
     // (`screen_c`); otherwise they come from the database `-c` and the flags.
@@ -809,6 +881,8 @@ pub fn contain(mut args: ContainArgs, pseudotax_in: bool) {
         args.pseudotax,
         &mut out_writer.lock().unwrap(),
         args.estimate_unknown,
+        args.pseudotax && args.reassign == ReassignMode::Em,
+        args.pseudotax && args.detect_missing_relatives,
     );
     // The per-sample profiling body: screen (if two-stage), compute per-genome
     // stats, reassign k-mers for taxonomic profiling, then print. Shared by the
@@ -988,7 +1062,12 @@ pub fn contain(mut args: ContainArgs, pseudotax_in: bool) {
 
             let mut out_writer = out_writer.lock().unwrap();
             for res in stats_vec_seq {
-                print_ani_result(&res, args.pseudotax, &mut out_writer);
+                print_ani_result(
+                    &res,
+                    args.pseudotax,
+                    args.detect_missing_relatives,
+                    &mut out_writer,
+                );
             }
         }
     };
@@ -1132,23 +1211,29 @@ fn em_profile_pass<'a>(
             })
             .collect();
         let assigned = em_reassign(&cands, &sequence_sketch.kmer_counts, args.mean_coverage);
-        let results: Vec<AniResult<'a>> = active
+        let results: Vec<(AniResult<'a>, (f64, f64))> = active
             .par_iter()
             .zip(assigned.into_par_iter())
             .filter_map(|(r, a)| {
                 if args.log_reassignments {
                     log::info!(
-                        "EM\tround {}\t{}\t{}\tlambda={:.4}\tpi={:.4}\tcontained {} -> {}",
+                        "EM\tround {}\t{}\t{}\tlambda={:.4}\tpi={:.4}\tcontained {} -> {}\tmasked {} ({} contained)",
                         round,
                         r.gn_name,
                         r.contig_name,
                         a.lambda,
                         a.pi,
                         r.containment_index.0,
-                        a.covs.len()
+                        a.covs.len(),
+                        a.n_masked,
+                        a.n_masked_contained
                     );
                 }
-                let lost = r.containment_index.0.saturating_sub(a.covs.len());
+                let lost = r
+                    .containment_index
+                    .0
+                    .saturating_sub(a.covs.len() + a.n_masked_contained);
+                let fit = (a.lambda, a.pi);
                 result_from_covs(
                     args,
                     r.genome_sketch,
@@ -1156,13 +1241,17 @@ fn em_profile_pass<'a>(
                     a.covs,
                     Some(lost),
                     args.log_reassignments,
+                    (a.n_masked, a.n_masked_contained),
                 )
+                .map(|res| (res, fit))
             })
             .collect();
+        let (results, fits): (Vec<AniResult<'a>>, Vec<(f64, f64)>) = results.into_iter().unzip();
         let results =
             derep_if_reassign_threshold(pass1, results, args.redundant_ani, sequence_sketch.k);
         if results.len() == active.len() || results.is_empty() {
-            return results;
+            // Nothing was filtered this round, so `results` lines up with `fits`.
+            return add_em_reports(args, pass1, results, &fits, sequence_sketch);
         }
         log::debug!(
             "EM round {}: {} of {} candidates dropped; re-running EM over the rest",
@@ -1177,6 +1266,65 @@ fn em_profile_pass<'a>(
         active.retain(|r| kept.contains(&(r.genome_sketch as *const GenomeSketch)));
     }
     unreachable!()
+}
+
+/// Attach the `--reassign em` report columns to the final EM results (`fits`: their
+/// EM `(λ, π)`, in the same order): which pass-1 candidates make each genome's evidence
+/// ambiguous, and with `--detect-missing-relatives` the two-rate fit.
+fn add_em_reports<'a>(
+    args: &ContainArgs,
+    pass1: &[AniResult<'a>],
+    mut results: Vec<AniResult<'a>>,
+    fits: &[(f64, f64)],
+    sequence_sketch: &SequencesSketch,
+) -> Vec<AniResult<'a>> {
+    let reported: Vec<&GenomeSketch> = results.iter().map(|r| r.genome_sketch).collect();
+    // The same mask as the EM's last round, which ran over exactly these genomes.
+    let mask = repeat_mask(reported.iter().copied());
+    let pool: Vec<&GenomeSketch> = pass1.iter().map(|r| r.genome_sketch).collect();
+    let partners = shared_only_partners(&reported, &pool, &sequence_sketch.kmer_counts, &mask);
+    let mixtures = if args.detect_missing_relatives {
+        let params: Vec<(f64, f64)> = fits.iter().map(|&(l, p)| (p, l)).collect();
+        missing_relative_test(&reported, &params, &sequence_sketch.kmer_counts, &mask)
+    } else {
+        vec![None; results.len()]
+    };
+    for ((res, partners), mixture) in results.iter_mut().zip(partners).zip(mixtures) {
+        let shared_only_with: Vec<String> = partners
+            .into_iter()
+            .map(|x| pool[x].file_name.clone())
+            .collect();
+        if !shared_only_with.is_empty() {
+            log::warn!(
+                "{}: every k-mer of {} ({}) found in the sample is also carried by {}, and none \
+                 of its own k-mers was found; the data cannot tell them apart, so the \
+                 assignment to {} rests on its higher pass-1 ANI",
+                res.seq_name,
+                res.gn_name,
+                res.contig_name,
+                shared_only_with.join(", "),
+                res.gn_name
+            );
+        }
+        if let Some(m) = mixture.as_ref().filter(|m| m.flagged) {
+            log::info!(
+                "{}: {} ({}) looks like it has a relative missing from the database: two \
+                 coverage rates {:.3} and {:.3} ({:.1}% of k-mers at the higher), LLR {:.1}",
+                res.seq_name,
+                res.gn_name,
+                res.contig_name,
+                m.rate_low,
+                m.rate_high,
+                m.weight_high * 100.,
+                m.llr
+            );
+        }
+        res.em_report = Some(EmReport {
+            shared_only_with,
+            mixture,
+        });
+    }
+    results
 }
 
 fn derep_if_reassign_threshold<'a>(
@@ -1196,7 +1344,11 @@ fn derep_if_reassign_threshold<'a>(
     let mut return_vec = vec![];
     for result in results_new.into_iter() {
         let old_res = &gn_sketch_to_contain[result.genome_sketch];
-        let num_kmer_reassign = (old_res.containment_index.0 - result.containment_index.0) as f64;
+        let num_kmer_reassign = old_res
+            .containment_index
+            .0
+            .saturating_sub(result.containment_index.0 + result.kmers_masked_contained)
+            as f64;
         let reass_thresh = threshold * result.containment_index.1 as f64;
         if num_kmer_reassign < reass_thresh {
             return_vec.push(result);
@@ -1390,7 +1542,9 @@ fn apply_unknown_from_tsv(
     const N_COLS: usize = 15;
     const SEQ_ABUND: usize = 3; // Sequence_abundance
     const COV: usize = 5; // Eff_cov (or True_cov)
-    if cols.len() != N_COLS
+                          // `--reassign em` appends report columns after Contig_name; they pass through.
+    if cols.len() < N_COLS
+        || cols[N_COLS - 1] != "Contig_name"
         || cols[0] != "Sample_file"
         || cols[1] != "Genome_file"
         || cols[SEQ_ABUND] != "Sequence_abundance"
@@ -1428,11 +1582,11 @@ fn apply_unknown_from_tsv(
 
     let mut covered_bases: FxHashMap<String, f64> = FxHashMap::default();
     for row in rows.iter() {
-        if row.len() != N_COLS {
+        if row.len() != cols.len() {
             log::error!(
                 "--apply-unknown: malformed row in `{}` (expected {} columns): {:?}. Exiting.",
                 tsv_path,
-                N_COLS,
+                cols.len(),
                 row
             );
             std::process::exit(1);
@@ -1616,7 +1770,13 @@ fn winner_table<'a>(
     kmer_to_genome_map
 }
 
-fn print_header(pseudotax: bool, writer: &mut Box<dyn Write + Send>, estimate_unknown: bool) {
+fn print_header(
+    pseudotax: bool,
+    writer: &mut Box<dyn Write + Send>,
+    estimate_unknown: bool,
+    em: bool,
+    mixture: bool,
+) {
     if !pseudotax {
         writeln!(writer,
             //"Sample_file\tQuery_file\tAdjusted_ANI\tNaive_ANI\tANI_5-95_percentile\tEff_cov\tEff_lambda\tLambda_5-95_percentile\tMedian_cov\tMean_cov_geq1\tContainment_ind\tContig_name",
@@ -1630,7 +1790,9 @@ fn print_header(pseudotax: bool, writer: &mut Box<dyn Write + Send>, estimate_un
             cov_head = "Eff_cov";
         }
         writeln!(writer,
-            "Sample_file\tGenome_file\tTaxonomic_abundance\tSequence_abundance\tAdjusted_ANI\t{}\tANI_5-95_percentile\tEff_lambda\tLambda_5-95_percentile\tMedian_cov\tMean_cov_geq1\tContainment_ind\tNaive_ANI\tkmers_reassigned\tContig_name", cov_head
+            "Sample_file\tGenome_file\tTaxonomic_abundance\tSequence_abundance\tAdjusted_ANI\t{}\tANI_5-95_percentile\tEff_lambda\tLambda_5-95_percentile\tMedian_cov\tMean_cov_geq1\tContainment_ind\tNaive_ANI\tkmers_reassigned\tContig_name{}{}", cov_head,
+            if em { "\tShared_only_with" } else { "" },
+            if mixture { "\tMixture_LLR\tMixture_rates\tMixture_high_fraction\tMissing_relative" } else { "" },
             ).expect("Error writing to file.");
     }
 }
@@ -1888,6 +2050,7 @@ fn get_stats<'a>(
         covs,
         kmers_lost,
         log_reassign,
+        (0, 0),
     )
 }
 
@@ -1901,9 +2064,12 @@ fn result_from_covs<'a>(
     covs: Vec<u32>,
     kmers_lost: Option<usize>,
     log_reassign: bool,
+    masked: (usize, usize),
 ) -> Option<AniResult<'a>> {
     let contain_count = covs.len();
-    let n_kmers = genome_sketch.genome_kmers.len();
+    // `masked`: (k-mers, of which contained) left out under --reassign em because
+    // another candidate carries them as a repeat; they are out of the denominator.
+    let n_kmers = genome_sketch.genome_kmers.len() - masked.0;
     // Absolute evidence floor, independent of genome size: `-M` scales with the
     // genome's k-mer count, so lowering it to admit small genomes would also admit
     // hits carried by a couple of chance matches. Both gates have to pass.
@@ -1956,6 +2122,8 @@ fn result_from_covs<'a>(
         rel_abund: None,
         seq_abund: None,
         kmers_lost,
+        kmers_masked_contained: masked.1,
+        em_report: None,
     })
 }
 

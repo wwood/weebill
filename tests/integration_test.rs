@@ -3431,6 +3431,20 @@ fn profile_rows(tsv: &str) -> Vec<(String, f64, f64, f64, usize)> {
         .collect()
 }
 
+/// Build a version-4 (repeat-tracking) `.syl2db` from genome FASTAs, as
+/// `profile --reassign em` requires; returns its path.
+fn em_db(dir: &str, name: &str, genomes: &[&str]) -> String {
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("db-convert")
+        .arg("-g")
+        .args(genomes)
+        .arg("-o")
+        .arg(format!("{}/{}", dir, name))
+        .assert()
+        .success();
+    format!("{}/{}.syl2db", dir, name)
+}
+
 fn run_profile(db: &str, sample: &str, extra: &[&str]) -> Vec<(String, f64, f64, f64, usize)> {
     let mut cmd = Command::cargo_bin("weebill").unwrap();
     let out = cmd
@@ -3490,7 +3504,7 @@ fn test_profile_em_reassignment_ecoli_efergusonii() {
     let _ = fs::remove_file(format!("{}/coli2x.fq", dir));
     let _ = fs::remove_file(format!("{}/coli2x_ferg3x.fq", dir));
     let _ = fs::remove_file(format!("{}/coli0.05x_ferg3x.fq", dir));
-    let db = format!("{}/db.syldb", dir);
+    let db = em_db(dir, "db", &[coli, ferg]);
     let pure = format!("{}/coli2x.fq.sylsp", dir);
     let mixed = format!("{}/coli2x_ferg3x.fq.sylsp", dir);
     let is_coli = |g: &str| g.contains("K12");
@@ -3561,15 +3575,14 @@ fn test_profile_em_reassignment_ecoli_efergusonii() {
     // k-mers it shares with EC590 but is then filtered out, and its shares must go
     // back to EC590 (EM is re-run over the survivors). Before that fix EC590 lost
     // ~220 k-mers and ~2% of its coverage relative to winner-take-all.
-    let mut cmd = Command::cargo_bin("weebill").unwrap();
-    cmd.arg("sketch")
-        .arg("./test_files/e.coli-EC590.fasta.gz")
-        .arg("./test_files/e.coli-o157.fasta.gz")
-        .arg("-o")
-        .arg(format!("{}/strains", dir))
-        .assert()
-        .success();
-    let strains = format!("{}/strains.syldb", dir);
+    let strains = em_db(
+        dir,
+        "strains",
+        &[
+            "./test_files/e.coli-EC590.fasta.gz",
+            "./test_files/e.coli-o157.fasta.gz",
+        ],
+    );
     let s_wta = run_profile(&strains, &pure, &["--reassign", "winner-take-all"]);
     let s_em = run_profile(&strains, &pure, &["--reassign", "em"]);
     assert_eq!(s_em.len(), 1, "{:?}", s_em);
@@ -3669,7 +3682,7 @@ fn test_profile_em_high_coverage_matches_sylph() {
     let _ = fs::remove_file(format!("{}/coli8x.fq", dir));
     let _ = fs::remove_file(format!("{}/coli8x_ferg8x.fq", dir));
     let _ = fs::remove_file(format!("{}/coli1x_ferg8x.fq", dir));
-    let db = format!("{}/db.syldb", dir);
+    let db = em_db(dir, "db", &[coli, ferg]);
     let pure = format!("{}/coli8x.fq.sylsp", dir);
     let mixed = format!("{}/coli8x_ferg8x.fq.sylsp", dir);
 
@@ -3794,7 +3807,7 @@ fn test_profile_em_high_coverage_close_strains() {
         .success();
     let _ = fs::remove_file(format!("{}/k12_8x_ec590_8x.fq", dir));
     let _ = fs::remove_file(format!("{}/k12_20x_ec590_5x.fq", dir));
-    let db = format!("{}/db.syldb", dir);
+    let db = em_db(dir, "db", &[k12, o157, ec590]);
     let pick = |rows: &Vec<(String, f64, f64, f64, usize)>, name: &str| {
         rows.iter()
             .find(|r| r.0.contains(name))
@@ -3845,5 +3858,350 @@ fn test_profile_em_high_coverage_close_strains() {
     let first = profile_stdout(&db, &sample);
     for _ in 0..7 {
         assert_eq!(profile_stdout(&db, &sample), first);
+    }
+}
+
+fn profile_tsv(db: &str, sample: &str, extra: &[&str]) -> Vec<Vec<String>> {
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    let out = cmd
+        .arg("profile")
+        .arg(db)
+        .arg(sample)
+        .args(extra)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    str::from_utf8(&out.stdout)
+        .unwrap()
+        .lines()
+        .map(|l| l.split('\t').map(String::from).collect())
+        .collect()
+}
+
+fn inspect_yaml(file: &str) -> String {
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    let out = cmd.arg("inspect").arg(file).output().unwrap();
+    assert!(out.status.success());
+    String::from_utf8(out.stdout).unwrap()
+}
+
+/// `--reassign em` (and `--detect-missing-relatives`) only run on a version-4
+/// `.syl2db`, which records each genome's repeated k-mers. Such a database is built
+/// from FASTA by `db-convert -g`; built from a `.syldb` it stays version 3, and
+/// `db-add` keeps a database's version and refuses to put a `.syldb` genome (whose
+/// repeats are unknown) into a version-4 one.
+#[serial]
+#[test]
+fn test_em_requires_repeat_tracking_database() {
+    let dir = "./tests/results/em_repeat_db";
+    let _ = fs::remove_dir_all(dir);
+    fs::create_dir_all(dir).unwrap();
+    let k12 = "./test_files/e.coli-K12.fasta.gz";
+    let o157 = "./test_files/e.coli-o157.fasta.gz";
+    let ec590 = "./test_files/e.coli-EC590.fasta.gz";
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("sketch")
+        .arg("-g")
+        .arg(k12)
+        .arg(o157)
+        .arg("-o")
+        .arg(format!("{}/plain", dir))
+        .arg("-r")
+        .arg("./test_files/o157_reads.fastq.gz")
+        .arg("-d")
+        .arg(dir)
+        .assert()
+        .success();
+    let sample = format!("{}/o157_reads.fastq.gz.sylsp", dir);
+    let plain = format!("{}/plain.syldb", dir);
+
+    // Version 3 from a .syldb; version 4 from FASTA.
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("db-convert")
+        .arg(&plain)
+        .arg("-o")
+        .arg(format!("{}/v3", dir))
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "cannot be used with `profile --reassign em`",
+        ));
+    let v3 = format!("{}/v3.syl2db", dir);
+    let v4 = em_db(dir, "v4", &[k12, o157]);
+    let y3 = inspect_yaml(&v3);
+    assert!(
+        y3.contains("version: 3") && y3.contains("tracks_repeats: false"),
+        "{}",
+        y3
+    );
+    let y4 = inspect_yaml(&v4);
+    assert!(
+        y4.contains("version: 4") && y4.contains("tracks_repeats: true"),
+        "{}",
+        y4
+    );
+    assert!(y4.contains("checksum: ok"), "{}", y4);
+
+    // EM refuses anything but version 4.
+    for db in [&plain, &v3] {
+        let mut cmd = Command::cargo_bin("weebill").unwrap();
+        cmd.arg("profile")
+            .arg(db)
+            .arg(&sample)
+            .args(["--reassign", "em"])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains(
+                "requires a version-4 two-stage database",
+            ));
+    }
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("profile")
+        .arg(&v4)
+        .arg(&sample)
+        .arg("--detect-missing-relatives")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("requires --reassign em"));
+
+    // On version 4: the extra columns appear under EM only, and winner-take-all on
+    // either version gives the same profile.
+    let wta3 = profile_tsv(&v3, &sample, &[]);
+    let wta4 = profile_tsv(&v4, &sample, &[]);
+    assert_eq!(wta3, wta4);
+    assert_eq!(wta4[0].len(), 15);
+    let em = profile_tsv(&v4, &sample, &["--reassign", "em"]);
+    assert_eq!(em[0][15], "Shared_only_with");
+    assert_eq!(em[0].len(), 16);
+    let em_mix = profile_tsv(
+        &v4,
+        &sample,
+        &["--reassign", "em", "--detect-missing-relatives"],
+    );
+    assert_eq!(
+        em_mix[0][15..],
+        [
+            "Shared_only_with",
+            "Mixture_LLR",
+            "Mixture_rates",
+            "Mixture_high_fraction",
+            "Missing_relative"
+        ]
+    );
+    assert!(em_mix.len() > 1);
+    for row in &em_mix[1..] {
+        assert_eq!(row.len(), 20, "{:?}", row);
+    }
+
+    // db-add keeps the version: -g genomes go into version 4, a .syldb does not.
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("sketch")
+        .arg("-g")
+        .arg(ec590)
+        .arg("-o")
+        .arg(format!("{}/ec590", dir))
+        .assert()
+        .success();
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("db-add")
+        .arg("-D")
+        .arg(&v4)
+        .arg(format!("{}/ec590.syldb", dir))
+        .arg("-o")
+        .arg(format!("{}/v4_bad", dir))
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("add it from its FASTA with -g"));
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("db-add")
+        .arg("-D")
+        .arg(&v4)
+        .arg("-g")
+        .arg(ec590)
+        .arg("-o")
+        .arg(format!("{}/v4_added", dir))
+        .assert()
+        .success();
+    let y = inspect_yaml(&format!("{}/v4_added.syl2db", dir));
+    assert!(
+        y.contains("version: 4") && y.contains("num_genomes: 3"),
+        "{}",
+        y
+    );
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("db-add")
+        .arg("-D")
+        .arg(&v3)
+        .arg("-g")
+        .arg(ec590)
+        .arg("-o")
+        .arg(format!("{}/v3_added", dir))
+        .assert()
+        .success();
+    let y = inspect_yaml(&format!("{}/v3_added.syl2db", dir));
+    assert!(
+        y.contains("version: 3") && y.contains("num_genomes: 3"),
+        "{}",
+        y
+    );
+    // The grown version-4 database profiles the same as one built in one go.
+    let v4_all = em_db(dir, "v4_all", &[k12, o157, ec590]);
+    let a = profile_tsv(&v4_all, &sample, &["--reassign", "em"]);
+    let b = profile_tsv(
+        &format!("{}/v4_added.syl2db", dir),
+        &sample,
+        &["--reassign", "em"],
+    );
+    let strip = |t: &Vec<Vec<String>>| -> Vec<Vec<String>> {
+        let mut v: Vec<Vec<String>> = t[1..].to_vec();
+        v.sort();
+        v
+    };
+    assert_eq!(strip(&a), strip(&b));
+}
+
+/// Write a FASTA of one sequence, gzipped (as `simulate_reads` reads).
+fn write_gz_fasta(path: &str, name: &str, seq: &[u8]) {
+    use std::io::Write;
+    let mut w =
+        flate2::write::GzEncoder::new(fs::File::create(path).unwrap(), flate2::Compression::fast());
+    writeln!(w, ">{}", name).unwrap();
+    for line in seq.chunks(80) {
+        w.write_all(line).unwrap();
+        w.write_all(b"\n").unwrap();
+    }
+    w.finish().unwrap();
+}
+
+fn random_seq(n: usize, seed: u64) -> Vec<u8> {
+    let mut rng = SplitMix(seed);
+    (0..n).map(|_| b"ACGT"[rng.below(4)]).collect()
+}
+
+/// When every k-mer of a genome found in the sample is also in another candidate,
+/// and none of its own k-mers is, the counts cannot tell the two apart. Two
+/// genomes here share 3 Mbp of K-12 and each has 0.5 Mbp of its own; the reads come
+/// from the shared part only. Whichever genome the EM keeps, `Shared_only_with`
+/// names the other. Ordinary profiles report NA.
+#[serial]
+#[test]
+fn test_em_reports_shared_only_genomes() {
+    let dir = "./tests/results/em_shared_only";
+    let _ = fs::remove_dir_all(dir);
+    fs::create_dir_all(dir).unwrap();
+    let k12 = read_gz_fasta("./test_files/e.coli-K12.fasta.gz");
+    let core = &k12[0][..3_000_000];
+    let (a, b, c) = (
+        format!("{}/a.fasta.gz", dir),
+        format!("{}/b.fasta.gz", dir),
+        format!("{}/core.fasta.gz", dir),
+    );
+    write_gz_fasta(&a, "a", &[core, &random_seq(500_000, 71)[..]].concat());
+    write_gz_fasta(&b, "b", &[core, &random_seq(500_000, 72)[..]].concat());
+    write_gz_fasta(&c, "core", core);
+    simulate_reads(&format!("{}/core5x.fq", dir), &[(c.as_str(), 5.)], 73);
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("sketch")
+        .arg("-r")
+        .arg(format!("{}/core5x.fq", dir))
+        .arg("-d")
+        .arg(dir)
+        .assert()
+        .success();
+    let _ = fs::remove_file(format!("{}/core5x.fq", dir));
+    let db = em_db(dir, "ab", &[&a, &b]);
+    let rows = profile_tsv(
+        &db,
+        &format!("{}/core5x.fq.sylsp", dir),
+        &["--reassign", "em"],
+    );
+    assert_eq!(rows.len(), 2, "{:?}", rows);
+    let (kept, other) = if rows[1][1] == a { (&a, &b) } else { (&b, &a) };
+    assert_eq!(&rows[1][1], kept);
+    assert_eq!(&rows[1][15], other, "{:?}", rows);
+
+    // A genome with k-mers of its own in the sample is not ambiguous.
+    let db = em_db(dir, "a_k12", &[&a, "./test_files/e.coli-K12.fasta.gz"]);
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("sketch")
+        .arg("-r")
+        .arg("./test_files/o157_reads.fastq.gz")
+        .arg("-d")
+        .arg(dir)
+        .assert()
+        .success();
+    let rows = profile_tsv(
+        &db,
+        &format!("{}/o157_reads.fastq.gz.sylsp", dir),
+        &["--reassign", "em"],
+    );
+    assert!(rows.len() > 1);
+    for row in &rows[1..] {
+        assert_eq!(row[15], "NA", "{:?}", rows);
+    }
+}
+
+/// `--detect-missing-relatives`: 8x K-12 + 8x E. fergusonii profiled against a
+/// database without E. fergusonii. The ~17% of K-12's k-mers that E. fergusonii
+/// shares get both genomes' coverage, so K-12's counts show two rates: its own
+/// (~6.0) and K-12 + E. fergusonii (~12). With E. fergusonii in the database, or
+/// with K-12 alone in the sample, nothing is flagged.
+#[serial]
+#[test]
+fn test_em_detect_missing_relatives() {
+    let dir = "./tests/results/em_missing_relatives";
+    let _ = fs::remove_dir_all(dir);
+    fs::create_dir_all(dir).unwrap();
+    let k12 = "./test_files/e.coli-K12.fasta.gz";
+    let ec590 = "./test_files/e.coli-EC590.fasta.gz";
+    let ferg = "./test_files/e.fergusonii-ATCC35469.fasta.gz";
+    simulate_reads(
+        &format!("{}/k12_8x_ferg_8x.fq", dir),
+        &[(k12, 8.), (ferg, 8.)],
+        51,
+    );
+    simulate_reads(&format!("{}/k12_8x.fq", dir), &[(k12, 8.)], 52);
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("sketch")
+        .arg("-r")
+        .arg(format!("{}/k12_8x_ferg_8x.fq", dir))
+        .arg(format!("{}/k12_8x.fq", dir))
+        .arg("-d")
+        .arg(dir)
+        .assert()
+        .success();
+    let _ = fs::remove_file(format!("{}/k12_8x_ferg_8x.fq", dir));
+    let _ = fs::remove_file(format!("{}/k12_8x.fq", dir));
+    let mixed = format!("{}/k12_8x_ferg_8x.fq.sylsp", dir);
+    let pure = format!("{}/k12_8x.fq.sylsp", dir);
+    let no_ferg = em_db(dir, "no_ferg", &[k12, ec590]);
+    let full = em_db(dir, "full", &[k12, ec590, ferg]);
+    let flags = ["--reassign", "em", "--detect-missing-relatives"];
+    let f = |x: &str| -> f64 { x.parse().unwrap() };
+
+    let rows = profile_tsv(&no_ferg, &mixed, &flags);
+    assert_eq!(rows.len(), 2, "{:?}", rows);
+    let r = &rows[1];
+    assert!(r[1].contains("K12"), "{:?}", r);
+    // E. fergusonii's shared coverage inflates K-12's own estimate (~7.5).
+    assert!(f(&r[5]) > 6.8, "{:?}", r);
+    assert_eq!(r[19], "yes", "{:?}", r);
+    assert!(f(&r[16]) > 500., "{:?}", r);
+    let (lo, hi) = r[17].split_once(',').unwrap();
+    assert!((f(lo) - 6.0).abs() < 0.3, "{:?}", r);
+    assert!((f(hi) - f(lo) - 6.0).abs() < 0.6, "{:?}", r);
+    assert!(f(&r[18]) > 0.1 && f(&r[18]) < 0.4, "{:?}", r);
+
+    for (db, sample) in [(&full, &mixed), (&no_ferg, &pure), (&full, &pure)] {
+        let rows = profile_tsv(db, sample, &flags);
+        assert!(rows.len() > 1);
+        for r in &rows[1..] {
+            assert_eq!(r[19], "no", "{} {}: {:?}", db, sample, r);
+            assert!(f(&r[16]) < 30., "{:?}", r);
+        }
     }
 }
