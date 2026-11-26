@@ -26,7 +26,7 @@
 //! cap are left out of the fit; the caps start from the pass-1 medians and are
 //! then refitted from the EM's own histograms until they settle.
 //! k-mers that any candidate carries as a repeat (`GenomeSketch::repeat_kmers`, from a
-//! version-4 `.syl2db`) are left out of every candidate's fit and k-mer total, because
+//! `.syl3db`) are left out of every candidate's fit and k-mer total, because
 //! their counts include an unknown copy number (see `repeat_mask`).
 //! It starts from the winner-take-all assignment: each genome's initial parameters
 //! come from the k-mers it wins, with lost k-mers treated as missing rather than as
@@ -101,7 +101,7 @@ pub struct EmAssignment {
 /// most when a low-coverage genome sits beside an abundant relative: the relative's
 /// repeats (rRNA operons, IS elements) otherwise land in the low-coverage genome's
 /// counts at the relative's coverage. Repeats are only known for genomes from a
-/// version-4 `.syl2db`; `None` repeats contribute nothing.
+/// `.syl3db`; `None` repeats contribute nothing.
 pub fn repeat_mask<'a>(genomes: impl IntoIterator<Item = &'a GenomeSketch>) -> FxHashSet<Kmer> {
     let mut mask = FxHashSet::default();
     for g in genomes {

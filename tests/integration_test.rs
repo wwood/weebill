@@ -3431,8 +3431,8 @@ fn profile_rows(tsv: &str) -> Vec<(String, f64, f64, f64, usize)> {
         .collect()
 }
 
-/// Build a version-4 (repeat-tracking) `.syl2db` from genome FASTAs, as
-/// `profile --reassign em` requires; returns its path.
+/// Build a repeat-tracking `.syl3db` from genome FASTAs, as `profile --reassign em`
+/// requires; returns its path.
 fn em_db(dir: &str, name: &str, genomes: &[&str]) -> String {
     let mut cmd = Command::cargo_bin("weebill").unwrap();
     cmd.arg("db-convert")
@@ -3442,7 +3442,13 @@ fn em_db(dir: &str, name: &str, genomes: &[&str]) -> String {
         .arg(format!("{}/{}", dir, name))
         .assert()
         .success();
-    format!("{}/{}.syl2db", dir, name)
+    let out = format!("{}/{}.syl3db", dir, name);
+    assert!(
+        Path::new(&out).exists(),
+        "db-convert -g did not write {}",
+        out
+    );
+    out
 }
 
 fn run_profile(db: &str, sample: &str, extra: &[&str]) -> Vec<(String, f64, f64, f64, usize)> {
@@ -3889,11 +3895,12 @@ fn inspect_yaml(file: &str) -> String {
     String::from_utf8(out.stdout).unwrap()
 }
 
-/// `--reassign em` (and `--detect-missing-relatives`) only run on a version-4
-/// `.syl2db`, which records each genome's repeated k-mers. Such a database is built
-/// from FASTA by `db-convert -g`; built from a `.syldb` it stays version 3, and
-/// `db-add` keeps a database's version and refuses to put a `.syldb` genome (whose
-/// repeats are unknown) into a version-4 one.
+/// `--reassign em` (and `--detect-missing-relatives`) only run on a `.syl3db`, which
+/// records each genome's repeated k-mers and so is a separate format from sylph's
+/// `.syl2db`. `db-convert -g` writes one by default; a `.syldb` input gives a `.syl2db`,
+/// as does asking for one by name. `db-add` keeps a database's format, refusing a
+/// `.syldb` genome (whose repeats are unknown) for a `.syl3db` and an output named for
+/// the other format.
 #[serial]
 #[test]
 fn test_em_requires_repeat_tracking_database() {
@@ -3918,36 +3925,65 @@ fn test_em_requires_repeat_tracking_database() {
         .success();
     let sample = format!("{}/o157_reads.fastq.gz.sylsp", dir);
     let plain = format!("{}/plain.syldb", dir);
+    let magic = |p: &str| fs::read(p).unwrap()[0..5].to_vec();
 
-    // Version 3 from a .syldb; version 4 from FASTA.
+    // A .syl2db from a .syldb; a .syl3db from FASTA, unless a .syl2db is asked for.
     let mut cmd = Command::cargo_bin("weebill").unwrap();
     cmd.arg("db-convert")
         .arg(&plain)
         .arg("-o")
-        .arg(format!("{}/v3", dir))
+        .arg(format!("{}/from_syldb", dir))
         .assert()
         .success()
         .stderr(predicate::str::contains(
             "cannot be used with `profile --reassign em`",
         ));
-    let v3 = format!("{}/v3.syl2db", dir);
-    let v4 = em_db(dir, "v4", &[k12, o157]);
-    let y3 = inspect_yaml(&v3);
+    let syl2 = format!("{}/from_syldb.syl2db", dir);
+    let syl3 = em_db(dir, "rep", &[k12, o157]);
+    assert_eq!(magic(&syl2), b"SY2D\x03");
+    assert_eq!(magic(&syl3), b"SY3D\x01");
+    let y2 = inspect_yaml(&syl2);
     assert!(
-        y3.contains("version: 3") && y3.contains("tracks_repeats: false"),
+        y2.contains("format: .syl2db")
+            && y2.contains("version: 3")
+            && y2.contains("tracks_repeats: false"),
+        "{}",
+        y2
+    );
+    let y3 = inspect_yaml(&syl3);
+    assert!(
+        y3.contains("format: .syl3db")
+            && y3.contains("version: 1")
+            && y3.contains("tracks_repeats: true")
+            && y3.contains("checksum: ok"),
         "{}",
         y3
     );
-    let y4 = inspect_yaml(&v4);
-    assert!(
-        y4.contains("version: 4") && y4.contains("tracks_repeats: true"),
-        "{}",
-        y4
-    );
-    assert!(y4.contains("checksum: ok"), "{}", y4);
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("db-convert")
+        .arg("-g")
+        .arg(k12)
+        .arg(o157)
+        .arg("-o")
+        .arg(format!("{}/fasta.syl2db", dir))
+        .assert()
+        .success();
+    let fasta_syl2 = format!("{}/fasta.syl2db", dir);
+    assert_eq!(magic(&fasta_syl2), b"SY2D\x03");
+    assert!(!Path::new(&format!("{}/fasta.syl2db.syl3db", dir)).exists());
+    // A .syl3db cannot be made from a .syldb.
+    let mut cmd = Command::cargo_bin("weebill").unwrap();
+    cmd.arg("db-convert")
+        .arg(&plain)
+        .arg("-o")
+        .arg(format!("{}/bad.syl3db", dir))
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("give them as FASTA"));
+    assert!(!Path::new(&format!("{}/bad.syl3db", dir)).exists());
 
-    // EM refuses anything but version 4.
-    for db in [&plain, &v3] {
+    // EM refuses anything but a .syl3db.
+    for db in [&plain, &syl2, &fasta_syl2] {
         let mut cmd = Command::cargo_bin("weebill").unwrap();
         cmd.arg("profile")
             .arg(db)
@@ -3956,29 +3992,30 @@ fn test_em_requires_repeat_tracking_database() {
             .assert()
             .failure()
             .stderr(predicate::str::contains(
-                "requires a version-4 two-stage database",
+                "requires a repeat-tracking two-stage database (.syl3db)",
             ));
     }
     let mut cmd = Command::cargo_bin("weebill").unwrap();
     cmd.arg("profile")
-        .arg(&v4)
+        .arg(&syl3)
         .arg(&sample)
         .arg("--detect-missing-relatives")
         .assert()
         .failure()
         .stderr(predicate::str::contains("requires --reassign em"));
 
-    // On version 4: the extra columns appear under EM only, and winner-take-all on
-    // either version gives the same profile.
-    let wta3 = profile_tsv(&v3, &sample, &[]);
-    let wta4 = profile_tsv(&v4, &sample, &[]);
-    assert_eq!(wta3, wta4);
-    assert_eq!(wta4[0].len(), 15);
-    let em = profile_tsv(&v4, &sample, &["--reassign", "em"]);
+    // The extra columns appear under EM only, and winner-take-all gives the same
+    // profile from either format.
+    let wta2 = profile_tsv(&syl2, &sample, &[]);
+    let wta3 = profile_tsv(&syl3, &sample, &[]);
+    assert_eq!(wta2, wta3);
+    assert_eq!(profile_tsv(&fasta_syl2, &sample, &[]), wta3);
+    assert_eq!(wta3[0].len(), 15);
+    let em = profile_tsv(&syl3, &sample, &["--reassign", "em"]);
     assert_eq!(em[0][15], "Shared_only_with");
     assert_eq!(em[0].len(), 16);
     let em_mix = profile_tsv(
-        &v4,
+        &syl3,
         &sample,
         &["--reassign", "em", "--detect-missing-relatives"],
     );
@@ -3997,7 +4034,8 @@ fn test_em_requires_repeat_tracking_database() {
         assert_eq!(row.len(), 20, "{:?}", row);
     }
 
-    // db-add keeps the version: -g genomes go into version 4, a .syldb does not.
+    // db-add keeps the format: -g genomes go into either, a .syldb only into a .syl2db,
+    // and an output named for the other format is refused.
     let mut cmd = Command::cargo_bin("weebill").unwrap();
     cmd.arg("sketch")
         .arg("-g")
@@ -4009,53 +4047,64 @@ fn test_em_requires_repeat_tracking_database() {
     let mut cmd = Command::cargo_bin("weebill").unwrap();
     cmd.arg("db-add")
         .arg("-D")
-        .arg(&v4)
+        .arg(&syl3)
         .arg(format!("{}/ec590.syldb", dir))
         .arg("-o")
-        .arg(format!("{}/v4_bad", dir))
+        .arg(format!("{}/rep_bad", dir))
         .assert()
         .failure()
         .stderr(predicate::str::contains("add it from its FASTA with -g"));
+    for (db, out) in [(&syl3, "x.syl2db"), (&syl2, "x.syl3db")] {
+        let mut cmd = Command::cargo_bin("weebill").unwrap();
+        cmd.arg("db-add")
+            .arg("-D")
+            .arg(db)
+            .arg("-g")
+            .arg(ec590)
+            .arg("-o")
+            .arg(format!("{}/{}", dir, out))
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("db-add keeps a database's format"));
+        assert!(!Path::new(&format!("{}/{}", dir, out)).exists());
+    }
     let mut cmd = Command::cargo_bin("weebill").unwrap();
     cmd.arg("db-add")
         .arg("-D")
-        .arg(&v4)
+        .arg(&syl3)
         .arg("-g")
         .arg(ec590)
         .arg("-o")
-        .arg(format!("{}/v4_added", dir))
+        .arg(format!("{}/rep_added", dir))
         .assert()
         .success();
-    let y = inspect_yaml(&format!("{}/v4_added.syl2db", dir));
+    let rep_added = format!("{}/rep_added.syl3db", dir);
+    let y = inspect_yaml(&rep_added);
     assert!(
-        y.contains("version: 4") && y.contains("num_genomes: 3"),
+        y.contains("format: .syl3db") && y.contains("num_genomes: 3"),
         "{}",
         y
     );
     let mut cmd = Command::cargo_bin("weebill").unwrap();
     cmd.arg("db-add")
         .arg("-D")
-        .arg(&v3)
+        .arg(&syl2)
         .arg("-g")
         .arg(ec590)
         .arg("-o")
-        .arg(format!("{}/v3_added", dir))
+        .arg(format!("{}/syl2_added", dir))
         .assert()
         .success();
-    let y = inspect_yaml(&format!("{}/v3_added.syl2db", dir));
+    let y = inspect_yaml(&format!("{}/syl2_added.syl2db", dir));
     assert!(
-        y.contains("version: 3") && y.contains("num_genomes: 3"),
+        y.contains("format: .syl2db") && y.contains("num_genomes: 3"),
         "{}",
         y
     );
-    // The grown version-4 database profiles the same as one built in one go.
-    let v4_all = em_db(dir, "v4_all", &[k12, o157, ec590]);
-    let a = profile_tsv(&v4_all, &sample, &["--reassign", "em"]);
-    let b = profile_tsv(
-        &format!("{}/v4_added.syl2db", dir),
-        &sample,
-        &["--reassign", "em"],
-    );
+    // The grown .syl3db profiles the same as one built in one go.
+    let rep_all = em_db(dir, "rep_all", &[k12, o157, ec590]);
+    let a = profile_tsv(&rep_all, &sample, &["--reassign", "em"]);
+    let b = profile_tsv(&rep_added, &sample, &["--reassign", "em"]);
     let strip = |t: &Vec<Vec<String>>| -> Vec<Vec<String>> {
         let mut v: Vec<Vec<String>> = t[1..].to_vec();
         v.sort();

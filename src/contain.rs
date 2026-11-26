@@ -545,7 +545,7 @@ pub fn contain(mut args: ContainArgs, pseudotax_in: bool) {
             sample_sketch_good_suffix = true;
         }
 
-        if file.ends_with(TWO_STAGE_DB_SUFFIX) {
+        if file.ends_with(TWO_STAGE_DB_SUFFIX) || file.ends_with(REPEAT_DB_SUFFIX) {
             two_stage_db_files.push(file);
         } else if genome_sketch_good_suffix {
             genome_sketch_files.push(file);
@@ -621,7 +621,7 @@ pub fn contain(mut args: ContainArgs, pseudotax_in: bool) {
         }
     };
 
-    // A .syl2db is a self-contained two-stage database: open it (loading only the
+    // A .syl2db (or .syl3db) is a self-contained two-stage database: open it (loading only the
     // sparse stage-1 index) and use its per-genome sparse sketches as the screen.
     let two_stage_db: Option<TwoStageDb> = if !two_stage_db_files.is_empty() {
         if two_stage_db_files.len() > 1
@@ -629,13 +629,14 @@ pub fn contain(mut args: ContainArgs, pseudotax_in: bool) {
             || !genome_files.is_empty()
         {
             log::error!(
-                "A two-stage database ({}) must be the only genome input. Exiting",
-                TWO_STAGE_DB_SUFFIX
+                "A two-stage database ({} or {}) must be the only genome input. Exiting",
+                TWO_STAGE_DB_SUFFIX,
+                REPEAT_DB_SUFFIX
             );
             std::process::exit(1);
         }
         if !args.pseudotax {
-            log::error!("Two-stage databases ({}) are only supported for `sylph profile`, not `sylph query`. Exiting", TWO_STAGE_DB_SUFFIX);
+            log::error!("Two-stage databases ({} or {}) are only supported for `sylph profile`, not `sylph query`. Exiting", TWO_STAGE_DB_SUFFIX, REPEAT_DB_SUFFIX);
             std::process::exit(1);
         }
         log::info!(
@@ -717,7 +718,7 @@ pub fn contain(mut args: ContainArgs, pseudotax_in: bool) {
 
     // `--reassign em` keeps other genomes' copies of a genome's repeated k-mers out
     // of their fits (see `reassign::repeat_mask`), and the mixture test relies on the
-    // same, so both need the repeats a version-4 .syl2db records. Without them the
+    // same, so both need the repeats a .syl3db records. Without them the
     // relatives' repeats would show as a second coverage rate.
     if args.pseudotax {
         if args.detect_missing_relatives && args.reassign != ReassignMode::Em {
@@ -728,19 +729,21 @@ pub fn contain(mut args: ContainArgs, pseudotax_in: bool) {
             && !two_stage_db.as_ref().is_some_and(|db| db.tracks_repeats())
         {
             let found = match &two_stage_db {
-                Some(db) => format!("a version-{} .syl2db", db.version()),
+                Some(_) => format!("a {}", TWO_STAGE_DB_SUFFIX),
                 None => "a .syldb or FASTA genomes".to_string(),
             };
             log::error!(
-                "--reassign em{} requires a version-4 two-stage database (.syl2db), which records \
+                "--reassign em{} requires a repeat-tracking two-stage database ({}), which records \
                  each genome's repeated k-mers, but was given {}. Build one from the genome \
-                 FASTA files with `weebill db-convert -g <genomes...> -o <db>` (or --gl <list>). Exiting",
+                 FASTA files with `weebill db-convert -g <genomes...> -o <db>{}` (or --gl <list>). Exiting",
                 if args.detect_missing_relatives {
                     " (and --detect-missing-relatives)"
                 } else {
                     ""
                 },
-                found
+                REPEAT_DB_SUFFIX,
+                found,
+                REPEAT_DB_SUFFIX
             );
             std::process::exit(1);
         }

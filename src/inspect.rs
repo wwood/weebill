@@ -74,7 +74,7 @@ pub struct DatabaseSketch {
     pub genome_files: Vec<GenomeSketchInspect>,
 }
 
-/// Summary of a seekable database (`.sylref` / `.syl2db`), whose stored checksum
+/// Summary of a seekable database (`.sylref` / `.syl2db` / `.syl3db`), whose stored checksum
 /// `inspect` verifies. The single-frame formats need no such entry: reading one at
 /// all decodes its whole zstd frame, which validates its checksum.
 #[derive(Deserialize, Serialize, Debug, PartialEq)]
@@ -93,11 +93,11 @@ struct SeekableDatabaseInspect {
     /// `.sylref` only: whether genome sequences are stored (`ref-build --store-genomes`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stores_genome_sequences: Option<bool>,
-    /// `.syl2db` only: on-disk format version.
+    /// `.syl2db`/`.syl3db` only: on-disk format version, within that format.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<u8>,
-    /// `.syl2db` only: whether each genome's repeated k-mers are recorded (version 4),
-    /// as `profile --reassign em` requires.
+    /// `.syl2db`/`.syl3db` only: whether each genome's repeated k-mers are recorded (a
+    /// `.syl3db`), as `profile --reassign em` requires.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tracks_repeats: Option<bool>,
 }
@@ -172,11 +172,14 @@ pub fn inspect(args: InspectArgs) {
             genome_sketch_files.push(file);
         } else if sample_sketch_good_suffix {
             read_sketch_files.push(file);
-        } else if file.ends_with(REF_DB_SUFFIX) || file.ends_with(TWO_STAGE_DB_SUFFIX) {
+        } else if file.ends_with(REF_DB_SUFFIX)
+            || file.ends_with(TWO_STAGE_DB_SUFFIX)
+            || file.ends_with(REPEAT_DB_SUFFIX)
+        {
             seekable_db_files.push(file);
         } else {
             warn!(
-                "{} is not a .sylsp/.syldb, .sylref or .syl2db file. Skipping...",
+                "{} is not a .sylsp/.syldb, .sylref, .syl2db or .syl3db file. Skipping...",
                 &file
             );
         }
@@ -260,7 +263,7 @@ fn get_seekable_db_inspect(path: &String) -> SeekableDatabaseInspect {
         }
         SeekableDatabaseInspect {
             database_file: path.clone(),
-            format: TWO_STAGE_DB_SUFFIX.to_string(),
+            format: db.format_suffix().to_string(),
             checksum: if verified { "ok" } else { "absent" }.to_string(),
             c: db.c,
             k: db.k,

@@ -196,7 +196,7 @@ pub struct GenomeSketch {
     /// count is its copy number times the coverage, but the genome still carries
     /// them: `profile --reassign em` uses them to keep other genomes' copies of these
     /// k-mers out of their coverage fits. Filled in when a genome is sketched from
-    /// sequence; stored only by a version-4 `.syl2db` (never by a `.syldb`, which keeps
+    /// sequence; stored only by a `.syl3db` (never by a `.syldb`, which keeps
     /// sylph's layout, hence `serde(skip)`). `None` when unknown.
     #[serde(skip)]
     pub repeat_kmers: Option<Vec<Kmer>>,

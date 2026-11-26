@@ -99,3 +99,6 @@ pub const SPARSE_TARGET_MIN_DEFAULT: usize = 50;
 /// Two-stage seekable database: a small bincoded sparse (screen) index plus
 /// per-genome Golomb-Rice compressed dense blocks loaded on demand.
 pub const TWO_STAGE_DB_SUFFIX: &str = ".syl2db";
+/// Two-stage database that also records each genome's repeated k-mers (needed by
+/// `profile --reassign em`); not readable by upstream sylph.
+pub const REPEAT_DB_SUFFIX: &str = ".syl3db";

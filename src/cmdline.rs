@@ -49,7 +49,7 @@ pub enum Mode {
     ///Compress sample sketches against a reference DB (.sylsp -> .sylspr), or --decompress to reverse.
     #[clap(arg_required_else_help = true, display_order = 6)]
     RefCompress(RefCompressArgs),
-    ///Convert a standard database (.syldb) into a two-stage seekable database (.syl2db) for `profile --two-stage`.
+    ///Convert a standard database (.syldb), or genome FASTA files, into a two-stage seekable database for `profile --two-stage`: a .syl2db (sylph-compatible), or from FASTA a repeat-tracking .syl3db (needed by `profile --reassign em`).
     // `convert-db-two-screen` is what upstream sylph calls this, kept as a hidden alias
     // so a command line written for either tool runs on both.
     #[clap(
@@ -58,7 +58,7 @@ pub enum Mode {
         alias = "convert-db-two-screen"
     )]
     DbConvert(DbConvertArgs),
-    ///Add new genomes to an existing two-stage database (.syl2db) without rebuilding it from scratch.
+    ///Add new genomes to an existing two-stage database (.syl2db/.syl3db) without rebuilding it from scratch.
     #[clap(arg_required_else_help = true, display_order = 7)]
     DbAdd(DbAddArgs),
 }
@@ -68,7 +68,7 @@ pub struct DbAddArgs {
     #[clap(
         short = 'D',
         long = "database",
-        help = "Existing two-stage database (*.syl2db) to add genomes to"
+        help = "Existing two-stage database (*.syl2db/*.syl3db) to add genomes to"
     )]
     pub database: String,
     #[clap(
@@ -86,7 +86,7 @@ pub struct DbAddArgs {
     #[clap(
         short = 'o',
         long = "output",
-        help = "Write the grown database here (.syl2db appended) instead of updating --database in place. In-place updates are written to a temporary file and renamed, so an interrupted run leaves the original intact."
+        help = "Write the grown database here (the database's own .syl2db/.syl3db suffix appended; the format is kept) instead of updating --database in place. In-place updates are written to a temporary file and renamed, so an interrupted run leaves the original intact."
     )]
     pub output: Option<String>,
     #[clap(
@@ -133,7 +133,7 @@ pub struct DbConvertArgs {
         short = 'g',
         long = "genomes",
         help_heading = "GENOME INPUT",
-        help = "Genomes in fasta format, sketched here. When every genome comes from FASTA, the database is version 4: it also records each genome's repeated k-mers, which `profile --reassign em` and --detect-missing-relatives require."
+        help = "Genomes in fasta format, sketched here. When every genome comes from FASTA, the database can be a .syl3db, which also records each genome's repeated k-mers, as `profile --reassign em` and --detect-missing-relatives require (see -o)."
     )]
     pub genomes: Vec<String>,
     #[clap(
@@ -166,7 +166,7 @@ pub struct DbConvertArgs {
     #[clap(
         short = 'o',
         long = "output",
-        help = "Output two-stage database name (.syl2db appended)"
+        help = "Output two-stage database name. Ending it in .syl2db writes a sylph-compatible database; .syl3db writes one that also records each genome's repeated k-mers, as `profile --reassign em` requires, and needs every genome given as FASTA (-g/--gl). Otherwise .syl3db is appended when every genome came from FASTA, and .syl2db when not."
     )]
     pub output: String,
     #[clap(long="screen-c", default_value_t = SCREEN_C_DEFAULT, help = "Subsampling rate -c of the small in-memory stage-1 SCREEN index (the bincoded sparse hashes). Must be >= the database -c. A coarser (larger) value gives a smaller/faster screen index. The dense per-genome blocks always keep every k-mer at the database -c.")]
@@ -597,7 +597,7 @@ pub struct ContainArgs {
         short = 'd',
         long = "databases",
         multiple = true,
-        help = "Explicitly specify database files (*.syldb/*.syldbc/*.syl2db) instead of/in addition to positional input",
+        help = "Explicitly specify database files (*.syldb/*.syldbc/*.syl2db/*.syl3db) instead of/in addition to positional input",
         help_heading = "INPUT/OUTPUT"
     )]
     pub databases: Vec<String>,
@@ -799,7 +799,7 @@ pub struct ContainArgs {
     #[clap(
         long = "detect-missing-relatives",
         help_heading = "ALGORITHM",
-        help = "With --reassign em: test each reported genome for a relative that is in the sample but missing from the database. Fits one and two Poisson rates to the counts of the genome's k-mers that no other reported genome carries; a missing relative adds its coverage to the k-mers it shares, giving a second, higher rate. Adds columns Mixture_LLR, Mixture_rates (low,high: when flagged, low is the genome's own coverage and high-low the relative's), Mixture_high_fraction (fraction of those k-mers at the high rate) and Missing_relative (yes/no; NA when there are too few k-mers or the coverage is too low, roughly below 0.5x). Strains above ~99.8% ANI and heterozygous or repeat-rich eukaryotes are not reliably called. Requires a version-4 .syl2db (db-convert -g)."
+        help = "With --reassign em: test each reported genome for a relative that is in the sample but missing from the database. Fits one and two Poisson rates to the counts of the genome's k-mers that no other reported genome carries; a missing relative adds its coverage to the k-mers it shares, giving a second, higher rate. Adds columns Mixture_LLR, Mixture_rates (low,high: when flagged, low is the genome's own coverage and high-low the relative's), Mixture_high_fraction (fraction of those k-mers at the high rate) and Missing_relative (yes/no; NA when there are too few k-mers or the coverage is too low, roughly below 0.5x). Strains above ~99.8% ANI and heterozygous or repeat-rich eukaryotes are not reliably called. Requires a .syl3db (db-convert -g)."
     )]
     pub detect_missing_relatives: bool,
 
@@ -843,7 +843,7 @@ pub struct ContainArgs {
         long = "screen-small-genomes",
         default_value_t = SPARSE_TARGET_MIN_DEFAULT,
         help_heading = "TWO-STAGE PROFILING",
-        help = "Two-stage databases (.syl2db) only: screen genomes with fewer than this many stored stage-1 k-mers (small genomes: viruses, plasmids, short contigs) directly, by reading back their smallest this-many dense k-mers when the database is opened. This is the same per-genome minimum as upstream sylph's --min-sparse-kmers, applied at profile time, so small genomes stay detectable without the stage-1 index being widened for everyone. Costs time per sample proportional to the number of such genomes; a no-op for genomes a `--small-genome-screen loosen` build already densified. 0 disables."
+        help = "Two-stage databases (.syl2db/.syl3db) only: screen genomes with fewer than this many stored stage-1 k-mers (small genomes: viruses, plasmids, short contigs) directly, by reading back their smallest this-many dense k-mers when the database is opened. This is the same per-genome minimum as upstream sylph's --min-sparse-kmers, applied at profile time, so small genomes stay detectable without the stage-1 index being widened for everyone. Costs time per sample proportional to the number of such genomes; a no-op for genomes a `--small-genome-screen loosen` build already densified. 0 disables."
     )]
     pub screen_small_genomes: usize,
 
@@ -885,7 +885,7 @@ pub struct ContainArgs {
 pub struct InspectArgs {
     #[clap(
         multiple = true,
-        help = "Sketches (*.syldb/*.sylsp, compressed or not) and databases (*.sylref/*.syl2db) to inspect. Every file is checked for corruption: the compressed sketch formats are checksummed by their zstd frame, and the seekable databases carry a whole-file checksum that is verified here."
+        help = "Sketches (*.syldb/*.sylsp, compressed or not) and databases (*.sylref/*.syl2db/*.syl3db) to inspect. Every file is checked for corruption: the compressed sketch formats are checksummed by their zstd frame, and the seekable databases carry a whole-file checksum that is verified here."
     )]
     pub files: Vec<String>,
     #[clap(
